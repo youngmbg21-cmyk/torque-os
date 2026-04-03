@@ -126,6 +126,7 @@ This typically indicates that your device does not have a healthy Internet conne
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
 <script type="text/babel">
 const { useState, useCallback, useEffect, useRef, useMemo } = React;
 
@@ -698,13 +699,40 @@ const ScoreBadge = ({item, profile, t, size="sm"}) => {
 };
 
 // ─── AUTH & NAMESPACED STORAGE ───────────────────────────────────────────────
-const hashPassword = async (pw) => {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pw));
-  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+const hashPassword = async (pw, salt) => {
+  if (!salt) {
+    const saltBuf = crypto.getRandomValues(new Uint8Array(16));
+    salt = Array.from(saltBuf).map(b=>b.toString(16).padStart(2,"0")).join("");
+  }
+  const keyMaterial = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({name:"PBKDF2", salt:new TextEncoder().encode(salt), iterations:100000, hash:"SHA-256"}, keyMaterial, 256);
+  const hash = Array.from(new Uint8Array(bits)).map(b=>b.toString(16).padStart(2,"0")).join("");
+  return salt + ":" + hash;
+};
+const verifyPassword = async (pw, stored) => {
+  if (!stored || !stored.includes(":")) {
+    // Legacy SHA-256 hash (no salt) — compare old way then migrate
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pw));
+    const oldHash = Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+    return oldHash === stored;
+  }
+  const salt = stored.split(":")[0];
+  const rehashed = await hashPassword(pw, salt);
+  return rehashed === stored;
 };
 
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const getCurrentUser = () => {
-  try { return JSON.parse(localStorage.getItem("oos-session")||"null"); } catch { return null; }
+  try {
+    const session = JSON.parse(localStorage.getItem("oos-session")||"null");
+    if (!session) return null;
+    // Expire sessions older than SESSION_MAX_AGE_MS
+    if (session.ts && (Date.now() - session.ts) > SESSION_MAX_AGE_MS) {
+      localStorage.removeItem("oos-session");
+      return null;
+    }
+    return session;
+  } catch { return null; }
 };
 
 const storage = {
@@ -966,7 +994,7 @@ const renderMD = (text, t) => {
     if(bm) { elements.push(<div key={i} style={{display:"flex",gap:8,paddingLeft:4,marginTop:4,alignItems:"flex-start"}}><span style={{color:t.textMuted,flexShrink:0,marginTop:3,fontSize:12}}>–</span><span style={{lineHeight:1.7}}>{renderInline(bm[1])}</span></div>); i++; continue; }
     const nm = tr.match(/^(\d+)\.\s+(.*)/);
     if(nm) { elements.push(<div key={i} style={{display:"flex",gap:8,paddingLeft:4,marginTop:4,alignItems:"flex-start"}}><span style={{color:t.textMuted,flexShrink:0,marginTop:2,fontSize:14,fontWeight:600,minWidth:16,fontFamily:"'DM Mono',monospace"}}>{nm[1]}.</span><span style={{lineHeight:1.7}}>{renderInline(nm[2])}</span></div>); i++; continue; }
-    elements.push(<div key={i} style={{lineHeight:1.7,marginTop:3}}>{renderInline(line)}</div>);
+    elements.push(<div key={i} style={{lineHeight:1.7,marginTop:3}}>{renderInline(tr)}</div>);
     i++;
   }
   return elements;
@@ -1115,7 +1143,7 @@ const StreamingChatbot = ({apiKey, provider, systemPrompt, title, subtitle, icon
   const prov = PROVIDERS[provider]||PROVIDERS.claude;
 
   useEffect(()=>{ if(scrollRef.current) scrollRef.current.scrollTop=scrollRef.current.scrollHeight; },[msgs]);
-  useEffect(()=>{ if(onMessagesChange) onMessagesChange(msgs.filter(m=>!m.streaming)); },[msgs]);
+  useEffect(()=>{ if(onMessagesChange) onMessagesChange(msgs.filter(m=>!m.streaming)); },[msgs, onMessagesChange]);
 
   const send = async () => {
     if(!input.trim()||loading||!apiKey) return;
@@ -1176,6 +1204,7 @@ const StreamingChatbot = ({apiKey, provider, systemPrompt, title, subtitle, icon
           }
           if(stopReason==="tool_use"&&toolBlocks.length){
             const ns=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify({model:prov.model,max_tokens:100,system:systemPrompt,tools:useSearch,messages:apiMsgs})});
+            if(!ns.ok){const errText=await ns.text().catch(()=>"");throw new Error(`API error ${ns.status}: ${errText.slice(0,200)}`);}
             const nd=await ns.json();
             apiMsgs=[...apiMsgs,{role:"assistant",content:nd.content||[]},{role:"user",content:(nd.content||[]).filter(b=>b.type==="tool_use").map(b=>({type:"tool_result",tool_use_id:b.id,content:"Search done"}))}];
             continue;
@@ -1990,7 +2019,7 @@ const DealMonitorModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,on
   const currentItems=tab==="deals"?deals.filter(i=>statusFilter==="ALL"||i.status===statusFilter):dmSaved.filter(i=>statusFilter==="ALL"||i.status===statusFilter);
 
   const ALL_GEO=ALL_COUNTRIES_FLAT.map(c=>c.name);
-  const ALL_SEC=ALL_SECTORS_FLAT.sort();
+  const ALL_SEC=[...ALL_SECTORS_FLAT].sort();
 
   const toggleGeo=(g)=>setThesis(p=>({...p,geographies:p.geographies.includes(g)?p.geographies.filter(x=>x!==g):[...p.geographies,g]}));
   const toggleSec=(s)=>setThesis(p=>({...p,sectors:p.sectors.includes(s)?p.sectors.filter(x=>x!==s):[...p.sectors,s]}));
@@ -2083,7 +2112,7 @@ const DealMonitorModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,on
 };
 
 // ─── MODULE: COMMAND CENTER ────────────────────────────────────────────────────
-const CommandCenter = ({t,profile,saved,isMobile,setActiveModule,apiKey,provider,profileComplete,gatedModules}) => {
+const CommandCenter = ({t,profile,saved,isMobile,setActiveModule,apiKey,provider,profileComplete,gatedModules,activityLog,contacts,saveToVault}) => {
   const now=new Date();
   const hr=now.getHours();
   const greeting=hr<12?"Good morning":hr<17?"Good afternoon":"Good evening";
@@ -2093,6 +2122,36 @@ const CommandCenter = ({t,profile,saved,isMobile,setActiveModule,apiKey,provider
   const topPursue=saved.filter(s=>s.status==="PURSUE"||s.status==="BUILD"||s.status==="HOT").slice(0,3);
   const [morningBrief,setMorningBrief]=useState(null);
   const [briefLoading,setBriefLoading]=useState(false);
+  const [weeklyDigest,setWeeklyDigest]=useState(null);
+  const [digestLoading,setDigestLoading]=useState(false);
+  const [digestSaved,setDigestSaved]=useState(false);
+
+  const generateWeeklyDigest=async()=>{
+    if(!apiKey){setWeeklyDigest("Add your API key in Settings to generate your digest.");return;}
+    setDigestLoading(true);setWeeklyDigest(null);setDigestSaved(false);
+    const now2=new Date();
+    const weekAgo=new Date(now2.getTime()-7*24*60*60*1000);
+    const newCards=(saved||[]).filter(s=>s.savedAt&&new Date(s.savedAt)>=weekAgo);
+    const allPursuing=(saved||[]).filter(s=>["PURSUE","ACTIVE","BUILD"].includes(s.status||""));
+    const recentActivity=(activityLog||[]).filter(e=>new Date(e.loggedAt)>=weekAgo).sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt));
+    const totalAnnual=(saved||[]).filter(s=>s.annualUSD>0).reduce((sum,s)=>sum+(s.annualUSD||0),0);
+    const goalTarget=profile.targetAmount||0;
+    const weekStr=now2.toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"});
+    const weekAgoStr=weekAgo.toLocaleDateString("en-GB",{day:"numeric",month:"long"});
+    const prompt=`Generate a Weekly Digest for ${profile.name||"the user"} (${profile.title||"senior professional"}).
+Period: ${weekAgoStr} to ${weekStr}
+Pipeline: ${saved.length} total, ${allPursuing.length} pursuing, ${newCards.length} new this week
+Value: $${totalAnnual.toLocaleString()}/yr${goalTarget>0?" vs goal of $"+goalTarget.toLocaleString():""}
+Activity: ${recentActivity.length} entries this week
+${recentActivity.slice(0,8).map(e=>new Date(e.loggedAt).toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})+" | "+e.pipelineCardName+" | "+e.actionType.toUpperCase()+(e.note?" — "+e.note:"")).join("\n")||"No activity logged"}
+
+Write 4 sections using **bold**: WEEK IN REVIEW (2-3 sentences), PIPELINE HEALTH (2-3 sentences), NEXT WEEK PRIORITIES (2-3 actions), WATCH LIST (1-2 items needing attention). Max 200 words. Be specific with names and numbers.`;
+    try {
+      const blocks=await callLLM(provider,apiKey,[{role:"user",content:prompt}],[],"You are a sharp executive intelligence advisor.","DIGEST",null);
+      setWeeklyDigest(stripCiteTags(blocks.map(b=>b.text).join("").trim())||"Digest generation failed.");
+    } catch(e){ setWeeklyDigest("Could not generate digest: "+e.message); }
+    setDigestLoading(false);
+  };
 
   const generateBrief=async()=>{
     if(!apiKey){setMorningBrief("Add your API key in Settings to generate your morning brief.");return;}
@@ -2164,13 +2223,26 @@ Use "you have", "your pipeline", "you should" — never "Young has" or "the user
           {hr<12?"☀️":hr<17?"🌤":"🌙"} {hr<12?"Good morning":hr<17?"Good afternoon":"Good evening"}{name?", "+name:""}
         </div>
         <div style={{fontSize:15,color:t.textMuted}}>Here's your opportunity intelligence for {now.toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long"})}.</div>
-        <button onClick={generateBrief} disabled={briefLoading} style={{...btn0,marginTop:8,display:"inline-flex",alignItems:"center",gap:7,padding:"8px 14px",borderRadius:8,fontSize:15,fontWeight:700,background:briefLoading?t.input:"linear-gradient(135deg,"+t.accent+"20,"+t.indigo+"20)",border:"1px solid "+(briefLoading?t.border:t.accent+"40"),color:briefLoading?t.textDim:t.accent}}>
-          {briefLoading?<><Ic.Loader2 size={13}/> Generating brief…</>:<><Ic.Zap size={13}/> Generate AI Morning Brief</>}
-        </button>
+        <div style={{display:"flex",gap:8,marginTop:8,flexWrap:"wrap"}}>
+          <button onClick={generateBrief} disabled={briefLoading} style={{...btn0,display:"inline-flex",alignItems:"center",gap:7,padding:"8px 14px",borderRadius:8,fontSize:15,fontWeight:700,background:briefLoading?t.input:"linear-gradient(135deg,"+t.accent+"20,"+t.indigo+"20)",border:"1px solid "+(briefLoading?t.border:t.accent+"40"),color:briefLoading?t.textDim:t.accent}}>
+            {briefLoading?<><Ic.Loader2 size={13}/> Generating brief...</>:<><Ic.Zap size={13}/> Morning Brief</>}
+          </button>
+          <button onClick={generateWeeklyDigest} disabled={digestLoading} style={{...btn0,display:"inline-flex",alignItems:"center",gap:7,padding:"8px 14px",borderRadius:8,fontSize:15,fontWeight:700,background:digestLoading?t.input:"linear-gradient(135deg,#38bdf820,#818cf820)",border:"1px solid "+(digestLoading?t.border:"#38bdf840"),color:digestLoading?t.textDim:"#38bdf8"}}>
+            {digestLoading?<><Ic.Loader2 size={13}/> Generating digest...</>:<><Ic.BarChart2 size={13}/> Weekly Digest</>}
+          </button>
+        </div>
         {morningBrief&&<div style={{marginTop:12,padding:"14px 16px",background:t.card,border:"1px solid "+t.accent+"25",borderRadius:10,fontSize:15,color:t.textMuted,lineHeight:1.8}}>
           <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.08em",color:t.accent,marginBottom:8}}>TODAY'S BRIEF</div>
           {renderMD(morningBrief,t)}
           <button onClick={()=>setMorningBrief(null)} style={{...btn0,marginTop:10,fontSize:15,color:t.textDim,background:"transparent",padding:0}}>Dismiss</button>
+        </div>}
+        {weeklyDigest&&<div style={{marginTop:12,padding:"14px 16px",background:t.card,border:"1px solid #38bdf825",borderRadius:10,fontSize:15,color:t.textMuted,lineHeight:1.8}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+            <span style={{fontSize:12,fontWeight:700,letterSpacing:"0.08em",color:"#38bdf8"}}>WEEKLY DIGEST</span>
+            {saveToVault&&<button onClick={()=>{saveToVault({title:"Weekly Digest — "+new Date().toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"}),docTypeLabel:"Weekly Digest",content:weeklyDigest,contentType:"document",sourceOpportunity:"Home"});setDigestSaved(true);setTimeout(()=>setDigestSaved(false),2500);}} style={{...btn0,display:"inline-flex",alignItems:"center",gap:4,fontSize:11,fontWeight:700,padding:"2px 9px",borderRadius:4,background:digestSaved?"#38bdf820":"transparent",border:"1px solid "+(digestSaved?"#38bdf850":"#38bdf830"),color:"#38bdf8",marginLeft:"auto"}}><Ic.Archive size={11}/>{digestSaved?"Saved!":"Save to Vault"}</button>}
+          </div>
+          {renderMD(weeklyDigest,t)}
+          <button onClick={()=>setWeeklyDigest(null)} style={{...btn0,marginTop:10,fontSize:15,color:t.textDim,background:"transparent",padding:0}}>Dismiss</button>
         </div>}
       </div>
 
@@ -2651,8 +2723,6 @@ const TaxOptimiserPanel = ({item,profile,apiKey,provider,t,onClose}) => {
   const incomeType=item.estimatedFee||item.entryCost?"fee-based income":item.equity?"equity / capital gain":"mixed income and equity";
   const sourceCountry=item.region||"unknown";
 
-  useEffect(()=>{ runAnalysis(); },[]);
-
   const runAnalysis=async()=>{
     if(!apiKey){setError("No API key — add it in Settings.");return;}
     setLoading(true);setError(null);setAnalysis(null);
@@ -2688,6 +2758,8 @@ Return 2-3 options. OUTPUT ONLY JSON.`;
     } catch(e){ setError("Analysis failed: "+e.message); }
     setLoading(false);
   };
+
+  useEffect(()=>{ if(apiKey && profile && item) runAnalysis(); },[apiKey, provider]);
 
   const effColor=e=>e==="high"?"#10b981":e==="medium"?"#f59e0b":"#ef4444";
   const urgColor=u=>u==="high"?"#ef4444":u==="medium"?"#f59e0b":u==="low"?"#3b82f6":t.textDim;
@@ -2729,7 +2801,7 @@ ${analysis.keyRisk?`<div class="risk"><strong style="color:#dc2626">Key risk: </
     const html=buildHTML();
     if(!html) return;
     const w=window.open("","_blank");
-    w.document.write(html);
+    w.document.write(typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html,{WHOLE_DOCUMENT:true,ADD_TAGS:["style","meta","link"],ADD_ATTR:["target"]}):html);
     w.document.close();
     w.focus();
     setTimeout(()=>w.print(),400);
@@ -2996,7 +3068,7 @@ ${(analysis.mutualOrgs||[]).filter(Boolean).length>0?`<h2>Shared Organisations</
 <p style="font-size:11px;color:#9ca3af;margin-top:32px;font-style:italic;">Generated by TorqueOS for ${profile.name||"User"}</p>
 </body></html>`;
     const w=window.open("","_blank");
-    w.document.write(html);
+    w.document.write(typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html,{WHOLE_DOCUMENT:true,ADD_TAGS:["style","meta","link"],ADD_ATTR:["target"]}):html);
     w.document.close();
     w.focus();
     setTimeout(()=>w.print(),400);
@@ -3383,7 +3455,7 @@ ${htmlLines}
 <p class="footer">Generated by TorqueOS for ${profile.name||"User"}</p>
 </body></html>`;
     const w=window.open("","_blank");
-    w.document.write(html);
+    w.document.write(typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html,{WHOLE_DOCUMENT:true,ADD_TAGS:["style","meta","link"],ADD_ATTR:["target"]}):html);
     w.document.close();
     w.focus();
     setTimeout(()=>w.print(),400);
@@ -3564,7 +3636,7 @@ const SettingsModule = ({t,profile,setProfile,apiKey,setApiKey,provider,setProvi
       // Also update local hash store so login still works
       const email = window.TorqueFirebase.getUserEmail();
       if(email){
-        const newHash = await hashPassword(pwNew);
+        const newHash = await hashPassword(pwNew); // now uses PBKDF2 with salt
         const users = storage.gget("oos-users")||{};
         if(users[email.toLowerCase()]){
           users[email.toLowerCase()].hash = newHash;
@@ -3872,6 +3944,248 @@ Return ONLY JSON, no markdown, no backticks.`;
       <button onClick={saveProfile} style={{...btn0,width:"100%",padding:11,borderRadius:8,fontSize:15,fontWeight:700,color:"#07090f",background:"linear-gradient(135deg,"+t.accent+","+t.indigo+")",display:"flex",alignItems:"center",justifyContent:"center",gap:7,marginTop:4}}>
         {saved?<><Ic.Check size={16}/> Saved!</>:<><Ic.Check size={16}/> Save All Settings</>}
       </button>
+    </div>
+  );
+};
+
+// ─── MODULE: DOCUMENT VAULT ───────────────────────────────────────────────────
+const DocumentVaultModule = ({t, isMobile, vault, setVault, onRegenerate}) => {
+  const [selectedId, setSelectedId] = useState(null);
+  const [search, setSearch] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const vaultColor = "#38bdf8";
+
+  const filtered = (vault||[]).filter(d =>
+    !search.trim() ||
+    (d.title||"").toLowerCase().includes(search.toLowerCase()) ||
+    (d.type||"").toLowerCase().includes(search.toLowerCase()) ||
+    (d.sourceOpportunity||"").toLowerCase().includes(search.toLowerCase())
+  );
+
+  const selected = filtered.find(d => d.id === selectedId) || filtered[0] || null;
+
+  const deleteDoc = (id) => {
+    const next = vault.filter(d => d.id !== id);
+    setVault(next);
+    storage.set("oos-vault", next);
+    if (selectedId === id) setSelectedId(null);
+    setConfirmDelete(null);
+  };
+
+  const copyDoc = (content) => { navigator.clipboard.writeText(content||"").catch(()=>{}); };
+
+  const printDoc = (doc) => {
+    if (doc.contentType === "network-intel") {
+      try {
+        const a = JSON.parse(doc.content||"{}");
+        const wc=w=>w==="hot"?"#ef4444":w==="warm"?"#f59e0b":"#3b82f6";
+        const contacts=(a.keyContacts||[]).map(c=>`<div style="border:1px solid #e5e7eb;border-left:4px solid ${wc(c.warmthLevel)};border-radius:8px;padding:12px 14px;margin-bottom:10px;"><strong>${c.name}</strong> — ${c.role}<br><strong style="color:#4f46e5">Path:</strong> ${c.connectionPath}</div>`).join("");
+        const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${doc.title}</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;padding:40px;color:#111;line-height:1.7;}</style></head><body><h1>Network Intelligence</h1><p>${doc.niTarget||""} · ${new Date(doc.savedAt).toLocaleDateString("en-GB")}</p>${a.targetSummary?`<p>${a.targetSummary}</p>`:""}<h2>Key Contacts</h2>${contacts}</body></html>`;
+        const w=window.open("","_blank"); w.document.write(typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html,{WHOLE_DOCUMENT:true,ADD_TAGS:["style","meta","link"],ADD_ATTR:["target"]}):html); w.document.close(); w.focus(); setTimeout(()=>w.print(),400);
+      } catch(e) {}
+      return;
+    }
+    const lines = (doc.content||"").split("\n");
+    const htmlLines = lines.map(line => {
+      const tr = line.trim();
+      if (!tr) return "<br>";
+      if (/^[A-Z][A-Z\s\-&\/]{3,}$/.test(tr) && !tr.includes(".") && tr.length < 60) return `<h2>${tr}</h2>`;
+      if (/^[-]\s+(.*)/.test(tr)) return `<p style="padding-left:14px">- ${tr.replace(/^[-]\s+/,"")}</p>`;
+      return `<p>${tr}</p>`;
+    }).join("\n");
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${doc.title}</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;padding:40px;color:#111;line-height:1.7;font-size:15px;}h2{font-size:13px;font-weight:700;letter-spacing:0.06em;color:#6b7280;margin:24px 0 8px;text-transform:uppercase;border-bottom:1px solid #e5e7eb;padding-bottom:5px;}p{margin:0 0 8px;color:#374151;}</style></head><body><h1>${doc.title}</h1><p style="color:#6b7280">${doc.sourceOpportunity||""} · ${new Date(doc.savedAt).toLocaleDateString("en-GB")}</p>${htmlLines}<p style="font-size:11px;color:#9ca3af;margin-top:32px;text-align:center">Saved in TorqueOS Document Vault</p></body></html>`;
+    const w = window.open("","_blank");
+    w.document.write(typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html,{WHOLE_DOCUMENT:true,ADD_TAGS:["style","meta","link"],ADD_ATTR:["target"]}):html);
+    w.document.close(); w.focus(); setTimeout(()=>w.print(), 400);
+  };
+
+  if (!vault || vault.length === 0) return (
+    <div style={{textAlign:"center",padding:"60px 24px",color:t.textDim}}>
+      <div style={{fontSize:48,marginBottom:14}}>📄</div>
+      <div style={{fontSize:16,fontWeight:700,color:t.text,marginBottom:8}}>Your Vault is empty</div>
+      <div style={{fontSize:14,color:t.textMuted,maxWidth:360,margin:"0 auto"}}>Generate documents from any opportunity card using the Docs button, then save them here.</div>
+    </div>
+  );
+
+  return (
+    <div style={{display:"flex",flexDirection:isMobile?"column":"row",gap:8,flex:1,overflow:"hidden"}}>
+      <div style={{width:isMobile?"100%":260,flexShrink:0,display:"flex",flexDirection:"column",gap:6,overflowY:"auto",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
+        <div style={{position:"relative"}}>
+          <Ic.Search size={13} style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:t.textDim,pointerEvents:"none"}}/>
+          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search vault..." style={{width:"100%",padding:"8px 10px 8px 30px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:7,color:t.text,fontSize:14,fontFamily:"inherit",boxSizing:"border-box"}}/>
+        </div>
+        <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,padding:"2px 2px"}}>{filtered.length} DOCUMENT{filtered.length!==1?"S":""}</div>
+        {filtered.map(doc => (
+          <div key={doc.id} onClick={()=>setSelectedId(doc.id)} style={{background:t.card,border:"1px solid "+(selectedId===doc.id||(!selectedId&&doc===filtered[0])?vaultColor+"50":t.border),borderLeft:"3px solid "+(selectedId===doc.id||(!selectedId&&doc===filtered[0])?vaultColor:t.border),borderRadius:8,padding:"10px 12px",cursor:"pointer",transition:"all 0.15s"}}>
+            <div style={{fontSize:13,fontWeight:700,color:t.text,marginBottom:3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{doc.title}</div>
+            <div style={{display:"flex",alignItems:"center",gap:5,flexWrap:"wrap"}}>
+              {doc.type&&<span style={{fontSize:11,fontWeight:600,padding:"1px 6px",borderRadius:3,background:vaultColor+"15",color:vaultColor}}>{doc.type}</span>}
+              {doc.sourceOpportunity&&<span style={{fontSize:11,color:t.textMuted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:110}}>{doc.sourceOpportunity}</span>}
+            </div>
+            <div style={{fontSize:11,color:t.textDim,marginTop:4}}>{new Date(doc.savedAt).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</div>
+          </div>
+        ))}
+      </div>
+      {selected && (
+        <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",overflow:"hidden",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
+          <div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 16px",marginBottom:8,flexShrink:0}}>
+            <div style={{fontSize:16,fontWeight:700,color:t.text,marginBottom:4}}>{selected.title}</div>
+            <div style={{fontSize:12,color:t.textMuted,marginBottom:8}}>{selected.type&&<span style={{marginRight:8,padding:"1px 6px",borderRadius:3,background:vaultColor+"15",color:vaultColor,fontWeight:600}}>{selected.type}</span>}{selected.sourceOpportunity} · {new Date(selected.savedAt).toLocaleDateString("en-GB")}</div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              <button onClick={()=>copyDoc(selected.content)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}><Ic.Copy size={11}/> Copy</button>
+              <button onClick={()=>printDoc(selected)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:t.indigoDim,border:"1px solid "+t.indigo+"40",color:t.indigo}}><Ic.Printer size={11}/> Print</button>
+              {onRegenerate&&selected.sourceItem&&<button onClick={()=>onRegenerate(selected.sourceItem)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:t.goldDim,border:"1px solid "+t.gold+"40",color:t.gold}}><Ic.RefreshCw size={11}/> Regenerate</button>}
+              <button onClick={()=>setConfirmDelete(selected.id)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:"transparent",border:"1px solid rgba(239,68,68,0.25)",color:"#ef4444",marginLeft:"auto"}}><Ic.Trash2 size={11}/> Delete</button>
+            </div>
+            {confirmDelete===selected.id&&<div style={{marginTop:10,padding:"8px 12px",background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.25)",borderRadius:6,display:"flex",alignItems:"center",gap:10}}>
+              <span style={{fontSize:13,color:"#ef4444",flex:1}}>Delete this document?</span>
+              <button onClick={()=>deleteDoc(selected.id)} style={{...btn0,fontSize:12,fontWeight:700,padding:"4px 10px",borderRadius:5,background:"#ef4444",color:"#fff",border:"none"}}>Delete</button>
+              <button onClick={()=>setConfirmDelete(null)} style={{...btn0,fontSize:12,padding:"4px 10px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
+            </div>}
+          </div>
+          <div style={{flex:1,overflowY:"auto",minHeight:0,background:t.input,border:"1px solid "+t.border,borderRadius:8,padding:"20px 24px",fontSize:14,color:t.text,lineHeight:1.8}}>
+            {selected.contentType==="network-intel" ? (()=>{
+              let a={}; try { a=JSON.parse(selected.content||"{}"); } catch(e){}
+              const warmColor=w=>w==="hot"?"#ef4444":w==="warm"?"#f59e0b":"#3b82f6";
+              return <>
+                {a.targetSummary&&<div style={{padding:"10px 12px",background:t.card,border:"1px solid "+t.border,borderRadius:7,fontSize:14,color:t.textMuted,lineHeight:1.65,marginBottom:14}}>{a.targetSummary}</div>}
+                {(a.keyContacts||[]).map((c,i)=>(
+                  <div key={i} style={{background:t.card,border:"1px solid "+t.border,borderLeft:"3px solid "+warmColor(c.warmthLevel),borderRadius:7,padding:"10px 12px",marginBottom:8}}>
+                    <div style={{fontSize:14,fontWeight:700,color:t.text}}>{c.name} <span style={{fontSize:11,fontWeight:700,padding:"2px 7px",borderRadius:3,background:warmColor(c.warmthLevel)+"20",color:warmColor(c.warmthLevel),textTransform:"uppercase",marginLeft:6}}>{c.warmthLevel}</span></div>
+                    <div style={{fontSize:12,color:t.textMuted,marginTop:2}}>{c.role}</div>
+                    <div style={{fontSize:13,color:t.textMuted,lineHeight:1.6,marginTop:4}}><strong style={{color:t.indigo}}>Path: </strong>{c.connectionPath}</div>
+                  </div>
+                ))}
+                {a.recommendedApproach&&<div style={{padding:"9px 12px",background:t.accentDim,border:"1px solid "+t.accent+"25",borderRadius:6,fontSize:13,color:t.textMuted,lineHeight:1.65,marginTop:10}}><strong style={{color:t.accent}}>Approach: </strong>{a.recommendedApproach}</div>}
+              </>;
+            })() : (selected.content||"").split("\n").map((line,i)=>{
+              const tr = line.trim();
+              if (!tr) return <div key={i} style={{height:10}}/>;
+              if (/^[A-Z][A-Z\s\-&\/]{3,}$/.test(tr) && !tr.includes(".") && tr.length < 60) return <div key={i} style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",color:t.textDim,marginTop:18,marginBottom:5,paddingBottom:4,borderBottom:"1px solid "+t.border}}>{tr}</div>;
+              return <div key={i} style={{color:t.text,marginBottom:2}}>{line}</div>;
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─── MODULE: CONTACTS CRM ────────────────────────────────────────────────────
+const ContactsModule = ({t, isMobile, contacts, setContacts, activityLog, saved, onNavigateToNetwork}) => {
+  const [selectedId, setSelectedId] = useState(null);
+  const [search, setSearch] = useState("");
+  const [warmthFilter, setWarmthFilter] = useState("ALL");
+  const [editingContact, setEditingContact] = useState(null);
+  const [editNote, setEditNote] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const contactColor = "#2dd4bf";
+  const warmthColor = w => w==="hot"?"#ef4444":w==="warm"?"#f59e0b":"#3b82f6";
+  const warmthOrder = {hot:0, warm:1, cold:2};
+
+  const filtered = (contacts||[])
+    .filter(c => warmthFilter==="ALL" || c.warmth===warmthFilter)
+    .filter(c => !search.trim() || (c.name||"").toLowerCase().includes(search.toLowerCase()) || (c.company||"").toLowerCase().includes(search.toLowerCase()))
+    .sort((a,b) => (warmthOrder[a.warmth]||2)-(warmthOrder[b.warmth]||2));
+
+  const selected = filtered.find(c=>c.id===selectedId) || filtered[0] || null;
+  const updateContact = (id, patch) => setContacts(prev => prev.map(c => c.id===id ? {...c,...patch} : c));
+  const deleteContact = (id) => { setContacts(prev => prev.filter(c=>c.id!==id)); setSelectedId(null); setConfirmDelete(null); };
+
+  const contactActivity = selected ? (activityLog||[]).filter(e => e.pipelineCardName && selected.company && e.pipelineCardName.toLowerCase().includes(selected.company.toLowerCase())).sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt)).slice(0,10) : [];
+  const linkedOpps = selected ? (saved||[]).filter(s => (selected.linkedOpportunities||[]).includes(s.name) || (selected.company && (s.name||"").toLowerCase().includes(selected.company.toLowerCase()))) : [];
+
+  if (!contacts || contacts.length === 0) return (
+    <div style={{textAlign:"center",padding:"60px 24px",color:t.textDim}}>
+      <div style={{fontSize:48,marginBottom:14}}>👥</div>
+      <div style={{fontSize:16,fontWeight:700,color:t.text,marginBottom:8}}>No contacts yet</div>
+      <div style={{fontSize:14,color:t.textMuted,maxWidth:380,margin:"0 auto",lineHeight:1.6}}>Contacts are saved from Network Intelligence. Run a network analysis on any opportunity, then click "Save contact" on any key contact card.</div>
+    </div>
+  );
+
+  return (
+    <div style={{display:"flex",flexDirection:isMobile?"column":"row",gap:8,flex:1,overflow:"hidden"}}>
+      <div style={{width:isMobile?"100%":260,flexShrink:0,display:"flex",flexDirection:"column",gap:6,overflowY:"auto",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
+        <div style={{position:"relative"}}>
+          <Ic.Search size={13} style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:t.textDim,pointerEvents:"none"}}/>
+          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search contacts..." style={{width:"100%",padding:"8px 10px 8px 30px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:7,color:t.text,fontSize:14,fontFamily:"inherit",boxSizing:"border-box"}}/>
+        </div>
+        <div style={{display:"flex",gap:4}}>
+          {["ALL","hot","warm","cold"].map(w=>(
+            <button key={w} onClick={()=>setWarmthFilter(w)} style={{...btn0,flex:1,padding:"4px 0",borderRadius:5,fontSize:11,fontWeight:700,border:"1px solid "+(warmthFilter===w?(w==="ALL"?contactColor:warmthColor(w))+"60":t.border),background:warmthFilter===w?(w==="ALL"?contactColor:warmthColor(w))+"15":"transparent",color:warmthFilter===w?(w==="ALL"?contactColor:warmthColor(w)):t.textMuted,textTransform:"capitalize"}}>{w==="ALL"?"All":w}</button>
+          ))}
+        </div>
+        {filtered.map(c=>(
+          <div key={c.id} onClick={()=>setSelectedId(c.id)} style={{background:t.card,border:"1px solid "+(c.id===selectedId?contactColor+"50":t.border),borderLeft:"3px solid "+warmthColor(c.warmth),borderRadius:8,padding:"10px 12px",cursor:"pointer"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <div style={{width:28,height:28,borderRadius:"50%",background:warmthColor(c.warmth)+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:700,color:warmthColor(c.warmth),flexShrink:0}}>{(c.name||"?")[0]}</div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:13,fontWeight:700,color:t.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.name}</div>
+                <div style={{fontSize:11,color:t.textMuted}}>{c.role&&c.company?c.role+" · "+c.company:c.role||c.company||""}</div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+      {selected&&(
+        <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",gap:8,overflowY:"auto",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
+          <div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"14px 16px"}}>
+            <div style={{display:"flex",alignItems:"flex-start",gap:12,marginBottom:10}}>
+              <div style={{width:44,height:44,borderRadius:"50%",background:warmthColor(selected.warmth)+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,fontWeight:700,color:warmthColor(selected.warmth),flexShrink:0}}>{(selected.name||"?")[0]}</div>
+              <div style={{flex:1}}>
+                <div style={{fontSize:16,fontWeight:700,color:t.text}}>{selected.name}</div>
+                <div style={{fontSize:13,color:t.textMuted}}>{selected.role}{selected.company?" · "+selected.company:""}</div>
+                <div style={{display:"flex",gap:5,marginTop:5}}>
+                  {["hot","warm","cold"].map(w=>(
+                    <button key={w} onClick={()=>updateContact(selected.id,{warmth:w})} style={{...btn0,fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:4,border:"1px solid "+(selected.warmth===w?warmthColor(w)+"60":t.border),background:selected.warmth===w?warmthColor(w)+"18":"transparent",color:selected.warmth===w?warmthColor(w):t.textMuted,textTransform:"capitalize"}}>{w}</button>
+                  ))}
+                  {onNavigateToNetwork&&selected.company&&<button onClick={()=>onNavigateToNetwork(selected.company)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:4,fontSize:11,fontWeight:600,padding:"2px 9px",borderRadius:4,background:t.indigoDim,border:"1px solid "+t.indigo+"30",color:t.indigo,marginLeft:"auto"}}><span>🕸</span> Network Intel</button>}
+                </div>
+              </div>
+              <button onClick={()=>setConfirmDelete(selected.id)} style={{...btn0,padding:4,background:"transparent",border:"none",color:t.textDim}}><Ic.Trash2 size={14}/></button>
+            </div>
+            {confirmDelete===selected.id&&<div style={{padding:"8px 10px",background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.25)",borderRadius:6,display:"flex",alignItems:"center",gap:10}}>
+              <span style={{fontSize:13,color:"#ef4444",flex:1}}>Delete?</span>
+              <button onClick={()=>deleteContact(selected.id)} style={{...btn0,fontSize:12,fontWeight:700,padding:"3px 10px",borderRadius:5,background:"#ef4444",color:"#fff",border:"none"}}>Delete</button>
+              <button onClick={()=>setConfirmDelete(null)} style={{...btn0,fontSize:12,padding:"3px 8px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
+            </div>}
+          </div>
+          <div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 14px"}}>
+            <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:6}}>NOTES</div>
+            {editingContact===selected.id
+              ? <><textarea value={editNote} onChange={e=>setEditNote(e.target.value)} rows={3} style={{width:"100%",padding:"8px 10px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:6,color:t.text,fontSize:13,fontFamily:"inherit",resize:"vertical",boxSizing:"border-box",marginBottom:6}}/>
+                  <div style={{display:"flex",gap:6}}>
+                    <button onClick={()=>{updateContact(selected.id,{notes:editNote});setEditingContact(null);}} style={{...btn0,fontSize:12,fontWeight:700,padding:"4px 12px",borderRadius:5,background:contactColor+"20",border:"1px solid "+contactColor+"40",color:contactColor}}>Save</button>
+                    <button onClick={()=>setEditingContact(null)} style={{...btn0,fontSize:12,padding:"4px 10px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
+                  </div></>
+              : <div onClick={()=>{setEditingContact(selected.id);setEditNote(selected.notes||"");}} style={{fontSize:13,color:selected.notes?t.textMuted:t.textDim,lineHeight:1.6,cursor:"pointer",padding:"6px 8px",borderRadius:5,border:"1px dashed "+t.border,minHeight:32}}>{selected.notes||"Click to add notes..."}</div>
+            }
+          </div>
+          {linkedOpps.length>0&&<div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 14px"}}>
+            <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:8}}>LINKED OPPORTUNITIES</div>
+            {linkedOpps.map((opp,i)=>{
+              const mc={board:"#6ee7b7",venture:"#818cf8",hustle:"#fb923c",deal:"#f6c90e",exec:"#c084fc"}[opp.source]||t.accent;
+              return <div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 8px",background:t.input,borderRadius:6,border:"1px solid "+t.border,marginBottom:4}}>
+                <span style={{fontSize:11,fontWeight:700,padding:"1px 6px",borderRadius:3,background:mc+"20",color:mc}}>{(opp.source||"").toUpperCase()}</span>
+                <span style={{fontSize:13,color:t.text,flex:1}}>{opp.name}</span>
+              </div>;
+            })}
+          </div>}
+          {contactActivity.length>0&&<div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 14px"}}>
+            <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:8}}>ACTIVITY ({contactActivity.length})</div>
+            {contactActivity.map((e,i)=>{
+              const aType=ACTIVITY_TYPES.find(a=>a.key===e.actionType)||ACTIVITY_TYPES[5];
+              return <div key={e.id} style={{display:"flex",gap:8,alignItems:"flex-start",padding:"6px 0",borderBottom:i<contactActivity.length-1?"1px solid "+t.border+"50":"none"}}>
+                <span style={{fontSize:12}}>{aType.icon}</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:12,fontWeight:700,color:aType.color}}>{aType.label} <span style={{fontSize:11,color:t.textDim,fontWeight:400}}>{new Date(e.loggedAt).toLocaleDateString("en-GB",{day:"numeric",month:"short"})}</span></div>
+                  {e.note&&<div style={{fontSize:12,color:t.textMuted,marginTop:2}}>{e.note}</div>}
+                </div>
+              </div>;
+            })}
+          </div>}
+        </div>
+      )}
     </div>
   );
 };
@@ -4197,6 +4511,79 @@ const ScheduleEventModal = ({t, item, events, onSave, onClose}) => {
   );
 };
 
+// ─── ACTIVITY LOG MODAL ──────────────────────────────────────────────────────
+const ACTIVITY_TYPES = [
+  {key:"email",    label:"Email sent",        icon:"📧", color:"#6ee7b7"},
+  {key:"call",     label:"Call made",         icon:"📞", color:"#34d399"},
+  {key:"meeting",  label:"Meeting held",      icon:"🤝", color:"#818cf8"},
+  {key:"proposal", label:"Proposal submitted",icon:"📋", color:"#f6c90e"},
+  {key:"intro",    label:"Intro requested",   icon:"🔗", color:"#fb923c"},
+  {key:"note",     label:"Note",              icon:"📝", color:"#a78bfa"},
+];
+
+const ActivityLogModal = ({t, item, onSave, onClose}) => {
+  const [actionType, setActionType] = useState("email");
+  const [note, setNote] = useState("");
+  const [outcome, setOutcome] = useState("neutral");
+
+  const save = () => {
+    const entry = {
+      id: "al-"+Date.now(),
+      pipelineCardId: item.id||item.name,
+      pipelineCardName: item.name,
+      actionType,
+      note: note.trim(),
+      outcome,
+      loggedAt: new Date().toISOString(),
+    };
+    onSave(entry);
+    onClose();
+  };
+
+  const selectedType = ACTIVITY_TYPES.find(a=>a.key===actionType)||ACTIVITY_TYPES[0];
+  const outcomeColors = {positive:"#10b981", neutral:"#6b7280", negative:"#ef4444"};
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:16}} onClick={onClose}>
+      <div style={{background:t.surface,border:"1px solid "+t.border,borderRadius:14,padding:22,width:"100%",maxWidth:420,boxShadow:"0 24px 64px rgba(0,0,0,0.5)"}} onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
+          <div>
+            <div style={{fontSize:17,fontWeight:700,color:t.text,marginBottom:3}}>Log Activity</div>
+            <div style={{fontSize:14,color:t.textMuted,fontWeight:500}}>{item.name}</div>
+          </div>
+          <button onClick={onClose} style={{background:"none",border:"none",color:t.textDim,cursor:"pointer",fontSize:20,lineHeight:1,padding:4}}>x</button>
+        </div>
+
+        <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:8}}>ACTION TYPE</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:16}}>
+          {ACTIVITY_TYPES.map(a=>(
+            <button key={a.key} onClick={()=>setActionType(a.key)} style={{...btn0,display:"flex",alignItems:"center",gap:5,padding:"5px 10px",borderRadius:6,fontSize:13,fontWeight:600,border:"1px solid "+(actionType===a.key?a.color+"60":t.border),background:actionType===a.key?a.color+"18":"transparent",color:actionType===a.key?a.color:t.textMuted}}>
+              <span style={{fontSize:14}}>{a.icon}</span>{a.label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:6}}>OUTCOME</div>
+        <div style={{display:"flex",gap:6,marginBottom:16}}>
+          {["positive","neutral","negative"].map(o=>(
+            <button key={o} onClick={()=>setOutcome(o)} style={{...btn0,flex:1,padding:"6px 0",borderRadius:6,fontSize:13,fontWeight:600,border:"1px solid "+(outcome===o?outcomeColors[o]+"60":t.border),background:outcome===o?outcomeColors[o]+"18":"transparent",color:outcome===o?outcomeColors[o]:t.textMuted,textTransform:"capitalize"}}>{o}</button>
+          ))}
+        </div>
+
+        <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:6}}>NOTE <span style={{fontWeight:400,textTransform:"none",color:t.textDim}}>(optional)</span></div>
+        <textarea value={note} onChange={e=>setNote(e.target.value)} placeholder="What happened? Key points..." rows={3} style={{width:"100%",padding:"9px 11px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:7,color:t.text,fontSize:14,fontFamily:"inherit",resize:"vertical",boxSizing:"border-box",marginBottom:16}}/>
+
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={save} style={{...btn0,flex:1,padding:"10px",borderRadius:8,fontSize:15,fontWeight:700,background:"linear-gradient(135deg,"+selectedType.color+","+selectedType.color+"cc)",color:"#07090f",border:"none"}}>
+            Save Entry
+          </button>
+          <button onClick={onClose} style={{...btn0,padding:"10px 16px",borderRadius:8,fontSize:15,fontWeight:600,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // ─── MODULE: CALENDAR ────────────────────────────────────────────────────────
 const CalendarModule = ({t, isMobile, events, onSaveEvents, saved, onScheduleItem, onNavigate}) => {
   const [view, setView] = useState("month"); // month | agenda
@@ -4480,7 +4867,7 @@ const LoginScreen = ({t, onLogin}) => {
       const isNew = !users[email];
       users[email] = users[email] || {hash:"google-oauth", createdAt:new Date().toISOString()};
       storage.gset("oos-users", users);
-      storage.gset("oos-session", {email});
+      storage.gset("oos-session", {email, ts:Date.now()});
       onLogin(isNew);
     } catch(e) {
       if(e.code !== "auth/popup-closed-by-user" && e.code !== "auth/cancelled-popup-request") {
@@ -4495,17 +4882,20 @@ const LoginScreen = ({t, onLogin}) => {
     if(!email.trim()||!password.trim()){setError("Please enter email and password.");setLoading(false);return;}
     if(!/^[^@]+@[^@]+\.[^@]+$/.test(email)){setError("Please enter a valid email.");setLoading(false);return;}
     if(password.length<6){setError("Password must be at least 6 characters.");setLoading(false);return;}
-    const hash = await hashPassword(password);
     const users = storage.gget("oos-users")||{};
     if(mode==="login"){
       // Try Firebase first — works on any device
       if(window.TorqueFirebase) {
         try {
           await window.TorqueFirebase.signIn(email.toLowerCase(), password);
-          // Firebase sign in worked — create local session too
-          users[email.toLowerCase()] = users[email.toLowerCase()] || {hash, createdAt:new Date().toISOString()};
-          storage.gset("oos-users", users);
-          storage.gset("oos-session", {email:email.toLowerCase()});
+          // Firebase sign in worked — update local hash to PBKDF2 if legacy
+          const existing = users[email.toLowerCase()];
+          if (!existing || !existing.hash || !existing.hash.includes(":")) {
+            const newHash = await hashPassword(password);
+            users[email.toLowerCase()] = {hash: newHash, createdAt: existing?.createdAt || new Date().toISOString()};
+            storage.gset("oos-users", users);
+          }
+          storage.gset("oos-session", {email:email.toLowerCase(), ts:Date.now()});
           setLoading(false);
           onLogin(false);
           return;
@@ -4515,19 +4905,31 @@ const LoginScreen = ({t, onLogin}) => {
       }
       // Local fallback
       if(!users[email.toLowerCase()]){setError("No account found. Create one below.");setLoading(false);return;}
-      if(users[email.toLowerCase()].hash!==hash){setError("Incorrect password.");setLoading(false);return;}
-      storage.gset("oos-session",{email:email.toLowerCase()});
+      const isValid = await verifyPassword(password, users[email.toLowerCase()].hash);
+      if(!isValid){setError("Incorrect password.");setLoading(false);return;}
+      // Migrate legacy hash to PBKDF2 on successful login
+      if(!users[email.toLowerCase()].hash.includes(":")){
+        users[email.toLowerCase()].hash = await hashPassword(password);
+        storage.gset("oos-users", users);
+      }
+      storage.gset("oos-session",{email:email.toLowerCase(), ts:Date.now()});
       onLogin(false);
     } else {
       // Register — create both Firebase and local account
+      let firebaseOk = false;
       if(window.TorqueFirebase) {
-        try { await window.TorqueFirebase.signUp(email.toLowerCase(), password); } catch(e) {
-          try { await window.TorqueFirebase.signIn(email.toLowerCase(), password); } catch(e2) {}
+        try { await window.TorqueFirebase.signUp(email.toLowerCase(), password); firebaseOk = true; } catch(e) {
+          try { await window.TorqueFirebase.signIn(email.toLowerCase(), password); firebaseOk = true; } catch(e2) {
+            setError("Could not create account — please check your internet connection and try again.");
+            setLoading(false);
+            return;
+          }
         }
       }
+      const hash = await hashPassword(password); // PBKDF2 with random salt
       users[email.toLowerCase()]={hash, createdAt:new Date().toISOString()};
       storage.gset("oos-users",users);
-      storage.gset("oos-session",{email:email.toLowerCase()});
+      storage.gset("oos-session",{email:email.toLowerCase(), ts:Date.now()});
       onLogin(true);
     }
     setLoading(false);
@@ -4686,7 +5088,6 @@ Return ONLY JSON, no markdown.`;
     const profile={
       ...(extractedProfile||manualProfile),
       regions:selectedCountries.map(c=>WORLD_COUNTRIES.find(w=>w.code===c)?.name).filter(Boolean),
-      regions:selectedCountries.map(c=>WORLD_COUNTRIES.find(w=>w.code===c)?.name).filter(Boolean),
       defaultSectors:selectedIndustries.slice(0,5),
       dmInvestmentRole:"Co-investor", dmTicketMin:0, dmTicketMax:0,
       dmDealStage:"Any stage", dmValueAdd:"", dmRedFlags:"",
@@ -4699,7 +5100,7 @@ Return ONLY JSON, no markdown.`;
     storage.set("oos-provider",localProvider);
     storage.set("oos-key",localApiKey);
     storage.set("oos-onboarded","yes");
-    storage.gset("oos-session",{email,onboarded:true});
+    storage.gset("oos-session",{email,onboarded:true,ts:Date.now()});
     setApiKey(localApiKey);
     setProvider(localProvider);
     onComplete(profile);
@@ -5744,16 +6145,8 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
   const [provider,setProvider]=useState(()=>storage.get("oos-provider")||"claude");
   const [apiKey,setApiKey]=useState(()=>storage.get("oos-key")||"");
   const [profile,setProfile]=useState(()=>storage.get("oos-profile")||initialProfile||DEFAULT_PROFILE);
-  const [saved,setSavedRaw]=useState(()=>storage.get("oos-saved")||[]);
-  // Wrapped setSaved — every pipeline change auto-schedules a Firebase sync
-  const setSaved = React.useCallback((updater) => {
-    setSavedRaw(prev => {
-      const next = typeof updater === "function" ? updater(prev) : updater;
-      // Schedule sync after state settles
-      setTimeout(() => schedulePipelineSync(next), 0);
-      return next;
-    });
-  }, [schedulePipelineSync]);
+  const [saved,setSaved]=useState(()=>storage.get("oos-saved")||[]);
+  const schedulePipelineSyncRef = React.useRef(null);
   const [chatContext,setChatContext]=useState(null);
   const [chatBrief,setChatBrief]=useState(null);
   const [chatMessages,setChatMessages]=useState(()=>storage.get("oos-chat-messages")||[{role:"assistant",content:"Hi! I'm your AI Advisor. Ask me anything about your opportunities, pipeline, strategy, or how to use the app.",id:"w1"}]);
@@ -5762,14 +6155,44 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
   const saveCalendarEvents=(evts)=>{setCalendarEvents(evts);storage.set("oos-calendar-events",evts);};
   const [scheduleModalItem,setScheduleModalItem]=useState(null);
 
+  // ── Activity Log ──
+  const [activityLog, setActivityLogRaw] = useState(()=>storage.get("oos-activity-log")||[]);
+  const saveActivityEntry = React.useCallback((entry) => {
+    setActivityLogRaw(prev => { const next = [...prev, entry]; storage.set("oos-activity-log", next); return next; });
+  }, []);
+  const [activityLogItem, setActivityLogItem] = useState(null);
+
+  // ── Contacts CRM ──
+  const [contacts, setContactsRaw] = useState(()=>storage.get("oos-contacts")||[]);
+  const setContacts = React.useCallback((updater) => {
+    setContactsRaw(prev => { const next = typeof updater === "function" ? updater(prev) : updater; storage.set("oos-contacts", next); return next; });
+  }, []);
+  const saveContact = React.useCallback((contact) => {
+    setContactsRaw(prev => {
+      if(prev.some(c=>c.name===contact.name&&c.company===contact.company)) return prev;
+      const entry = { id:"ct-"+Date.now(), name:contact.name||"", role:contact.role||"", company:contact.company||"", warmth:contact.warmth||"cold", linkedOpportunities:contact.linkedOpportunities||[], notes:"", source:contact.source||"manual", createdAt:new Date().toISOString() };
+      const next = [entry, ...prev]; storage.set("oos-contacts", next); return next;
+    });
+  }, []);
+
+  // ── Document Vault ──
+  const [vault, setVaultRaw] = useState(()=>storage.get("oos-vault")||[]);
+  const setVault = (next) => { setVaultRaw(next); storage.set("oos-vault", next); };
+  const saveToVault = React.useCallback((doc) => {
+    setVaultRaw(prev => {
+      const entry = { id:"vault-"+Date.now(), title:doc.title||"Document", type:doc.docTypeLabel||"", content:doc.content||"", contentType:doc.contentType||"document", sourceOpportunity:doc.sourceOpportunity||"", sourceItem:doc.sourceItem||null, niTarget:doc.niTarget||"", niRegion:doc.niRegion||"", savedAt:new Date().toISOString() };
+      const next = [entry, ...prev]; storage.set("oos-vault", next); return next;
+    });
+  }, []);
+
   // ── Calendar reminder engine — checks every minute ──
   useEffect(()=>{
     const checkReminders=()=>{
       const now=new Date();
       const evts=storage.get("oos-calendar-events")||[];
       let changed=false;
-      evts.forEach(ev=>{
-        if(ev.completed||ev.reminded) return;
+      const updated=evts.map(ev=>{
+        if(ev.completed||ev.reminded) return ev;
         const evDate=new Date(ev.datetime);
         const diff=(evDate-now)/60000; // minutes
         if(diff<=0&&diff>-60){ // within the last hour
@@ -5779,11 +6202,12 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
               icon:"/favicon.ico"
             });
           }
-          ev.reminded=true;
           changed=true;
+          return {...ev, reminded:true};
         }
+        return ev;
       });
-      if(changed){setCalendarEvents([...evts]);storage.set("oos-calendar-events",evts);}
+      if(changed){setCalendarEvents(updated);storage.set("oos-calendar-events",updated);}
     };
     const interval=setInterval(checkReminders,60000);
     checkReminders();
@@ -5944,6 +6368,16 @@ Be direct and specific. Reference the user's background. No generic advice. Max 
       });
     }, 300);
   }, []);
+  // Keep ref in sync so setSaved effect can access it without dependency issues
+  schedulePipelineSyncRef.current = schedulePipelineSync;
+  // Auto-sync pipeline to Firebase whenever saved changes
+  const savedInitRef = React.useRef(true);
+  useEffect(() => {
+    if (savedInitRef.current) { savedInitRef.current = false; return; } // skip initial mount
+    if (schedulePipelineSyncRef.current) schedulePipelineSyncRef.current(saved);
+  }, [saved]);
+  // Cleanup debounce timer on unmount (Bug 20)
+  useEffect(() => () => clearTimeout(pipelineSaveTimer.current), []);
 
   const toggleTheme=()=>setTheme(p=>p==="dark"?"light":"dark");
 
@@ -6179,6 +6613,9 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
     {key:"vibe",label:"Vibe Agent",icon:"⚡",color:"#a78bfa"},
     {key:"calendar",label:"Calendar",icon:"📆",color:"#34d399"},
     {key:"network",label:"Network Intel",icon:"🕸",color:"#818cf8"},
+    {key:"_tools_",label:"TOOLS",icon:"",color:"",divider:true},
+    {key:"vault",label:"Document Vault",icon:"📄",color:"#38bdf8"},
+    {key:"contacts",label:"Contacts",icon:"👥",color:"#2dd4bf"},
     {key:"settings",label:"Settings",icon:"⚙",color:t.textMuted},
   ];
 
@@ -6195,7 +6632,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
   const profileComplete = gateItems.every(g=>g.ok);
   const missingItems = gateItems.filter(g=>!g.ok).map(g=>g.label);
 
-  const activeM=modules.find(m=>m.key===activeModule)||modules[0];
+  const activeM=modules.find(m=>m.key===activeModule&&!m.divider)||modules[0];
   const moduleColor=activeM.color;
 
   const navItemStyle=(m)=>{
@@ -6231,8 +6668,11 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
 
         {/* Nav items */}
         <div style={{flex:1,padding:"6px 8px"}}>
-          {modules.map(m=>(
-            <button key={m.key} data-module={m.key} onClick={()=>{ if(!profileComplete&&gatedModules.includes(m.key)) return; setActiveModule(m.key); }} style={navItemStyle(m)} title={!profileComplete&&gatedModules.includes(m.key)?"Complete your profile in Settings first":m.label}>
+          {modules.map(m=>{
+            if(m.divider) return <div key={m.key} style={{fontSize:10,fontWeight:700,letterSpacing:"0.1em",color:t.textDim,padding:"14px 10px 4px",opacity:0.6}}>{m.label}</div>;
+            const locked = !profileComplete && gatedModules.includes(m.key);
+            return (
+            <button key={m.key} data-module={m.key} onClick={()=>{ if(locked) return; setActiveModule(m.key); }} style={navItemStyle(m)} title={locked?"Complete your profile in Settings first":m.label}>
               <span style={{fontSize:16}}>{m.icon}</span>
               <span style={{flex:1}}>{m.label}</span>
               {m.key==="board"&&bsLoading&&<span style={{width:6,height:6,borderRadius:"50%",background:"#6ee7b7",animation:"pulse 1s ease-in-out infinite",flexShrink:0}}/>}
@@ -6248,8 +6688,10 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
               {m.key==="exec"&&!esLoading&&esResults.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#c084fc20",color:"#c084fc"}}>{esResults.length}</span>}
               {m.key==="deal"&&!dmLoading&&deals.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#f6c90e"+"20",color:"#f6c90e"}}>{deals.length}</span>}
               {m.key==="pipeline"&&saved.length>0&&<span style={{marginLeft:2,fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:t.indigoDim,color:t.indigo}}>{saved.length}</span>}
+              {m.key==="vault"&&vault.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#38bdf820",color:"#38bdf8"}}>{vault.length}</span>}
+              {m.key==="contacts"&&contacts.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#2dd4bf20",color:"#2dd4bf"}}>{contacts.length}</span>}
             </button>
-          ))}
+          );})}
         </div>
 
         {/* Profile + theme */}
@@ -6279,8 +6721,11 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
       {/* Mobile nav drawer */}
       {isMobile&&navOpen&&<div onClick={()=>setNavOpen(false)} style={{position:"fixed",inset:0,zIndex:300,background:"rgba(0,0,0,0.6)"}}>
         <div onClick={e=>e.stopPropagation()} style={{position:"absolute",top:0,left:0,width:240,height:"100%",background:t.surface,borderRight:"1px solid "+t.border,padding:"60px 10px 20px",display:"flex",flexDirection:"column",gap:4}}>
-          {modules.map(m=>(
-            <button key={m.key} data-module={m.key} onClick={()=>{ if(!profileComplete&&gatedModules.includes(m.key)) return; setActiveModule(m.key);setNavOpen(false); }} style={{...navItemStyle(m)}} title={!profileComplete&&gatedModules.includes(m.key)?"Complete your profile in Settings first":m.label}>
+          {modules.map(m=>{
+            if(m.divider) return <div key={m.key} style={{fontSize:10,fontWeight:700,letterSpacing:"0.1em",color:t.textDim,padding:"10px 10px 2px",opacity:0.6}}>{m.label}</div>;
+            const locked = !profileComplete && gatedModules.includes(m.key);
+            return (
+            <button key={m.key} data-module={m.key} onClick={()=>{ if(locked) return; setActiveModule(m.key);setNavOpen(false); }} style={{...navItemStyle(m)}} title={locked?"Complete your profile in Settings first":m.label}>
               <span style={{fontSize:16}}>{m.icon}</span>
               <span style={{flex:1}}>{m.label}</span>
               {m.key==="board"&&bsLoading&&<span style={{width:6,height:6,borderRadius:"50%",background:"#6ee7b7",animation:"pulse 1s ease-in-out infinite"}}/>}
@@ -6288,8 +6733,11 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
               {m.key==="hustle"&&shLoading&&<span style={{width:6,height:6,borderRadius:"50%",background:"#fb923c",animation:"pulse 1s ease-in-out infinite"}}/>}
               {m.key==="exec"&&esLoading&&<span style={{width:6,height:6,borderRadius:"50%",background:"#c084fc",animation:"pulse 1s ease-in-out infinite"}}/>}
               {m.key==="deal"&&dmLoading&&<span style={{width:6,height:6,borderRadius:"50%",background:"#f6c90e",animation:"pulse 1s ease-in-out infinite"}}/>}
+              {m.key==="vault"&&vault.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#38bdf820",color:"#38bdf8"}}>{vault.length}</span>}
+              {m.key==="contacts"&&contacts.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#2dd4bf20",color:"#2dd4bf"}}>{contacts.length}</span>}
             </button>
-          ))}
+          );})}
+
         </div>
       </div>}
 
@@ -6311,6 +6759,8 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
                 {activeModule==="pipeline"&&saved.length+" opportunities saved across all modules"}
                 {activeModule==="network"&&"Map warm intro paths from your professional network"}
                 {activeModule==="vibe"&&"Your autonomous opportunity agent — scan, plan, and discover"}
+                {activeModule==="vault"&&vault.length+" document"+(vault.length!==1?"s":"")+" saved"}
+                {activeModule==="contacts"&&contacts.length+" contact"+(contacts.length!==1?"s":"")}
                 {activeModule==="settings"&&"Profile, API, tax profile & goal runway"}
               </div>
             </div>
@@ -6326,32 +6776,35 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
         <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column"}}>
           <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column",padding:activeModule==="vibe"?"0":isMobile?"10px 10px":"12px 14px"}}>
           {/* Single-column pages get their own scroll context */}
-          {(activeModule==="home"||activeModule==="settings"||activeModule==="pipeline"||activeModule==="calendar")&&
+          {(activeModule==="home"||activeModule==="settings"||activeModule==="pipeline"||activeModule==="calendar"||activeModule==="vault"||activeModule==="contacts")&&
             <div style={{flex:1,overflowY:"auto",minHeight:0}}>
-              {activeModule==="home"&&<CommandCenter t={t} profile={profile} saved={saved} isMobile={isMobile} setActiveModule={setActiveModule} apiKey={apiKey} provider={provider} profileComplete={profileComplete} gatedModules={gatedModules}/>}
-              {activeModule==="pipeline"&&<PipelineModule t={t} saved={saved} setSaved={setSaved} isMobile={isMobile} onOpenChat={(item)=>openChat(item)} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onNavigateToSource={(item)=>{const tabMap={board:"saved",venture:"saved",hustle:"saved",deal:"saved",exec:"saved"};const modMap={board:"board",venture:"venture",hustle:"hustle",deal:"deal",exec:"exec"};const prefMap={board:"bs",venture:"vs",hustle:"sh",deal:"dm",exec:"es"};storage.set((prefMap[item.source]||"bs")+"-tab",tabMap[item.source]||"saved");setActiveModule(modMap[item.source]||"board");}}/>}
+              {activeModule==="home"&&<CommandCenter t={t} profile={profile} saved={saved} isMobile={isMobile} setActiveModule={setActiveModule} apiKey={apiKey} provider={provider} profileComplete={profileComplete} gatedModules={gatedModules} activityLog={activityLog} contacts={contacts} saveToVault={saveToVault}/>}
+              {activeModule==="pipeline"&&<PipelineModule t={t} saved={saved} setSaved={setSaved} isMobile={isMobile} onOpenChat={(item)=>openChat(item)} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} onNavigateToSource={(item)=>{const tabMap={board:"saved",venture:"saved",hustle:"saved",deal:"saved",exec:"saved"};const modMap={board:"board",venture:"venture",hustle:"hustle",deal:"deal",exec:"exec"};const prefMap={board:"bs",venture:"vs",hustle:"sh",deal:"dm",exec:"es"};storage.set((prefMap[item.source]||"bs")+"-tab",tabMap[item.source]||"saved");setActiveModule(modMap[item.source]||"board");}}/>}
               {activeModule==="calendar"&&<CalendarModule t={t} isMobile={isMobile} events={calendarEvents} onSaveEvents={saveCalendarEvents} saved={saved} onScheduleItem={setScheduleModalItem} onNavigate={setActiveModule}/>}
               {activeModule==="settings"&&<SettingsModule t={t} profile={profile} setProfile={p=>{setProfile(p);storage.set("oos-profile",p);}} apiKey={apiKey} setApiKey={setApiKey} provider={provider} setProvider={setProvider} isMobile={isMobile} isNewUser={startOnSettings}/>}
+              {activeModule==="vault"&&<DocumentVaultModule t={t} isMobile={isMobile} vault={vault} setVault={setVault} onRegenerate={(sourceItem)=>{setDocGenItem(sourceItem);}}/>}
+              {activeModule==="contacts"&&<ContactsModule t={t} isMobile={isMobile} contacts={contacts} setContacts={setContacts} activityLog={activityLog} saved={saved} onNavigateToNetwork={(company)=>{setNiFreeSearch(company);setActiveModule("network");}}/>}
             </div>
           }
           {/* Two-column pages manage their own scroll per panel */}
-          {activeModule==="board"&&<BoardScoutModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} boardResults={boardResults} setBoardResults={setBoardResults} consultResults={consultResults} setConsultResults={setConsultResults} bsLoading={bsLoading} setBsLoading={setBsLoading} bsScanLog={bsScanLog} setBsScanLog={setBsScanLog} bsLastScanned={bsLastScanned} setBsLastScanned={setBsLastScanned}/>}
-          {activeModule==="venture"&&<VentureScoutModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} ventures={ventures} setVentures={setVentures} ideas={ideas} setIdeas={setIdeas} vsLoading={vsLoading} setVsLoading={setVsLoading} vsScanLog={vsScanLog} setVsScanLog={setVsScanLog} vsLastScanned={vsLastScanned} setVsLastScanned={setVsLastScanned}/>}
-          {activeModule==="hustle"&&<SideHustleModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} hustles={hustles} setHustles={setHustles} shLoading={shLoading} setShLoading={setShLoading} shScanLog={shScanLog} setShScanLog={setShScanLog} shLastScanned={shLastScanned} setShLastScanned={setShLastScanned}/>}
-          {activeModule==="exec"&&<ExecSearchModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} esResults={esResults} setEsResults={setEsResults} esLoading={esLoading} setEsLoading={setEsLoading} esScanLog={esScanLog} setEsScanLog={setEsScanLog} esLastScanned={esLastScanned} setEsLastScanned={setEsLastScanned}/>}
-          {activeModule==="deal"&&<DealMonitorModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} deals={deals} setDeals={setDeals} dmLoading={dmLoading} setDmLoading={setDmLoading} dmScanLog={dmScanLog} setDmScanLog={setDmScanLog} dmLastScanned={dmLastScanned} setDmLastScanned={setDmLastScanned}/>}
+          {activeModule==="board"&&<BoardScoutModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} boardResults={boardResults} setBoardResults={setBoardResults} consultResults={consultResults} setConsultResults={setConsultResults} bsLoading={bsLoading} setBsLoading={setBsLoading} bsScanLog={bsScanLog} setBsScanLog={setBsScanLog} bsLastScanned={bsLastScanned} setBsLastScanned={setBsLastScanned}/>}
+          {activeModule==="venture"&&<VentureScoutModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} ventures={ventures} setVentures={setVentures} ideas={ideas} setIdeas={setIdeas} vsLoading={vsLoading} setVsLoading={setVsLoading} vsScanLog={vsScanLog} setVsScanLog={setVsScanLog} vsLastScanned={vsLastScanned} setVsLastScanned={setVsLastScanned}/>}
+          {activeModule==="hustle"&&<SideHustleModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} hustles={hustles} setHustles={setHustles} shLoading={shLoading} setShLoading={setShLoading} shScanLog={shScanLog} setShScanLog={setShScanLog} shLastScanned={shLastScanned} setShLastScanned={setShLastScanned}/>}
+          {activeModule==="exec"&&<ExecSearchModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} esResults={esResults} setEsResults={setEsResults} esLoading={esLoading} setEsLoading={setEsLoading} esScanLog={esScanLog} setEsScanLog={setEsScanLog} esLastScanned={esLastScanned} setEsLastScanned={setEsLastScanned}/>}
+          {activeModule==="deal"&&<DealMonitorModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} deals={deals} setDeals={setDeals} dmLoading={dmLoading} setDmLoading={setDmLoading} dmScanLog={dmScanLog} setDmScanLog={setDmScanLog} dmLastScanned={dmLastScanned} setDmLastScanned={setDmLastScanned}/>}
           {/* Vibe Agent tab — full page agent */}
           {activeModule==="vibe"&&<VibeAgentModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} vaMessages={vaMessages} setVaMessages={setVaMessages} vaScanLog={vaScanLog} setVaScanLog={setVaScanLog} vaInput={vaInput} setVaInput={setVaInput} vaLoading={vaLoading} setVaLoading={setVaLoading} setActiveModule={setActiveModule}/>}
-          {activeModule==="network"&&<NetworkModulePage t={t} profile={profile} apiKey={apiKey} provider={provider} isMobile={isMobile} saved={saved} onOpenChat={openChat} niLoading={niLoading} setNiLoading={setNiLoading} niAnalysis={niAnalysis} setNiAnalysis={setNiAnalysis} niError={niError} setNiError={setNiError} niTarget={niTarget} setNiTarget={setNiTarget} niFreeSearch={niFreeSearch} setNiFreeSearch={setNiFreeSearch}/>}
+          {activeModule==="network"&&<NetworkModulePage t={t} profile={profile} apiKey={apiKey} provider={provider} isMobile={isMobile} saved={saved} onOpenChat={openChat} niLoading={niLoading} setNiLoading={setNiLoading} niAnalysis={niAnalysis} setNiAnalysis={setNiAnalysis} niError={niError} setNiError={setNiError} niTarget={niTarget} setNiTarget={setNiTarget} niFreeSearch={niFreeSearch} setNiFreeSearch={setNiFreeSearch} onSaveToVault={saveToVault} onSaveContact={saveContact}/>}
           </div>
         </div>
       </div>
 
       {/* Root-level panels — outside all scroll containers so position:fixed works ──────── */}
       {scheduleModalItem&&<ScheduleEventModal t={t} item={scheduleModalItem} events={calendarEvents} onSave={(evts)=>{saveCalendarEvents(evts);setScheduleModalItem(null);}} onClose={()=>setScheduleModalItem(null)}/>}
+      {activityLogItem&&<ActivityLogModal t={t} item={activityLogItem} onSave={saveActivityEntry} onClose={()=>setActivityLogItem(null)}/>}
       {taxPanelItem&&<TaxOptimiserPanel item={taxPanelItem} profile={profile} apiKey={apiKey} provider={provider} t={t} onClose={()=>setTaxPanelItem(null)}/>}
-      {networkPanelItem&&<NetworkIntelligencePanel item={networkPanelItem} profile={profile} apiKey={apiKey} provider={provider} t={t} onClose={()=>setNetworkPanelItem(null)} onSaveAnalysis={(id,analysis)=>{setSaved(p=>p.map(s=>(s.id===id||s.name===id)?{...s,networkAnalysis:analysis,networkAnalysedAt:new Date().toISOString()}:s));}}/>}
-      {docGenItem&&<DocumentGenerator item={docGenItem} profile={profile} apiKey={apiKey} provider={provider} t={t} onClose={()=>setDocGenItem(null)}/>}
+      {networkPanelItem&&<NetworkIntelligencePanel item={networkPanelItem} profile={profile} apiKey={apiKey} provider={provider} t={t} onClose={()=>setNetworkPanelItem(null)} onSaveAnalysis={(id,analysis)=>{setSaved(p=>p.map(s=>(s.id===id||s.name===id)?{...s,networkAnalysis:analysis,networkAnalysedAt:new Date().toISOString()}:s));}} onSaveToVault={saveToVault} onSaveContact={saveContact}/>}
+      {docGenItem&&<DocumentGenerator item={docGenItem} profile={profile} apiKey={apiKey} provider={provider} t={t} onClose={()=>setDocGenItem(null)} onSaveToVault={saveToVault}/>}
 
       {/* Floating chat button — hidden on Vibe Agent tab */}
       {!chatContext&&activeModule!=="vibe"&&(
@@ -6401,13 +6854,14 @@ function AppRoot() {
 
   // Firebase Auth Sync — restores session on page load
   useEffect(() => {
+    const unsubRef = { current: null };
     const attach = () => {
       if (!window.TorqueFirebase?.onAuthChange) return false;
-      const unsub = window.TorqueFirebase.onAuthChange((user) => {
+      unsubRef.current = window.TorqueFirebase.onAuthChange((user) => {
         if (user) {
           const existing = getCurrentUser();
           if (!existing || existing.email !== user.email) {
-            const sessionData = { email: user.email, onboarded: true };
+            const sessionData = { email: user.email, onboarded: true, ts: Date.now() };
             storage.gset("oos-session", sessionData);
             setSession(sessionData);
           }
@@ -6415,15 +6869,18 @@ function AppRoot() {
         // Signal auth check is done so loader can dismiss
         window.__firebaseAuthReady = true;
       });
-      return unsub;
+      return true;
     };
-    let unsub = attach();
-    if (!unsub) {
-      const onReady = () => { unsub = attach(); };
+    let attached = attach();
+    let onReady;
+    if (!attached) {
+      onReady = () => { attach(); };
       window.addEventListener("torquefirebase:ready", onReady);
-      return () => window.removeEventListener("torquefirebase:ready", onReady);
     }
-    return () => { if (unsub) unsub(); };
+    return () => {
+      if (onReady) window.removeEventListener("torquefirebase:ready", onReady);
+      if (unsubRef.current) unsubRef.current();
+    };
   }, []);
 
   const handleLogin = (isNew) => {
@@ -6537,11 +6994,12 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
       const token = await this.getIdToken();
       if (!token) return;
       const user = auth.currentUser;
-      await fetch(`${FUNCTIONS_BASE}/syncProfile`, {
+      const res = await fetch(`${FUNCTIONS_BASE}/syncProfile`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
         body: JSON.stringify({ profile, email: user?.email }),
       });
+      if (!res.ok) console.error("syncProfile failed:", res.status);
     },
 
     // ── PIPELINE SYNC ───────────────────────────────────────────────────────
@@ -6564,23 +7022,27 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
           if (!snap.exists) return;
           const data = snap.data();
           if (data && data.items) callback(data.items);
-        });
+        }, err => console.error("Pipeline listener error:", err));
     },
 
     async getPipeline() {
       const user = auth.currentUser;
       if (!user) return null;
-      const snap = await db.doc(`users/${user.uid}/state/pipeline`).get();
-      if (!snap.exists) return null;
-      const data = snap.data();
-      return data && data.items ? data.items : null;
+      try {
+        const snap = await db.doc(`users/${user.uid}/state/pipeline`).get();
+        if (!snap.exists) return null;
+        const data = snap.data();
+        return data && data.items ? data.items : null;
+      } catch(e) { console.error("getPipeline failed:", e); return null; }
     },
 
     async getProfile() {
       const user = auth.currentUser;
       if (!user) return null;
-      const doc = await db.doc(`users/${user.uid}/profile/main`).get();
-      return doc.exists ? doc.data() : null;
+      try {
+        const doc = await db.doc(`users/${user.uid}/profile/main`).get();
+        return doc.exists ? doc.data() : null;
+      } catch(e) { console.error("getProfile failed:", e); return null; }
     },
 
     // ── SCHEDULE MANAGEMENT ─────────────────────────────────────────────────
@@ -6593,6 +7055,7 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
         body: JSON.stringify(scheduleConfig),
       });
+      if (!res.ok) { console.error("saveSchedule failed:", res.status); return null; }
       return res.json();
     },
 
@@ -6602,6 +7065,7 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
       const res = await fetch(`${FUNCTIONS_BASE}/getSchedules`, {
         headers: { "Authorization": `Bearer ${token}` },
       });
+      if (!res.ok) { console.error("getSchedules failed:", res.status); return []; }
       const data = await res.json();
       return data.schedules || [];
     },
@@ -6609,16 +7073,19 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
     async deleteSchedule(scheduleId) {
       const token = await this.getIdToken();
       if (!token) return;
-      await fetch(`${FUNCTIONS_BASE}/deleteSchedule?scheduleId=${scheduleId}`, {
+      const res = await fetch(`${FUNCTIONS_BASE}/deleteSchedule?scheduleId=${encodeURIComponent(scheduleId)}`, {
         method: "DELETE",
         headers: { "Authorization": `Bearer ${token}` },
       });
+      if (!res.ok) console.error("deleteSchedule failed:", res.status);
     },
 
     async toggleSchedule(scheduleId, enabled) {
       const user = auth.currentUser;
       if (!user) return;
-      await db.doc(`users/${user.uid}/schedules/${scheduleId}`).update({ enabled });
+      try {
+        await db.doc(`users/${user.uid}/schedules/${scheduleId}`).set({ enabled }, { merge: true });
+      } catch(e) { console.error("toggleSchedule failed:", e); }
     },
 
     // Subscribe to schedule list in real time
@@ -6627,7 +7094,7 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
       if (!user) return () => {};
       return db.collection(`users/${user.uid}/schedules`)
         .orderBy("createdAt", "desc")
-        .onSnapshot(snap => callback(snap.docs.map(d => d.data())));
+        .onSnapshot(snap => callback(snap.docs.map(d => d.data())), err => console.error("Schedules listener error:", err));
     },
 
     // ── API KEY CONFIG ──────────────────────────────────────────────────────
@@ -6635,11 +7102,12 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
     async saveApiKeys({ claudeKey, resendKey, digestEnabled }) {
       const token = await this.getIdToken();
       if (!token) return;
-      await fetch(`${FUNCTIONS_BASE}/saveApiKeys`, {
+      const res = await fetch(`${FUNCTIONS_BASE}/saveApiKeys`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
         body: JSON.stringify({ claudeKey, resendKey, digestEnabled }),
       });
+      if (!res.ok) console.error("saveApiKeys failed:", res.status);
     },
 
     // ── SCAN HISTORY ────────────────────────────────────────────────────────
@@ -6647,11 +7115,13 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
     async getScanHistory(limit = 20) {
       const user = auth.currentUser;
       if (!user) return [];
-      const snap = await db.collection(`users/${user.uid}/scanHistory`)
-        .orderBy("ranAt", "desc")
-        .limit(limit)
-        .get();
-      return snap.docs.map(d => d.data());
+      try {
+        const snap = await db.collection(`users/${user.uid}/scanHistory`)
+          .orderBy("ranAt", "desc")
+          .limit(limit)
+          .get();
+        return snap.docs.map(d => d.data());
+      } catch(e) { console.error("getScanHistory failed:", e); return []; }
     },
 
     // ── UTILITY ─────────────────────────────────────────────────────────────
