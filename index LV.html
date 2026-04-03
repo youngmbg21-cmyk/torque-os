@@ -126,6 +126,7 @@ This typically indicates that your device does not have a healthy Internet conne
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
 <script type="text/babel">
 const { useState, useCallback, useEffect, useRef, useMemo } = React;
 
@@ -698,13 +699,40 @@ const ScoreBadge = ({item, profile, t, size="sm"}) => {
 };
 
 // ─── AUTH & NAMESPACED STORAGE ───────────────────────────────────────────────
-const hashPassword = async (pw) => {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pw));
-  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+const hashPassword = async (pw, salt) => {
+  if (!salt) {
+    const saltBuf = crypto.getRandomValues(new Uint8Array(16));
+    salt = Array.from(saltBuf).map(b=>b.toString(16).padStart(2,"0")).join("");
+  }
+  const keyMaterial = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({name:"PBKDF2", salt:new TextEncoder().encode(salt), iterations:100000, hash:"SHA-256"}, keyMaterial, 256);
+  const hash = Array.from(new Uint8Array(bits)).map(b=>b.toString(16).padStart(2,"0")).join("");
+  return salt + ":" + hash;
+};
+const verifyPassword = async (pw, stored) => {
+  if (!stored || !stored.includes(":")) {
+    // Legacy SHA-256 hash (no salt) — compare old way then migrate
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pw));
+    const oldHash = Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+    return oldHash === stored;
+  }
+  const salt = stored.split(":")[0];
+  const rehashed = await hashPassword(pw, salt);
+  return rehashed === stored;
 };
 
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const getCurrentUser = () => {
-  try { return JSON.parse(localStorage.getItem("oos-session")||"null"); } catch { return null; }
+  try {
+    const session = JSON.parse(localStorage.getItem("oos-session")||"null");
+    if (!session) return null;
+    // Expire sessions older than SESSION_MAX_AGE_MS
+    if (session.ts && (Date.now() - session.ts) > SESSION_MAX_AGE_MS) {
+      localStorage.removeItem("oos-session");
+      return null;
+    }
+    return session;
+  } catch { return null; }
 };
 
 const storage = {
@@ -966,7 +994,7 @@ const renderMD = (text, t) => {
     if(bm) { elements.push(<div key={i} style={{display:"flex",gap:8,paddingLeft:4,marginTop:4,alignItems:"flex-start"}}><span style={{color:t.textMuted,flexShrink:0,marginTop:3,fontSize:12}}>–</span><span style={{lineHeight:1.7}}>{renderInline(bm[1])}</span></div>); i++; continue; }
     const nm = tr.match(/^(\d+)\.\s+(.*)/);
     if(nm) { elements.push(<div key={i} style={{display:"flex",gap:8,paddingLeft:4,marginTop:4,alignItems:"flex-start"}}><span style={{color:t.textMuted,flexShrink:0,marginTop:2,fontSize:14,fontWeight:600,minWidth:16,fontFamily:"'DM Mono',monospace"}}>{nm[1]}.</span><span style={{lineHeight:1.7}}>{renderInline(nm[2])}</span></div>); i++; continue; }
-    elements.push(<div key={i} style={{lineHeight:1.7,marginTop:3}}>{renderInline(line)}</div>);
+    elements.push(<div key={i} style={{lineHeight:1.7,marginTop:3}}>{renderInline(tr)}</div>);
     i++;
   }
   return elements;
@@ -1115,7 +1143,7 @@ const StreamingChatbot = ({apiKey, provider, systemPrompt, title, subtitle, icon
   const prov = PROVIDERS[provider]||PROVIDERS.claude;
 
   useEffect(()=>{ if(scrollRef.current) scrollRef.current.scrollTop=scrollRef.current.scrollHeight; },[msgs]);
-  useEffect(()=>{ if(onMessagesChange) onMessagesChange(msgs.filter(m=>!m.streaming)); },[msgs]);
+  useEffect(()=>{ if(onMessagesChange) onMessagesChange(msgs.filter(m=>!m.streaming)); },[msgs, onMessagesChange]);
 
   const send = async () => {
     if(!input.trim()||loading||!apiKey) return;
@@ -1176,6 +1204,7 @@ const StreamingChatbot = ({apiKey, provider, systemPrompt, title, subtitle, icon
           }
           if(stopReason==="tool_use"&&toolBlocks.length){
             const ns=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify({model:prov.model,max_tokens:100,system:systemPrompt,tools:useSearch,messages:apiMsgs})});
+            if(!ns.ok){const errText=await ns.text().catch(()=>"");throw new Error(`API error ${ns.status}: ${errText.slice(0,200)}`);}
             const nd=await ns.json();
             apiMsgs=[...apiMsgs,{role:"assistant",content:nd.content||[]},{role:"user",content:(nd.content||[]).filter(b=>b.type==="tool_use").map(b=>({type:"tool_result",tool_use_id:b.id,content:"Search done"}))}];
             continue;
@@ -1990,7 +2019,7 @@ const DealMonitorModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,on
   const currentItems=tab==="deals"?deals.filter(i=>statusFilter==="ALL"||i.status===statusFilter):dmSaved.filter(i=>statusFilter==="ALL"||i.status===statusFilter);
 
   const ALL_GEO=ALL_COUNTRIES_FLAT.map(c=>c.name);
-  const ALL_SEC=ALL_SECTORS_FLAT.sort();
+  const ALL_SEC=[...ALL_SECTORS_FLAT].sort();
 
   const toggleGeo=(g)=>setThesis(p=>({...p,geographies:p.geographies.includes(g)?p.geographies.filter(x=>x!==g):[...p.geographies,g]}));
   const toggleSec=(s)=>setThesis(p=>({...p,sectors:p.sectors.includes(s)?p.sectors.filter(x=>x!==s):[...p.sectors,s]}));
@@ -2651,8 +2680,6 @@ const TaxOptimiserPanel = ({item,profile,apiKey,provider,t,onClose}) => {
   const incomeType=item.estimatedFee||item.entryCost?"fee-based income":item.equity?"equity / capital gain":"mixed income and equity";
   const sourceCountry=item.region||"unknown";
 
-  useEffect(()=>{ runAnalysis(); },[]);
-
   const runAnalysis=async()=>{
     if(!apiKey){setError("No API key — add it in Settings.");return;}
     setLoading(true);setError(null);setAnalysis(null);
@@ -2688,6 +2715,8 @@ Return 2-3 options. OUTPUT ONLY JSON.`;
     } catch(e){ setError("Analysis failed: "+e.message); }
     setLoading(false);
   };
+
+  useEffect(()=>{ if(apiKey && profile && item) runAnalysis(); },[apiKey, provider]);
 
   const effColor=e=>e==="high"?"#10b981":e==="medium"?"#f59e0b":"#ef4444";
   const urgColor=u=>u==="high"?"#ef4444":u==="medium"?"#f59e0b":u==="low"?"#3b82f6":t.textDim;
@@ -2729,7 +2758,7 @@ ${analysis.keyRisk?`<div class="risk"><strong style="color:#dc2626">Key risk: </
     const html=buildHTML();
     if(!html) return;
     const w=window.open("","_blank");
-    w.document.write(html);
+    w.document.write(typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html,{WHOLE_DOCUMENT:true,ADD_TAGS:["style","meta","link"],ADD_ATTR:["target"]}):html);
     w.document.close();
     w.focus();
     setTimeout(()=>w.print(),400);
@@ -2996,7 +3025,7 @@ ${(analysis.mutualOrgs||[]).filter(Boolean).length>0?`<h2>Shared Organisations</
 <p style="font-size:11px;color:#9ca3af;margin-top:32px;font-style:italic;">Generated by TorqueOS for ${profile.name||"User"}</p>
 </body></html>`;
     const w=window.open("","_blank");
-    w.document.write(html);
+    w.document.write(typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html,{WHOLE_DOCUMENT:true,ADD_TAGS:["style","meta","link"],ADD_ATTR:["target"]}):html);
     w.document.close();
     w.focus();
     setTimeout(()=>w.print(),400);
@@ -3383,7 +3412,7 @@ ${htmlLines}
 <p class="footer">Generated by TorqueOS for ${profile.name||"User"}</p>
 </body></html>`;
     const w=window.open("","_blank");
-    w.document.write(html);
+    w.document.write(typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html,{WHOLE_DOCUMENT:true,ADD_TAGS:["style","meta","link"],ADD_ATTR:["target"]}):html);
     w.document.close();
     w.focus();
     setTimeout(()=>w.print(),400);
@@ -3564,7 +3593,7 @@ const SettingsModule = ({t,profile,setProfile,apiKey,setApiKey,provider,setProvi
       // Also update local hash store so login still works
       const email = window.TorqueFirebase.getUserEmail();
       if(email){
-        const newHash = await hashPassword(pwNew);
+        const newHash = await hashPassword(pwNew); // now uses PBKDF2 with salt
         const users = storage.gget("oos-users")||{};
         if(users[email.toLowerCase()]){
           users[email.toLowerCase()].hash = newHash;
@@ -4480,7 +4509,7 @@ const LoginScreen = ({t, onLogin}) => {
       const isNew = !users[email];
       users[email] = users[email] || {hash:"google-oauth", createdAt:new Date().toISOString()};
       storage.gset("oos-users", users);
-      storage.gset("oos-session", {email});
+      storage.gset("oos-session", {email, ts:Date.now()});
       onLogin(isNew);
     } catch(e) {
       if(e.code !== "auth/popup-closed-by-user" && e.code !== "auth/cancelled-popup-request") {
@@ -4495,17 +4524,20 @@ const LoginScreen = ({t, onLogin}) => {
     if(!email.trim()||!password.trim()){setError("Please enter email and password.");setLoading(false);return;}
     if(!/^[^@]+@[^@]+\.[^@]+$/.test(email)){setError("Please enter a valid email.");setLoading(false);return;}
     if(password.length<6){setError("Password must be at least 6 characters.");setLoading(false);return;}
-    const hash = await hashPassword(password);
     const users = storage.gget("oos-users")||{};
     if(mode==="login"){
       // Try Firebase first — works on any device
       if(window.TorqueFirebase) {
         try {
           await window.TorqueFirebase.signIn(email.toLowerCase(), password);
-          // Firebase sign in worked — create local session too
-          users[email.toLowerCase()] = users[email.toLowerCase()] || {hash, createdAt:new Date().toISOString()};
-          storage.gset("oos-users", users);
-          storage.gset("oos-session", {email:email.toLowerCase()});
+          // Firebase sign in worked — update local hash to PBKDF2 if legacy
+          const existing = users[email.toLowerCase()];
+          if (!existing || !existing.hash || !existing.hash.includes(":")) {
+            const newHash = await hashPassword(password);
+            users[email.toLowerCase()] = {hash: newHash, createdAt: existing?.createdAt || new Date().toISOString()};
+            storage.gset("oos-users", users);
+          }
+          storage.gset("oos-session", {email:email.toLowerCase(), ts:Date.now()});
           setLoading(false);
           onLogin(false);
           return;
@@ -4515,19 +4547,31 @@ const LoginScreen = ({t, onLogin}) => {
       }
       // Local fallback
       if(!users[email.toLowerCase()]){setError("No account found. Create one below.");setLoading(false);return;}
-      if(users[email.toLowerCase()].hash!==hash){setError("Incorrect password.");setLoading(false);return;}
-      storage.gset("oos-session",{email:email.toLowerCase()});
+      const isValid = await verifyPassword(password, users[email.toLowerCase()].hash);
+      if(!isValid){setError("Incorrect password.");setLoading(false);return;}
+      // Migrate legacy hash to PBKDF2 on successful login
+      if(!users[email.toLowerCase()].hash.includes(":")){
+        users[email.toLowerCase()].hash = await hashPassword(password);
+        storage.gset("oos-users", users);
+      }
+      storage.gset("oos-session",{email:email.toLowerCase(), ts:Date.now()});
       onLogin(false);
     } else {
       // Register — create both Firebase and local account
+      let firebaseOk = false;
       if(window.TorqueFirebase) {
-        try { await window.TorqueFirebase.signUp(email.toLowerCase(), password); } catch(e) {
-          try { await window.TorqueFirebase.signIn(email.toLowerCase(), password); } catch(e2) {}
+        try { await window.TorqueFirebase.signUp(email.toLowerCase(), password); firebaseOk = true; } catch(e) {
+          try { await window.TorqueFirebase.signIn(email.toLowerCase(), password); firebaseOk = true; } catch(e2) {
+            setError("Could not create account — please check your internet connection and try again.");
+            setLoading(false);
+            return;
+          }
         }
       }
+      const hash = await hashPassword(password); // PBKDF2 with random salt
       users[email.toLowerCase()]={hash, createdAt:new Date().toISOString()};
       storage.gset("oos-users",users);
-      storage.gset("oos-session",{email:email.toLowerCase()});
+      storage.gset("oos-session",{email:email.toLowerCase(), ts:Date.now()});
       onLogin(true);
     }
     setLoading(false);
@@ -4686,7 +4730,6 @@ Return ONLY JSON, no markdown.`;
     const profile={
       ...(extractedProfile||manualProfile),
       regions:selectedCountries.map(c=>WORLD_COUNTRIES.find(w=>w.code===c)?.name).filter(Boolean),
-      regions:selectedCountries.map(c=>WORLD_COUNTRIES.find(w=>w.code===c)?.name).filter(Boolean),
       defaultSectors:selectedIndustries.slice(0,5),
       dmInvestmentRole:"Co-investor", dmTicketMin:0, dmTicketMax:0,
       dmDealStage:"Any stage", dmValueAdd:"", dmRedFlags:"",
@@ -4699,7 +4742,7 @@ Return ONLY JSON, no markdown.`;
     storage.set("oos-provider",localProvider);
     storage.set("oos-key",localApiKey);
     storage.set("oos-onboarded","yes");
-    storage.gset("oos-session",{email,onboarded:true});
+    storage.gset("oos-session",{email,onboarded:true,ts:Date.now()});
     setApiKey(localApiKey);
     setProvider(localProvider);
     onComplete(profile);
@@ -5744,16 +5787,8 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
   const [provider,setProvider]=useState(()=>storage.get("oos-provider")||"claude");
   const [apiKey,setApiKey]=useState(()=>storage.get("oos-key")||"");
   const [profile,setProfile]=useState(()=>storage.get("oos-profile")||initialProfile||DEFAULT_PROFILE);
-  const [saved,setSavedRaw]=useState(()=>storage.get("oos-saved")||[]);
-  // Wrapped setSaved — every pipeline change auto-schedules a Firebase sync
-  const setSaved = React.useCallback((updater) => {
-    setSavedRaw(prev => {
-      const next = typeof updater === "function" ? updater(prev) : updater;
-      // Schedule sync after state settles
-      setTimeout(() => schedulePipelineSync(next), 0);
-      return next;
-    });
-  }, [schedulePipelineSync]);
+  const [saved,setSaved]=useState(()=>storage.get("oos-saved")||[]);
+  const schedulePipelineSyncRef = React.useRef(null);
   const [chatContext,setChatContext]=useState(null);
   const [chatBrief,setChatBrief]=useState(null);
   const [chatMessages,setChatMessages]=useState(()=>storage.get("oos-chat-messages")||[{role:"assistant",content:"Hi! I'm your AI Advisor. Ask me anything about your opportunities, pipeline, strategy, or how to use the app.",id:"w1"}]);
@@ -5768,8 +5803,8 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
       const now=new Date();
       const evts=storage.get("oos-calendar-events")||[];
       let changed=false;
-      evts.forEach(ev=>{
-        if(ev.completed||ev.reminded) return;
+      const updated=evts.map(ev=>{
+        if(ev.completed||ev.reminded) return ev;
         const evDate=new Date(ev.datetime);
         const diff=(evDate-now)/60000; // minutes
         if(diff<=0&&diff>-60){ // within the last hour
@@ -5779,11 +5814,12 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
               icon:"/favicon.ico"
             });
           }
-          ev.reminded=true;
           changed=true;
+          return {...ev, reminded:true};
         }
+        return ev;
       });
-      if(changed){setCalendarEvents([...evts]);storage.set("oos-calendar-events",evts);}
+      if(changed){setCalendarEvents(updated);storage.set("oos-calendar-events",updated);}
     };
     const interval=setInterval(checkReminders,60000);
     checkReminders();
@@ -5944,6 +5980,16 @@ Be direct and specific. Reference the user's background. No generic advice. Max 
       });
     }, 300);
   }, []);
+  // Keep ref in sync so setSaved effect can access it without dependency issues
+  schedulePipelineSyncRef.current = schedulePipelineSync;
+  // Auto-sync pipeline to Firebase whenever saved changes
+  const savedInitRef = React.useRef(true);
+  useEffect(() => {
+    if (savedInitRef.current) { savedInitRef.current = false; return; } // skip initial mount
+    if (schedulePipelineSyncRef.current) schedulePipelineSyncRef.current(saved);
+  }, [saved]);
+  // Cleanup debounce timer on unmount (Bug 20)
+  useEffect(() => () => clearTimeout(pipelineSaveTimer.current), []);
 
   const toggleTheme=()=>setTheme(p=>p==="dark"?"light":"dark");
 
@@ -6401,13 +6447,14 @@ function AppRoot() {
 
   // Firebase Auth Sync — restores session on page load
   useEffect(() => {
+    const unsubRef = { current: null };
     const attach = () => {
       if (!window.TorqueFirebase?.onAuthChange) return false;
-      const unsub = window.TorqueFirebase.onAuthChange((user) => {
+      unsubRef.current = window.TorqueFirebase.onAuthChange((user) => {
         if (user) {
           const existing = getCurrentUser();
           if (!existing || existing.email !== user.email) {
-            const sessionData = { email: user.email, onboarded: true };
+            const sessionData = { email: user.email, onboarded: true, ts: Date.now() };
             storage.gset("oos-session", sessionData);
             setSession(sessionData);
           }
@@ -6415,15 +6462,18 @@ function AppRoot() {
         // Signal auth check is done so loader can dismiss
         window.__firebaseAuthReady = true;
       });
-      return unsub;
+      return true;
     };
-    let unsub = attach();
-    if (!unsub) {
-      const onReady = () => { unsub = attach(); };
+    let attached = attach();
+    let onReady;
+    if (!attached) {
+      onReady = () => { attach(); };
       window.addEventListener("torquefirebase:ready", onReady);
-      return () => window.removeEventListener("torquefirebase:ready", onReady);
     }
-    return () => { if (unsub) unsub(); };
+    return () => {
+      if (onReady) window.removeEventListener("torquefirebase:ready", onReady);
+      if (unsubRef.current) unsubRef.current();
+    };
   }, []);
 
   const handleLogin = (isNew) => {
@@ -6537,11 +6587,12 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
       const token = await this.getIdToken();
       if (!token) return;
       const user = auth.currentUser;
-      await fetch(`${FUNCTIONS_BASE}/syncProfile`, {
+      const res = await fetch(`${FUNCTIONS_BASE}/syncProfile`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
         body: JSON.stringify({ profile, email: user?.email }),
       });
+      if (!res.ok) console.error("syncProfile failed:", res.status);
     },
 
     // ── PIPELINE SYNC ───────────────────────────────────────────────────────
@@ -6564,23 +6615,27 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
           if (!snap.exists) return;
           const data = snap.data();
           if (data && data.items) callback(data.items);
-        });
+        }, err => console.error("Pipeline listener error:", err));
     },
 
     async getPipeline() {
       const user = auth.currentUser;
       if (!user) return null;
-      const snap = await db.doc(`users/${user.uid}/state/pipeline`).get();
-      if (!snap.exists) return null;
-      const data = snap.data();
-      return data && data.items ? data.items : null;
+      try {
+        const snap = await db.doc(`users/${user.uid}/state/pipeline`).get();
+        if (!snap.exists) return null;
+        const data = snap.data();
+        return data && data.items ? data.items : null;
+      } catch(e) { console.error("getPipeline failed:", e); return null; }
     },
 
     async getProfile() {
       const user = auth.currentUser;
       if (!user) return null;
-      const doc = await db.doc(`users/${user.uid}/profile/main`).get();
-      return doc.exists ? doc.data() : null;
+      try {
+        const doc = await db.doc(`users/${user.uid}/profile/main`).get();
+        return doc.exists ? doc.data() : null;
+      } catch(e) { console.error("getProfile failed:", e); return null; }
     },
 
     // ── SCHEDULE MANAGEMENT ─────────────────────────────────────────────────
@@ -6593,6 +6648,7 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
         body: JSON.stringify(scheduleConfig),
       });
+      if (!res.ok) { console.error("saveSchedule failed:", res.status); return null; }
       return res.json();
     },
 
@@ -6602,6 +6658,7 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
       const res = await fetch(`${FUNCTIONS_BASE}/getSchedules`, {
         headers: { "Authorization": `Bearer ${token}` },
       });
+      if (!res.ok) { console.error("getSchedules failed:", res.status); return []; }
       const data = await res.json();
       return data.schedules || [];
     },
@@ -6609,16 +6666,19 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
     async deleteSchedule(scheduleId) {
       const token = await this.getIdToken();
       if (!token) return;
-      await fetch(`${FUNCTIONS_BASE}/deleteSchedule?scheduleId=${scheduleId}`, {
+      const res = await fetch(`${FUNCTIONS_BASE}/deleteSchedule?scheduleId=${encodeURIComponent(scheduleId)}`, {
         method: "DELETE",
         headers: { "Authorization": `Bearer ${token}` },
       });
+      if (!res.ok) console.error("deleteSchedule failed:", res.status);
     },
 
     async toggleSchedule(scheduleId, enabled) {
       const user = auth.currentUser;
       if (!user) return;
-      await db.doc(`users/${user.uid}/schedules/${scheduleId}`).update({ enabled });
+      try {
+        await db.doc(`users/${user.uid}/schedules/${scheduleId}`).set({ enabled }, { merge: true });
+      } catch(e) { console.error("toggleSchedule failed:", e); }
     },
 
     // Subscribe to schedule list in real time
@@ -6627,7 +6687,7 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
       if (!user) return () => {};
       return db.collection(`users/${user.uid}/schedules`)
         .orderBy("createdAt", "desc")
-        .onSnapshot(snap => callback(snap.docs.map(d => d.data())));
+        .onSnapshot(snap => callback(snap.docs.map(d => d.data())), err => console.error("Schedules listener error:", err));
     },
 
     // ── API KEY CONFIG ──────────────────────────────────────────────────────
@@ -6635,11 +6695,12 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
     async saveApiKeys({ claudeKey, resendKey, digestEnabled }) {
       const token = await this.getIdToken();
       if (!token) return;
-      await fetch(`${FUNCTIONS_BASE}/saveApiKeys`, {
+      const res = await fetch(`${FUNCTIONS_BASE}/saveApiKeys`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
         body: JSON.stringify({ claudeKey, resendKey, digestEnabled }),
       });
+      if (!res.ok) console.error("saveApiKeys failed:", res.status);
     },
 
     // ── SCAN HISTORY ────────────────────────────────────────────────────────
@@ -6647,11 +6708,13 @@ const FUNCTIONS_BASE = "https://us-central1-torqueos-51b4d.cloudfunctions.net";
     async getScanHistory(limit = 20) {
       const user = auth.currentUser;
       if (!user) return [];
-      const snap = await db.collection(`users/${user.uid}/scanHistory`)
-        .orderBy("ranAt", "desc")
-        .limit(limit)
-        .get();
-      return snap.docs.map(d => d.data());
+      try {
+        const snap = await db.collection(`users/${user.uid}/scanHistory`)
+          .orderBy("ranAt", "desc")
+          .limit(limit)
+          .get();
+        return snap.docs.map(d => d.data());
+      } catch(e) { console.error("getScanHistory failed:", e); return []; }
     },
 
     // ── UTILITY ─────────────────────────────────────────────────────────────
