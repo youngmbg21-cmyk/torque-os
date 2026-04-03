@@ -3948,6 +3948,312 @@ Return ONLY JSON, no markdown, no backticks.`;
   );
 };
 
+// ─── MODULE: CONTROL TOWER ────────────────────────────────────────────────────
+const ControlTowerModule = ({t, isMobile, saved, activityLog, contacts, calendarEvents, setActiveModule}) => {
+  const TC = {board:"#6ee7b7", exec:"#c084fc", hustle:"#fb923c", venture:"#818cf8", deal:"#f6c90e"};
+  const [selectedOpp, setSelectedOpp] = useState(null);
+
+  const now = new Date();
+  const DAY = 24*60*60*1000;
+
+  // Derived KPIs — all computed live from real data
+  const activeOpps = saved.filter(s => {
+    const entries = (activityLog||[]).filter(e => e.pipelineCardId === (s.id||s.name));
+    if (!entries.length) return false;
+    const latest = new Date(Math.max(...entries.map(e => new Date(e.loggedAt))));
+    return (now - latest) < 14 * DAY;
+  });
+
+  const dormantOpps = saved.filter(s => {
+    const entries = (activityLog||[]).filter(e => e.pipelineCardId === (s.id||s.name));
+    if (!entries.length) return true;
+    const latest = new Date(Math.max(...entries.map(e => new Date(e.loggedAt))));
+    return (now - latest) >= 14 * DAY;
+  });
+
+  const upcomingEvents = (calendarEvents||[])
+    .filter(e => !e.completed && new Date(e.datetime) >= now)
+    .sort((a,b) => new Date(a.datetime) - new Date(b.datetime))
+    .slice(0, 10);
+
+  const overdueEvents = (calendarEvents||[])
+    .filter(e => !e.completed && new Date(e.datetime) < now)
+    .sort((a,b) => new Date(b.datetime) - new Date(a.datetime))
+    .slice(0, 5);
+
+  const actionsThisWeek = (calendarEvents||[]).filter(e => {
+    const d = new Date(e.datetime);
+    return d >= now && d <= new Date(now.getTime() + 7*DAY);
+  });
+
+  const hotCount = saved.filter(s => s.status === "HOT" || s.status === "PURSUE" || s.status === "BUILD").length;
+
+  // Pipeline stages derived from kanbanStage or status
+  const getStage = (s) => {
+    const ks = (s.kanbanStage||"").toLowerCase();
+    const st = (s.status||"").toLowerCase();
+    if (ks === "decision" || st === "decision") return "decision";
+    if (ks === "talking" || ks === "in conversation" || st === "active") return "talking";
+    if (ks === "outreach" || ks === "outreach sent") return "outreach";
+    if (ks === "researching" || ks === "research" || st === "researching") return "research";
+    return "saved";
+  };
+
+  const STAGES = [
+    {key:"saved", label:"Saved", sub:"identified"},
+    {key:"research", label:"Researching", sub:"NI / docs"},
+    {key:"outreach", label:"Outreach", sub:"in contact"},
+    {key:"talking", label:"Talking", sub:"active conv."},
+    {key:"decision", label:"Decision", sub:"close stage"},
+  ];
+
+  // Sectors summary
+  const sectors = {};
+  saved.forEach(s => { sectors[s.sector||"Other"] = (sectors[s.sector||"Other"]||0)+1; });
+  const topSectors = Object.entries(sectors).sort((a,b)=>b[1]-a[1]).slice(0,4);
+
+  // Activity this week
+  const weekAgo = new Date(now.getTime() - 7*DAY);
+  const recentActivity = (activityLog||[]).filter(e => new Date(e.loggedAt) >= weekAgo);
+  const actByType = {};
+  recentActivity.forEach(e => { actByType[e.actionType] = (actByType[e.actionType]||0)+1; });
+
+  const typeColor = {board:"#6ee7b7",exec:"#c084fc",hustle:"#fb923c",venture:"#818cf8",deal:"#f6c90e"};
+  const getOppColor = (s) => {
+    const hasRecent = activeOpps.some(a => a.id === s.id || a.name === s.name);
+    return hasRecent ? (typeColor[s.source]||"#818cf8") : "#9ca3af";
+  };
+
+  const calColor = {call:"#0891b2","follow-up":"#7c3aed",meeting:"#ea580c",deadline:"#dc2626",research:"#16a34a",outreach:"#4f46e5",custom:"#a78bfa"};
+
+  const s = {
+    card: {background:t.card, border:"1px solid "+t.border, borderRadius:10, padding:"12px 14px"},
+    label: {fontSize:10, fontWeight:700, letterSpacing:"0.07em", color:t.textDim, marginBottom:8},
+    spokeItem: {fontSize:11, color:t.textMuted, padding:"3px 0", borderBottom:"1px solid "+t.border+"60", display:"flex", justifyContent:"space-between", alignItems:"center"},
+  };
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+
+      {/* Top stat pills */}
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+        <span style={{fontSize:13,color:t.textMuted}}>{saved.length} opportunities</span>
+        <span style={{color:t.textDim}}>·</span>
+        {Object.entries({board:"#6ee7b7",exec:"#c084fc",hustle:"#fb923c",venture:"#818cf8",deal:"#f6c90e"}).map(([src,col])=>{
+          const cnt = saved.filter(s=>s.source===src).length;
+          if(!cnt) return null;
+          return <span key={src} style={{fontSize:11,fontWeight:700,padding:"2px 9px",borderRadius:20,border:"1px solid "+col+"40",color:col,background:col+"12"}}>{cnt} {src}</span>;
+        })}
+        {dormantOpps.length>0&&<span style={{fontSize:11,fontWeight:700,padding:"2px 9px",borderRadius:20,border:"1px solid #ef444440",color:"#ef4444",background:"#ef444412"}}>{dormantOpps.length} dormant</span>}
+      </div>
+
+      {/* Pipeline flow */}
+      <div style={s.card}>
+        <div style={s.label}>OPPORTUNITY PIPELINE FLOW</div>
+        <div style={{display:"flex",alignItems:"stretch",gap:0,overflowX:"auto",paddingBottom:4}}>
+          {STAGES.map((stage,si)=>{
+            const items = saved.filter(op => getStage(op) === stage.key);
+            return (
+              <React.Fragment key={stage.key}>
+                {si>0&&<div style={{display:"flex",alignItems:"center",color:t.textDim,fontSize:14,padding:"0 2px",alignSelf:"center",marginTop:-24}}>›</div>}
+                <div style={{flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",minWidth:100}}>
+                  <div style={{fontSize:18,fontWeight:700,color:t.text,textAlign:"center",marginBottom:3}}>{items.length}</div>
+                  <div style={{fontSize:10,fontWeight:600,color:t.textDim,textAlign:"center",marginBottom:8}}>{stage.label}<br/><span style={{fontWeight:400}}>{stage.sub}</span></div>
+                  <div style={{display:"flex",flexDirection:"column",gap:4,width:"100%",padding:"0 4px"}}>
+                    {items.map(op=>{
+                      const color = getOppColor(op);
+                      const isSel = selectedOpp && selectedOpp.id === op.id;
+                      return (
+                        <div key={op.id||op.name} onClick={()=>setSelectedOpp(isSel?null:op)}
+                          style={{borderRadius:"0 6px 6px 0",padding:"5px 7px",cursor:"pointer",border:"0.5px solid "+(isSel?color:t.border),borderLeft:"2px solid "+color,background:isSel?t.card:t.input,transition:"all 0.15s"}}>
+                          <div style={{fontSize:11,fontWeight:600,color:t.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:85}}>{op.name}</div>
+                          <div style={{fontSize:10,color:t.textDim}}>{op.region||""}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </React.Fragment>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Selected opp detail */}
+      {selectedOpp&&(()=>{
+        const color = typeColor[selectedOpp.source]||"#818cf8";
+        const oppActivity = (activityLog||[]).filter(e=>e.pipelineCardId===(selectedOpp.id||selectedOpp.name)).sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt));
+        const lastAct = oppActivity[0];
+        return (
+          <div style={{...s.card, border:"1px solid "+color+"40", background:t.card}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontSize:14,fontWeight:700,color:t.text}}>{selectedOpp.name}</span>
+                <span style={{fontSize:10,padding:"2px 7px",borderRadius:3,background:color+"18",color}}>{(selectedOpp.source||"opp").toUpperCase()}</span>
+                <span style={{fontSize:10,padding:"2px 7px",borderRadius:3,background:activeOpps.some(a=>a.id===selectedOpp.id||a.name===selectedOpp.name)?"#16a34a18":"#9ca3af18",color:activeOpps.some(a=>a.id===selectedOpp.id||a.name===selectedOpp.name)?"#16a34a":"#9ca3af"}}>
+                  {activeOpps.some(a=>a.id===selectedOpp.id||a.name===selectedOpp.name)?"Active":"Dormant"}
+                </span>
+              </div>
+              <button onClick={()=>setSelectedOpp(null)} style={{...btn0,background:"none",color:t.textDim,fontSize:16,padding:0}}>×</button>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:10}}>
+              {[
+                {label:"Region",val:selectedOpp.region||"—"},
+                {label:"Sector",val:selectedOpp.sector||"—"},
+                {label:"Status",val:selectedOpp.status||"—"},
+                {label:"Activity entries",val:oppActivity.length},
+                {label:"Last logged",val:lastAct?new Date(lastAct.loggedAt).toLocaleDateString("en-GB",{day:"numeric",month:"short"}):"Never"},
+                {label:"Notes",val:selectedOpp.notes?"Yes":"None"},
+              ].map((stat,i)=>(
+                <div key={i} style={{background:t.input,borderRadius:6,padding:"6px 9px"}}>
+                  <div style={{fontSize:10,color:t.textDim,marginBottom:1}}>{stat.label}</div>
+                  <div style={{fontSize:12,fontWeight:600,color:t.text}}>{stat.val}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={()=>setSelectedOpp(null)} style={{...btn0,fontSize:11,padding:"4px 10px",borderRadius:5,border:"1px solid "+t.border,color:t.textMuted,background:"transparent"}}>Close</button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Hub + spokes */}
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 180px 1fr",gap:12,alignItems:"start"}}>
+
+        {/* Left spokes */}
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          <div style={s.card}>
+            <div style={{...s.label,color:"#c084fc"}}>PIPELINE HEALTH</div>
+            {[
+              {label:"HOT / PURSUE",val:hotCount,col:"#dc2626"},
+              {label:"In outreach / talking",val:saved.filter(s=>["outreach","talking","decision"].includes(getStage(s))).length,col:"#16a34a"},
+              {label:"Active (<14d)",val:activeOpps.length,col:"#16a34a"},
+              {label:"Dormant (>14d)",val:dormantOpps.length,col:"#9ca3af"},
+            ].map((item,i)=>(
+              <div key={i} style={s.spokeItem}>
+                <span>{item.label}</span>
+                <span style={{fontWeight:600,color:item.col}}>{item.val}</span>
+              </div>
+            ))}
+          </div>
+          <div style={s.card}>
+            <div style={{...s.label,color:"#16a34a"}}>ACTIVITY THIS WEEK</div>
+            {recentActivity.length===0
+              ? <div style={{fontSize:12,color:t.textDim,fontStyle:"italic"}}>No activity logged this week</div>
+              : [
+                  {label:"Total logged",val:recentActivity.length,col:"#16a34a"},
+                  ...Object.entries(actByType).map(([type,cnt])=>({label:type.charAt(0).toUpperCase()+type.slice(1),val:cnt,col:calColor[type]||"#818cf8"}))
+                ].map((item,i)=>(
+                  <div key={i} style={s.spokeItem}>
+                    <span>{item.label}</span>
+                    <span style={{fontWeight:600,color:item.col}}>{item.val}</span>
+                  </div>
+                ))
+            }
+          </div>
+        </div>
+
+        {/* Hub centre */}
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
+          <div style={{width:130,height:130,borderRadius:"50%",border:"1.5px solid "+t.border,background:t.card,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:2,flexShrink:0}}>
+            <div style={{fontSize:24,marginBottom:2}}>⚡</div>
+            <div style={{fontSize:11,fontWeight:700,color:t.text}}>TorqueOS</div>
+            <div style={{fontSize:10,color:t.textDim}}>control tower</div>
+          </div>
+          <div style={{width:2,height:12,background:t.border,margin:"0 auto"}}/>
+          <div style={{width:"100%",background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
+            <div style={{fontSize:22,fontWeight:700,color:"#16a34a"}}>{activeOpps.length}</div>
+            <div style={{fontSize:10,color:t.textDim,marginTop:1}}>active opportunities</div>
+            <div style={{fontSize:10,color:"#16a34a",marginTop:2}}>activity logged &lt;14 days</div>
+          </div>
+          <div style={{width:"100%",background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
+            <div style={{fontSize:22,fontWeight:700,color:"#0891b2"}}>{actionsThisWeek.length + overdueEvents.length}</div>
+            <div style={{fontSize:10,color:t.textDim,marginTop:1}}>actions this week</div>
+            <div style={{fontSize:10,marginTop:2,color:overdueEvents.length>0?"#dc2626":"#16a34a"}}>
+              {overdueEvents.length>0?overdueEvents.length+" overdue · ":""}{actionsThisWeek.length} upcoming
+            </div>
+          </div>
+        </div>
+
+        {/* Right spokes */}
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          <div style={s.card}>
+            <div style={{...s.label,color:"#fb923c"}}>CONTACTS CRM</div>
+            {[
+              {label:"Saved contacts",val:(contacts||[]).length,col:"#fb923c"},
+              {label:"Hot warmth",val:(contacts||[]).filter(c=>c.warmth==="hot").length,col:"#dc2626"},
+              {label:"Warm",val:(contacts||[]).filter(c=>c.warmth==="warm").length,col:"#f59e0b"},
+              {label:"Opps with contacts",val:saved.filter(s=>(contacts||[]).some(c=>c.company&&s.name&&s.name.toLowerCase().includes(c.company.toLowerCase()))).length,col:"#16a34a"},
+            ].map((item,i)=>(
+              <div key={i} style={s.spokeItem}>
+                <span>{item.label}</span>
+                <span style={{fontWeight:600,color:item.col}}>{item.val}</span>
+              </div>
+            ))}
+          </div>
+          <div style={s.card}>
+            <div style={{...s.label,color:"#be185d"}}>TOP SECTORS</div>
+            {topSectors.length===0
+              ? <div style={{fontSize:12,color:t.textDim,fontStyle:"italic"}}>No pipeline data yet</div>
+              : topSectors.map(([sector,count],i)=>(
+                  <div key={i} style={s.spokeItem}>
+                    <span>{sector}</span>
+                    <span style={{fontWeight:600,color:"#be185d"}}>{count} {count===1?"opp":"opps"}</span>
+                  </div>
+                ))
+            }
+          </div>
+        </div>
+      </div>
+
+      {/* Timeline */}
+      <div style={s.card}>
+        <div style={s.label}>UPCOMING ACTIONS <span style={{fontWeight:400,letterSpacing:0,color:t.textDim}}>— next 14 days</span></div>
+        {overdueEvents.length>0&&<div style={{display:"flex",gap:6,marginBottom:8,flexWrap:"wrap"}}>
+          {overdueEvents.map((ev,i)=>(
+            <div key={i} style={{flexShrink:0,minWidth:110,padding:"6px 9px",borderRadius:7,border:"1px solid #ef444430",background:"#ef444410"}}>
+              <div style={{fontSize:10,color:"#dc2626",marginBottom:2}}>overdue</div>
+              <div style={{fontSize:11,fontWeight:600,color:t.text,lineHeight:1.3}}>{ev.cardName}</div>
+              <span style={{fontSize:10,padding:"1px 5px",borderRadius:3,background:calColor[ev.actionType]+"18"||"#81cf820",color:calColor[ev.actionType]||"#16a34a"}}>{ev.actionType}</span>
+            </div>
+          ))}
+        </div>}
+        {upcomingEvents.length===0&&overdueEvents.length===0
+          ? <div style={{fontSize:12,color:t.textDim,fontStyle:"italic"}}>No upcoming events scheduled. Add actions via the Calendar.</div>
+          : <div style={{display:"flex",gap:8,overflowX:"auto",paddingBottom:4}}>
+              {upcomingEvents.map((ev,i)=>{
+                const evDate = new Date(ev.datetime);
+                const daysAway = Math.ceil((evDate-now)/DAY);
+                const col = calColor[ev.actionType]||"#818cf8";
+                return (
+                  <div key={i} style={{flexShrink:0,minWidth:118,display:"flex",flexDirection:"column",gap:3}}>
+                    <div style={{fontSize:10,color:t.textDim}}>
+                      {evDate.toLocaleDateString("en-GB",{day:"numeric",month:"short"})}
+                      {daysAway<=2&&<span style={{marginLeft:4,fontSize:9,padding:"1px 5px",borderRadius:3,background:"#dc262618",color:"#dc2626"}}>soon</span>}
+                    </div>
+                    <div style={{fontSize:11,fontWeight:600,color:t.text,lineHeight:1.3}}>{ev.cardName}</div>
+                    <span style={{fontSize:10,padding:"1px 6px",borderRadius:3,background:col+"18",color:col,display:"inline-block",width:"fit-content"}}>{ev.actionType}</span>
+                  </div>
+                );
+              })}
+            </div>
+        }
+      </div>
+
+      {/* Legend */}
+      <div style={{display:"flex",flexWrap:"wrap",gap:12}}>
+        {[["#6ee7b7","Board / NED"],["#c084fc","Executive"],["#fb923c","Side hustle"],["#818cf8","Venture"],["#f6c90e","Deal"],["#16a34a","Active (<14d)"],["#9ca3af","Dormant (>14d)"]].map(([col,lbl])=>(
+          <span key={lbl} style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:t.textDim}}>
+            <span style={{width:8,height:8,borderRadius:"50%",background:col,display:"inline-block",flexShrink:0}}/>
+            {lbl}
+          </span>
+        ))}
+      </div>
+
+    </div>
+  );
+};
 // ─── MODULE: DOCUMENT VAULT ───────────────────────────────────────────────────
 const DocumentVaultModule = ({t, isMobile, vault, setVault, onRegenerate}) => {
   const [selectedId, setSelectedId] = useState(null);
@@ -6613,6 +6919,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
     {key:"vibe",label:"Vibe Agent",icon:"⚡",color:"#a78bfa"},
     {key:"calendar",label:"Calendar",icon:"📆",color:"#34d399"},
     {key:"network",label:"Network Intel",icon:"🕸",color:"#818cf8"},
+    {key:"tower",label:"Control Tower",icon:"🗼",color:"#38bdf8"},
     {key:"_tools_",label:"TOOLS",icon:"",color:"",divider:true},
     {key:"vault",label:"Document Vault",icon:"📄",color:"#38bdf8"},
     {key:"contacts",label:"Contacts",icon:"👥",color:"#2dd4bf"},
@@ -6759,6 +7066,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
                 {activeModule==="pipeline"&&saved.length+" opportunities saved across all modules"}
                 {activeModule==="network"&&"Map warm intro paths from your professional network"}
                 {activeModule==="vibe"&&"Your autonomous opportunity agent — scan, plan, and discover"}
+                {activeModule==="tower"&&"Live view of all your opportunities in motion"}
                 {activeModule==="vault"&&vault.length+" document"+(vault.length!==1?"s":"")+" saved"}
                 {activeModule==="contacts"&&contacts.length+" contact"+(contacts.length!==1?"s":"")}
                 {activeModule==="settings"&&"Profile, API, tax profile & goal runway"}
@@ -6776,7 +7084,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
         <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column"}}>
           <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column",padding:activeModule==="vibe"?"0":isMobile?"10px 10px":"12px 14px"}}>
           {/* Single-column pages get their own scroll context */}
-          {(activeModule==="home"||activeModule==="settings"||activeModule==="pipeline"||activeModule==="calendar"||activeModule==="vault"||activeModule==="contacts")&&
+          {(activeModule==="home"||activeModule==="settings"||activeModule==="pipeline"||activeModule==="calendar"||activeModule==="vault"||activeModule==="contacts"||activeModule==="tower")&&
             <div style={{flex:1,overflowY:"auto",minHeight:0}}>
               {activeModule==="home"&&<CommandCenter t={t} profile={profile} saved={saved} isMobile={isMobile} setActiveModule={setActiveModule} apiKey={apiKey} provider={provider} profileComplete={profileComplete} gatedModules={gatedModules} activityLog={activityLog} contacts={contacts} saveToVault={saveToVault}/>}
               {activeModule==="pipeline"&&<PipelineModule t={t} saved={saved} setSaved={setSaved} isMobile={isMobile} onOpenChat={(item)=>openChat(item)} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} onNavigateToSource={(item)=>{const tabMap={board:"saved",venture:"saved",hustle:"saved",deal:"saved",exec:"saved"};const modMap={board:"board",venture:"venture",hustle:"hustle",deal:"deal",exec:"exec"};const prefMap={board:"bs",venture:"vs",hustle:"sh",deal:"dm",exec:"es"};storage.set((prefMap[item.source]||"bs")+"-tab",tabMap[item.source]||"saved");setActiveModule(modMap[item.source]||"board");}}/>}
@@ -6784,6 +7092,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
               {activeModule==="settings"&&<SettingsModule t={t} profile={profile} setProfile={p=>{setProfile(p);storage.set("oos-profile",p);}} apiKey={apiKey} setApiKey={setApiKey} provider={provider} setProvider={setProvider} isMobile={isMobile} isNewUser={startOnSettings}/>}
               {activeModule==="vault"&&<DocumentVaultModule t={t} isMobile={isMobile} vault={vault} setVault={setVault} onRegenerate={(sourceItem)=>{setDocGenItem(sourceItem);}}/>}
               {activeModule==="contacts"&&<ContactsModule t={t} isMobile={isMobile} contacts={contacts} setContacts={setContacts} activityLog={activityLog} saved={saved} onNavigateToNetwork={(company)=>{setNiFreeSearch(company);setActiveModule("network");}}/>}
+              {activeModule==="tower"&&<ControlTowerModule t={t} isMobile={isMobile} saved={saved} activityLog={activityLog} contacts={contacts} calendarEvents={calendarEvents} setActiveModule={setActiveModule}/>}
             </div>
           }
           {/* Two-column pages manage their own scroll per panel */}
