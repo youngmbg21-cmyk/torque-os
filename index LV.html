@@ -1292,7 +1292,7 @@ const StreamingChatbot = ({apiKey, provider, systemPrompt, title, subtitle, icon
 };
 
 // ─── SHARED: OPPORTUNITY CARD ─────────────────────────────────────────────────
-const OpportunityCard = ({item,t,onSave,isSaved,onRemove,onStatusChange,onNoteChange,savedMode,moduleColor,onResearch,profile,apiKey,provider,onOpenTax,onOpenNetwork,onOpenDocs,onNavigateToSource,onRemoveResult,onSchedule}) => {
+const OpportunityCard = ({item,t,onSave,isSaved,onRemove,onStatusChange,onNoteChange,savedMode,moduleColor,onResearch,profile,apiKey,provider,onOpenTax,onOpenNetwork,onOpenDocs,onNavigateToSource,onRemoveResult,onSchedule,onLogActivity,activityLog}) => {
   const [expanded,setExpanded]=useState(false);
   const [editingNote,setEditingNote]=useState(false);
   const [noteVal,setNoteVal]=useState(item.notes||"");
@@ -1446,6 +1446,47 @@ const OpportunityCard = ({item,t,onSave,isSaved,onRemove,onStatusChange,onNoteCh
         </div>}
 
         {savedMode&&<div style={{marginTop:10}}>
+          <div style={{background:t.input,border:"1px solid "+t.border,borderRadius:7,overflow:"visible"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",cursor:"pointer"}} onClick={e=>{e.stopPropagation();const el=e.currentTarget.nextSibling;el.style.display=el.style.display==="none"?"block":"none";}}>
+              <span style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:"#818cf8"}}>ACTIVITY</span>
+              {(activityLog||[]).filter(e=>e.pipelineCardId===(item.id||item.name)).length>0&&
+                <span style={{fontSize:11,fontWeight:700,padding:"1px 6px",borderRadius:3,background:"#818cf820",color:"#818cf8"}}>{(activityLog||[]).filter(e=>e.pipelineCardId===(item.id||item.name)).length}</span>}
+              {onLogActivity&&<button onClick={e=>{e.stopPropagation();onLogActivity(item);}} style={{...btn0,display:"inline-flex",alignItems:"center",gap:4,fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:4,background:"#818cf818",border:"1px solid #818cf840",color:"#818cf8",marginLeft:"auto"}}>+ Log</button>}
+            </div>
+            <div style={{display:"none",padding:"0 10px 10px",borderTop:"1px solid "+t.border}}>
+              {(()=>{
+                const entries = (activityLog||[])
+                  .filter(e=>e.pipelineCardId===(item.id||item.name))
+                  .sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt));
+                if(entries.length===0) return <div style={{fontSize:13,color:t.textDim,padding:"10px 0",fontStyle:"italic"}}>No activity logged yet. Use + Log to record emails, calls, meetings and notes.</div>;
+                return <div style={{display:"flex",flexDirection:"column",gap:1,marginTop:8}}>
+                  {entries.map((e,i)=>{
+                    const aType = ACTIVITY_TYPES.find(a=>a.key===e.actionType)||ACTIVITY_TYPES[5];
+                    const outcomeColor = e.outcome==="positive"?"#10b981":e.outcome==="negative"?"#ef4444":"#6b7280";
+                    const d = new Date(e.loggedAt);
+                    const dateStr = d.toLocaleDateString("en-GB",{day:"numeric",month:"short"});
+                    const timeStr = d.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"});
+                    return (
+                      <div key={e.id} style={{display:"flex",gap:10,alignItems:"flex-start",padding:"7px 0",borderBottom:i<entries.length-1?"1px solid "+t.border+"60":"none"}}>
+                        <div style={{width:24,height:24,borderRadius:"50%",background:aType.color+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,flexShrink:0,marginTop:1}}>{aType.icon}</div>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                            <span style={{fontSize:12,fontWeight:700,color:aType.color}}>{aType.label}</span>
+                            <span style={{fontSize:11,fontWeight:700,padding:"1px 5px",borderRadius:3,background:outcomeColor+"18",color:outcomeColor,textTransform:"capitalize"}}>{e.outcome}</span>
+                            <span style={{fontSize:11,color:t.textDim,marginLeft:"auto"}}>{dateStr} · {timeStr}</span>
+                          </div>
+                          {e.note&&<div style={{fontSize:13,color:t.textMuted,marginTop:3,lineHeight:1.5}}>{e.note}</div>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>;
+              })()}
+            </div>
+          </div>
+        </div>}
+
+        {savedMode&&<div style={{marginTop:10}}>
           <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:7}}>NOTES</div>
           {editingNote?<>
             <textarea value={noteVal} onChange={e=>setNoteVal(e.target.value)} rows={3} style={{width:"100%",padding:"8px 10px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:7,color:t.text,fontSize:15,fontFamily:"inherit",resize:"vertical"}}/>
@@ -1472,7 +1513,7 @@ const ScanLog = ({log,onClear,t}) => (
 );
 
 // ─── MODULE: BOARD SCOUT ──────────────────────────────────────────────────────
-const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,
+const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,onLogActivity,activityLog,
   boardResults,setBoardResults,consultResults,setConsultResults,
   bsLoading,setBsLoading,bsScanLog,setBsScanLog,bsLastScanned,setBsLastScanned}) => {
   const [tab,setTab]=useState(()=>{ const t=storage.get("bs-tab"); return t||"board"; });
@@ -1586,7 +1627,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
             <div style={{fontSize:36,marginBottom:10}}>🔍</div>
             <div style={{fontSize:15,fontWeight:500}}>{tab==="saved"?"No saved board opportunities yet.":"Run a scan to discover board & consulting opportunities."}</div>
           </div>}
-          {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule}/>)}
+          {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule} onLogActivity={onLogActivity} activityLog={activityLog}/>)}
         </div>
       </div>
     </div>
@@ -1594,7 +1635,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
 };
 
 // ─── MODULE: VENTURE SCOUT ────────────────────────────────────────────────────
-const VentureScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,
+const VentureScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,onLogActivity,activityLog,
   ventures,setVentures,ideas,setIdeas,
   vsLoading,setVsLoading,vsScanLog,setVsScanLog,vsLastScanned,setVsLastScanned}) => {
   const [tab,setTab]=useState(()=>{ const t=storage.get("vs-tab"); return t||"ventures"; });
@@ -1717,7 +1758,7 @@ Status: BUILD, RESEARCH, SKIP. Write fitReasons in second person addressed to th
         </div>
         <div style={{flex:1,overflowY:"auto",minHeight:0}}>
           {currentItems.length===0&&!loading&&<div style={{textAlign:"center",padding:48,color:t.textDim}}><div style={{fontSize:36,marginBottom:10}}>🚀</div><div style={{fontSize:15}}>Run a scan to discover startup ventures and ideas.</div></div>}
-          {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule}/>)}
+          {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule} onLogActivity={onLogActivity} activityLog={activityLog}/>)}
         </div>
       </div>
     </div>
@@ -1728,7 +1769,7 @@ Status: BUILD, RESEARCH, SKIP. Write fitReasons in second person addressed to th
 const EXEC_FUNCTIONS = ["Supply Chain","Operations","Finance","Technology","Commercial","General Management","HR & People","Legal & Compliance","Strategy","Marketing","Transformation"];
 const EXEC_SCOPES = [{key:"country",label:"Country"},{key:"regional",label:"Regional"},{key:"divisional",label:"Divisional"},{key:"group",label:"Group / Global"}];
 
-const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,
+const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,onLogActivity,activityLog,
   esResults,setEsResults,esLoading,setEsLoading,esScanLog,setEsScanLog,esLastScanned,setEsLastScanned}) => {
   const [tab,setTab]=useState(()=>storage.get("es-tab")||"roles");
   const [countries,setCountries]=useState(()=>storage.get("es-countries")||(profile.regions||[]).map(n=>ALL_COUNTRIES_FLAT.find(c=>c.name===n)?.code).filter(Boolean)||[]);
@@ -1845,7 +1886,7 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
         </div>
         <div style={{flex:1,overflowY:"auto",minHeight:0}}>
           {currentItems.length===0&&!loading&&<div style={{textAlign:"center",padding:48,color:t.textDim}}><div style={{fontSize:36,marginBottom:10}}>👔</div><div style={{fontSize:15,fontWeight:600,color:t.text,marginBottom:6}}>Find your next executive role</div><div style={{fontSize:14,color:t.textMuted}}>Configure your target geography, function, and minimum package, then scan for companies showing hiring signals.</div></div>}
-          {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule}/>)}
+          {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule} onLogActivity={onLogActivity} activityLog={activityLog}/>)}
         </div>
       </div>
     </div>
@@ -1853,7 +1894,7 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
 };
 
 // ─── MODULE: SIDE HUSTLE LAB ──────────────────────────────────────────────────
-const SideHustleModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,
+const SideHustleModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,onLogActivity,activityLog,
   hustles,setHustles,shLoading,setShLoading,shScanLog,setShScanLog,shLastScanned,setShLastScanned}) => {
   const [tab,setTab]=useState(()=>{ const t=storage.get("sh-tab"); return t||"hustles"; });
   const [countries,setCountries]=useState(()=>storage.get("sh-countries")||(profile.regions||[]).map(n=>ALL_COUNTRIES_FLAT.find(c=>c.name===n)?.code).filter(Boolean)||[]);
@@ -1954,7 +1995,7 @@ const SideHustleModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
         </div>
         <div style={{flex:1,overflowY:"auto",minHeight:0}}>
           {currentItems.length===0&&!loading&&<div style={{textAlign:"center",padding:48,color:t.textDim}}><div style={{fontSize:36,marginBottom:10}}>💡</div><div style={{fontSize:15}}>Run a scan to discover fractional roles, advisory seats, and paid gigs.</div></div>}
-          {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule}/>)}
+          {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule} onLogActivity={onLogActivity} activityLog={activityLog}/>)}
         </div>
       </div>
     </div>
@@ -1962,7 +2003,7 @@ const SideHustleModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
 };
 
 // ─── MODULE: DEAL MONITOR ──────────────────────────────────────────────────────
-const DealMonitorModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,
+const DealMonitorModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,onLogActivity,activityLog,
   deals,setDeals,dmLoading,setDmLoading,dmScanLog,setDmScanLog,dmLastScanned,setDmLastScanned}) => {
   const [tab,setTab]=useState(()=>{ const t=storage.get("dm-tab"); return t||"deals"; });
   const [statusFilter,setStatusFilter]=useState("ALL");
@@ -2104,7 +2145,7 @@ const DealMonitorModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,on
             <div style={{fontSize:15,fontWeight:500,marginBottom:6}}>{thesisComplete?"Run a scan to find deals matching your thesis.":"Configure your investment thesis to begin."}</div>
             {!thesisComplete&&<div style={{fontSize:15}}>Set your geographies and sectors in the panel.</div>}
           </div>}
-          {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule}/>)}
+          {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule} onLogActivity={onLogActivity} activityLog={activityLog}/>)}
         </div>
       </div>
     </div>
@@ -2131,6 +2172,7 @@ const CommandCenter = ({t,profile,saved,isMobile,setActiveModule,apiKey,provider
     setDigestLoading(true);setWeeklyDigest(null);setDigestSaved(false);
     const now2=new Date();
     const weekAgo=new Date(now2.getTime()-7*24*60*60*1000);
+    const weekAhead=new Date(now2.getTime()+7*24*60*60*1000);
     const newCards=(saved||[]).filter(s=>s.savedAt&&new Date(s.savedAt)>=weekAgo);
     const allPursuing=(saved||[]).filter(s=>["PURSUE","ACTIVE","BUILD"].includes(s.status||""));
     const recentActivity=(activityLog||[]).filter(e=>new Date(e.loggedAt)>=weekAgo).sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt));
@@ -2138,16 +2180,41 @@ const CommandCenter = ({t,profile,saved,isMobile,setActiveModule,apiKey,provider
     const goalTarget=profile.targetAmount||0;
     const weekStr=now2.toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"});
     const weekAgoStr=weekAgo.toLocaleDateString("en-GB",{day:"numeric",month:"long"});
-    const prompt=`Generate a Weekly Digest for ${profile.name||"the user"} (${profile.title||"senior professional"}).
+    const calEvts=(()=>{try{return storage.get("oos-calendar-events")||[];}catch{return [];}})();
+    const recentCal=calEvts.filter(e=>new Date(e.datetime)>=weekAgo&&new Date(e.datetime)<=now2);
+    const upcomingCal=calEvts.filter(e=>!e.completed&&new Date(e.datetime)>now2&&new Date(e.datetime)<=weekAhead);
+    const newContacts=(contacts||[]).filter(c=>c.createdAt&&new Date(c.createdAt)>=weekAgo);
+    const prompt=`You are generating a Weekly Digest for ${profile.name||"the user"} (${profile.title||"senior professional"}).
 Period: ${weekAgoStr} to ${weekStr}
-Pipeline: ${saved.length} total, ${allPursuing.length} pursuing, ${newCards.length} new this week
-Value: $${totalAnnual.toLocaleString()}/yr${goalTarget>0?" vs goal of $"+goalTarget.toLocaleString():""}
-Activity: ${recentActivity.length} entries this week
-${recentActivity.slice(0,8).map(e=>new Date(e.loggedAt).toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})+" | "+e.pipelineCardName+" | "+e.actionType.toUpperCase()+(e.note?" — "+e.note:"")).join("\n")||"No activity logged"}
 
-Write 4 sections using **bold**: WEEK IN REVIEW (2-3 sentences), PIPELINE HEALTH (2-3 sentences), NEXT WEEK PRIORITIES (2-3 actions), WATCH LIST (1-2 items needing attention). Max 200 words. Be specific with names and numbers.`;
+PIPELINE SNAPSHOT:
+- Total saved opportunities: ${saved.length}
+- Currently pursuing: ${allPursuing.length} (${allPursuing.slice(0,5).map(s=>s.name).join(", ")||"none"})
+- New this week: ${newCards.length}${newCards.length>0?" ("+newCards.slice(0,4).map(s=>s.name+" via "+s.source).join(", ")+")":""}
+- Combined pipeline value: $${totalAnnual.toLocaleString()}/yr${goalTarget>0?" vs goal of $"+goalTarget.toLocaleString():""}
+
+ACTIVITY THIS WEEK (${recentActivity.length} entries):
+${recentActivity.slice(0,10).map(e=>new Date(e.loggedAt).toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})+" | "+e.pipelineCardName+" | "+e.actionType.toUpperCase()+(e.outcome!=="neutral"?" ["+e.outcome+"]":"")+(e.note?" — "+e.note:"")).join("\n")||"No activity logged this week"}
+
+CALENDAR:
+Completed this week: ${recentCal.length} events
+Upcoming next 7 days: ${upcomingCal.length} events${upcomingCal.length>0?" — "+upcomingCal.slice(0,5).map(e=>new Date(e.datetime).toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})+" "+e.actionType+" ("+e.cardName+")").join(", "):""}
+
+NEW CONTACTS ADDED: ${newContacts.length}${newContacts.length>0?" — "+newContacts.map(c=>c.name+" at "+c.company).join(", "):""}
+
+Write a sharp, personalised Weekly Digest in exactly 4 sections. Use **bold** for key names and numbers. Address the user directly using "you" and "your":
+
+**WEEK IN REVIEW** 2-3 sentences summarising what was accomplished — activity logged, events completed, new opportunities added. Be specific with names.
+
+**PIPELINE HEALTH** 2-3 sentences on the current state — what's hot, what's stalled, total value vs goal. Be direct about gaps.
+
+**NEXT WEEK PRIORITIES** 2-3 sentences on the 2-3 highest-leverage actions for next week. Name specific companies and actions.
+
+**WATCH LIST** 1-2 sentences flagging dormant opportunities or upcoming events needing preparation.
+
+Max 200 words total. Be specific, analytical, direct. Reference real data.`;
     try {
-      const blocks=await callLLM(provider,apiKey,[{role:"user",content:prompt}],[],"You are a sharp executive intelligence advisor.","DIGEST",null);
+      const blocks=await callLLM(provider,apiKey,[{role:"user",content:prompt}],[],"You are a sharp executive intelligence advisor. Write concise, data-driven weekly digests.","DIGEST",null);
       setWeeklyDigest(stripCiteTags(blocks.map(b=>b.text).join("").trim())||"Digest generation failed.");
     } catch(e){ setWeeklyDigest("Could not generate digest: "+e.message); }
     setDigestLoading(false);
@@ -2425,7 +2492,7 @@ const sourceLabel = (src) => {
   return map[src] || (src ? src.charAt(0).toUpperCase()+src.slice(1) : "Unknown");
 };
 
-const PipelineModule = ({t,saved,setSaved,isMobile,onOpenChat,profile,apiKey,provider,onOpenTax,onOpenNetwork,onOpenDocs,onNavigateToSource,onSchedule}) => {
+const PipelineModule = ({t,saved,setSaved,isMobile,onOpenChat,profile,apiKey,provider,onOpenTax,onOpenNetwork,onOpenDocs,onNavigateToSource,onSchedule,onLogActivity,activityLog}) => {
   const [view,setView]=useState(()=>storage.get("pipeline-view")||"kanban");
   const [sourceFilter,setSourceFilter]=useState("ALL");
   const [listStatusFilter,setListStatusFilter]=useState("ALL");
@@ -2648,7 +2715,7 @@ Be conservative and realistic. OUTPUT ONLY JSON.`;
           ))}
         </div>
         {listFiltered.length===0&&<div style={{padding:"32px",textAlign:"center",color:t.textDim,fontSize:15}}>No opportunities match this filter.</div>}
-        {listFiltered.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={()=>{}} isSaved={true} onRemove={removeOpp} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={true} moduleColor={moduleColors[item.source]||t.accent} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onNavigateToSource={onNavigateToSource} onSchedule={onSchedule}/>)}
+        {listFiltered.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={()=>{}} isSaved={true} onRemove={removeOpp} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={true} moduleColor={moduleColors[item.source]||t.accent} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onNavigateToSource={onNavigateToSource} onSchedule={onSchedule} onLogActivity={onLogActivity} activityLog={activityLog}/>)}
       </div>}
 
       {/* VALUE VIEW */}
@@ -4309,7 +4376,7 @@ const DocumentVaultModule = ({t, isMobile, vault, setVault, onRegenerate}) => {
     <div style={{textAlign:"center",padding:"60px 24px",color:t.textDim}}>
       <div style={{fontSize:48,marginBottom:14}}>📄</div>
       <div style={{fontSize:16,fontWeight:700,color:t.text,marginBottom:8}}>Your Vault is empty</div>
-      <div style={{fontSize:14,color:t.textMuted,maxWidth:360,margin:"0 auto"}}>Generate documents from any opportunity card using the Docs button, then save them here.</div>
+      <div style={{fontSize:14,color:t.textMuted,maxWidth:360,margin:"0 auto",lineHeight:1.6}}>Generate documents from any opportunity card using the Docs button, then save them here. All generated content — board applications, outreach sequences, bios, briefings — lands in one place.</div>
     </div>
   );
 
@@ -4391,8 +4458,8 @@ const ContactsModule = ({t, isMobile, contacts, setContacts, activityLog, saved,
 
   const filtered = (contacts||[])
     .filter(c => warmthFilter==="ALL" || c.warmth===warmthFilter)
-    .filter(c => !search.trim() || (c.name||"").toLowerCase().includes(search.toLowerCase()) || (c.company||"").toLowerCase().includes(search.toLowerCase()))
-    .sort((a,b) => (warmthOrder[a.warmth]||2)-(warmthOrder[b.warmth]||2));
+    .filter(c => !search.trim() || (c.name||"").toLowerCase().includes(search.toLowerCase()) || (c.company||"").toLowerCase().includes(search.toLowerCase()) || (c.role||"").toLowerCase().includes(search.toLowerCase()))
+    .sort((a,b) => (warmthOrder[a.warmth]||2)-(warmthOrder[b.warmth]||2) || (a.name||"").localeCompare(b.name||""));
 
   const selected = filtered.find(c=>c.id===selectedId) || filtered[0] || null;
   const updateContact = (id, patch) => setContacts(prev => prev.map(c => c.id===id ? {...c,...patch} : c));
