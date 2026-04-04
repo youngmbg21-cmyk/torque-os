@@ -711,7 +711,6 @@ const hashPassword = async (pw, salt) => {
 };
 const verifyPassword = async (pw, stored) => {
   if (!stored || !stored.includes(":")) {
-    // Legacy SHA-256 hash (no salt) — compare old way then migrate
     const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pw));
     const oldHash = Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
     return oldHash === stored;
@@ -721,12 +720,11 @@ const verifyPassword = async (pw, stored) => {
   return rehashed === stored;
 };
 
-const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const getCurrentUser = () => {
   try {
     const session = JSON.parse(localStorage.getItem("oos-session")||"null");
     if (!session) return null;
-    // Expire sessions older than SESSION_MAX_AGE_MS
     if (session.ts && (Date.now() - session.ts) > SESSION_MAX_AGE_MS) {
       localStorage.removeItem("oos-session");
       return null;
@@ -882,6 +880,9 @@ const Ic = {
   BarChart2: p=><Icon {...p} d={<><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></>}/>,
   Flag: p=><Icon {...p} d={<><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></>}/>,
   Lock: p=><Icon {...p} d={<><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></>}/>,
+  Archive: p=><Icon {...p} d={<><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></>}/>,
+  Printer: p=><Icon {...p} d={<><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></>}/>,
+  RefreshCw: p=><Icon {...p} d={<><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></>}/>,
 };
 
 // ─── UTILITY ─────────────────────────────────────────────────────────────────
@@ -1133,16 +1134,40 @@ const extractJSON = (blocks) => {
 };
 
 // ─── SHARED: STREAMING CHATBOT ────────────────────────────────────────────────
-const StreamingChatbot = ({apiKey, provider, systemPrompt, title, subtitle, icon, contextPills=[], onClose, t, isMobile, openingBrief, persistedMessages, onMessagesChange}) => {
+const StreamingChatbot = ({apiKey, provider, systemPrompt, systemPromptBuilder, title, subtitle, icon, contextPills=[], onClose, t, isMobile, openingBrief, persistedMessages, onMessagesChange}) => {
   const [msgs, setMsgs] = useState(persistedMessages&&persistedMessages.length>0 ? persistedMessages : [{role:"assistant",content:openingBrief||"Hi! I'm your AI Advisor. Ask me anything about your opportunities, pipeline, strategy, or how to use the app.",id:"w1"}]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [minimised, setMinimised] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const scrollRef = useRef(null);
+  const userScrolledUp = useRef(false);
+  const lastMsgRef = useRef(null);
   const prov = PROVIDERS[provider]||PROVIDERS.claude;
 
-  useEffect(()=>{ if(scrollRef.current) scrollRef.current.scrollTop=scrollRef.current.scrollHeight; },[msgs]);
+  // Track whether user has manually scrolled up
+  const handleScroll = () => {
+    if (!scrollRef.current) return;
+    const el = scrollRef.current;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    userScrolledUp.current = !nearBottom;
+  };
+
+  useEffect(()=>{
+    if(!scrollRef.current) return;
+    const lastMsg = msgs[msgs.length-1];
+    if(!lastMsg) return;
+    if(lastMsg.role==="user") {
+      // User sent a message — scroll to bottom so they see it + incoming response
+      userScrolledUp.current = false;
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    } else if(lastMsg.role==="assistant" && !userScrolledUp.current) {
+      // New assistant message — scroll to show the TOP of that message, not the bottom
+      if(lastMsgRef.current) {
+        lastMsgRef.current.scrollIntoView({block:"start", behavior:"smooth"});
+      }
+    }
+  },[msgs.length]);
   useEffect(()=>{ if(onMessagesChange) onMessagesChange(msgs.filter(m=>!m.streaming)); },[msgs, onMessagesChange]);
 
   const send = async () => {
@@ -1151,6 +1176,7 @@ const StreamingChatbot = ({apiKey, provider, systemPrompt, title, subtitle, icon
     setInput("");
 
     const userMsg={role:"user",content:rawInput,id:Date.now()+"-u"};
+    userScrolledUp.current = false; // reset so we scroll to show the new exchange
     setMsgs(p=>[...p,userMsg]);
 
 
@@ -1160,6 +1186,8 @@ const StreamingChatbot = ({apiKey, provider, systemPrompt, title, subtitle, icon
     setLoading(true);
 
     const history=[...msgs,userMsg].filter(m=>m.role==="user"||m.role==="assistant").map(m=>({role:m.role,content:m.content}));
+    // Resolve system prompt fresh at call time — picks up all current app state
+    const resolvedSystemPrompt = systemPromptBuilder ? systemPromptBuilder() : (systemPrompt||"");
     // Collect full response then set at once — no streaming
     let fullText="";
     const append=(chunk)=>{ fullText+=chunk; };
@@ -1174,7 +1202,7 @@ const StreamingChatbot = ({apiKey, provider, systemPrompt, title, subtitle, icon
           const res=await fetch("https://api.anthropic.com/v1/messages",{
             method:"POST",
             headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-            body:JSON.stringify({model:prov.model,max_tokens:4000,stream:true,system:systemPrompt,tools:useSearch,messages:apiMsgs})
+            body:JSON.stringify({model:prov.model,max_tokens:4000,stream:true,system:resolvedSystemPrompt,tools:useSearch,messages:apiMsgs})
           });
           if(!res.ok){const e=await res.text();throw new Error("API "+res.status+": "+e);}
           const reader=res.body.getReader(); const dec=new TextDecoder();
@@ -1203,7 +1231,7 @@ const StreamingChatbot = ({apiKey, provider, systemPrompt, title, subtitle, icon
             }
           }
           if(stopReason==="tool_use"&&toolBlocks.length){
-            const ns=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify({model:prov.model,max_tokens:100,system:systemPrompt,tools:useSearch,messages:apiMsgs})});
+            const ns=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify({model:prov.model,max_tokens:100,system:resolvedSystemPrompt,tools:useSearch,messages:apiMsgs})});
             if(!ns.ok){const errText=await ns.text().catch(()=>"");throw new Error(`API error ${ns.status}: ${errText.slice(0,200)}`);}
             const nd=await ns.json();
             apiMsgs=[...apiMsgs,{role:"assistant",content:nd.content||[]},{role:"user",content:(nd.content||[]).filter(b=>b.type==="tool_use").map(b=>({type:"tool_result",tool_use_id:b.id,content:"Search done"}))}];
@@ -1268,9 +1296,9 @@ const StreamingChatbot = ({apiKey, provider, systemPrompt, title, subtitle, icon
         {contextPills.length>0&&<div style={{display:"flex",gap:5,marginTop:8,flexWrap:"wrap"}}>{contextPills.map((p,i)=><span key={i} style={{fontSize:15,padding:"2px 8px",borderRadius:4,background:t.accentDim,color:t.accent,fontWeight:600}}>{p}</span>)}</div>}
       </div>
       {<>
-        <div ref={scrollRef} style={{flex:1,overflowY:"auto",padding:"12px 14px",display:"flex",flexDirection:"column",gap:10}}>
-          {msgs.map(msg=>(
-            <div key={msg.id} style={{display:"flex",flexDirection:"column",alignItems:msg.role==="user"?"flex-end":"flex-start",gap:4}}>
+        <div ref={scrollRef} onScroll={handleScroll} style={{flex:1,overflowY:"auto",padding:"12px 14px",display:"flex",flexDirection:"column",gap:10}}>
+          {msgs.map((msg, idx)=>(
+            <div key={msg.id} ref={idx===msgs.length-1 ? lastMsgRef : null} style={{display:"flex",flexDirection:"column",alignItems:msg.role==="user"?"flex-end":"flex-start",gap:4}}>
               {msg.role==="assistant"&&<div style={{fontSize:12,fontWeight:700,letterSpacing:"0.06em",color:t.accent,marginLeft:2}}>AI</div>}
               <div style={{maxWidth:"90%",padding:"10px 13px",borderRadius:msg.role==="user"?"12px 12px 2px 12px":"12px 12px 12px 2px",background:msg.role==="user"?"linear-gradient(135deg,"+t.accent+"20,"+t.indigo+"20)":t.input,border:"1px solid "+(msg.role==="user"?t.accentDim:t.border),fontSize:15,color:msg.isError?"#ef4444":t.text,lineHeight:1.7}}>
                 {msg.streaming&&!msg.content?<div style={{display:"flex",gap:4}}>{[0,1,2].map(i=><div key={i} style={{width:6,height:6,borderRadius:"50%",background:t.accent,animation:"pulse 1.2s ease-in-out infinite",animationDelay:i*0.2+"s"}}/>)}</div>:renderMD(msg.content,t)}
@@ -1448,7 +1476,7 @@ const OpportunityCard = ({item,t,onSave,isSaved,onRemove,onStatusChange,onNoteCh
         {savedMode&&<div style={{marginTop:10}}>
           <div style={{background:t.input,border:"1px solid "+t.border,borderRadius:7,overflow:"visible"}}>
             <div style={{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",cursor:"pointer"}} onClick={e=>{e.stopPropagation();const el=e.currentTarget.nextSibling;el.style.display=el.style.display==="none"?"block":"none";}}>
-              <span style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:"#818cf8"}}>ACTIVITY</span>
+              <span style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:"#818cf8"}}>📋 ACTIVITY</span>
               {(activityLog||[]).filter(e=>e.pipelineCardId===(item.id||item.name)).length>0&&
                 <span style={{fontSize:11,fontWeight:700,padding:"1px 6px",borderRadius:3,background:"#818cf820",color:"#818cf8"}}>{(activityLog||[]).filter(e=>e.pipelineCardId===(item.id||item.name)).length}</span>}
               {onLogActivity&&<button onClick={e=>{e.stopPropagation();onLogActivity(item);}} style={{...btn0,display:"inline-flex",alignItems:"center",gap:4,fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:4,background:"#818cf818",border:"1px solid #818cf840",color:"#818cf8",marginLeft:"auto"}}>+ Log</button>}
@@ -2170,20 +2198,34 @@ const CommandCenter = ({t,profile,saved,isMobile,setActiveModule,apiKey,provider
   const generateWeeklyDigest=async()=>{
     if(!apiKey){setWeeklyDigest("Add your API key in Settings to generate your digest.");return;}
     setDigestLoading(true);setWeeklyDigest(null);setDigestSaved(false);
-    const now2=new Date();
-    const weekAgo=new Date(now2.getTime()-7*24*60*60*1000);
-    const weekAhead=new Date(now2.getTime()+7*24*60*60*1000);
+    const now=new Date();
+    const weekAgo=new Date(now.getTime()-7*24*60*60*1000);
+    const weekAhead=new Date(now.getTime()+7*24*60*60*1000);
+
+    // Pipeline — new cards saved in last 7 days
     const newCards=(saved||[]).filter(s=>s.savedAt&&new Date(s.savedAt)>=weekAgo);
     const allPursuing=(saved||[]).filter(s=>["PURSUE","ACTIVE","BUILD"].includes(s.status||""));
-    const recentActivity=(activityLog||[]).filter(e=>new Date(e.loggedAt)>=weekAgo).sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt));
+
+    // Activity log — last 7 days
+    const recentActivity=(activityLog||[])
+      .filter(e=>new Date(e.loggedAt)>=weekAgo)
+      .sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt));
+
+    // Calendar — last 7 + next 7 days
+    const calEvts=(()=>{try{return storage.get("oos-calendar-events")||[];}catch{return [];}})();
+    const recentCal=calEvts.filter(e=>new Date(e.datetime)>=weekAgo&&new Date(e.datetime)<=now);
+    const upcomingCal=calEvts.filter(e=>!e.completed&&new Date(e.datetime)>now&&new Date(e.datetime)<=weekAhead);
+
+    // Contacts added last 7 days
+    const newContacts=(contacts||[]).filter(c=>c.createdAt&&new Date(c.createdAt)>=weekAgo);
+
+    // Income goal delta
     const totalAnnual=(saved||[]).filter(s=>s.annualUSD>0).reduce((sum,s)=>sum+(s.annualUSD||0),0);
     const goalTarget=profile.targetAmount||0;
-    const weekStr=now2.toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"});
+
+    const weekStr=now.toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"});
     const weekAgoStr=weekAgo.toLocaleDateString("en-GB",{day:"numeric",month:"long"});
-    const calEvts=(()=>{try{return storage.get("oos-calendar-events")||[];}catch{return [];}})();
-    const recentCal=calEvts.filter(e=>new Date(e.datetime)>=weekAgo&&new Date(e.datetime)<=now2);
-    const upcomingCal=calEvts.filter(e=>!e.completed&&new Date(e.datetime)>now2&&new Date(e.datetime)<=weekAhead);
-    const newContacts=(contacts||[]).filter(c=>c.createdAt&&new Date(c.createdAt)>=weekAgo);
+
     const prompt=`You are generating a Weekly Digest for ${profile.name||"the user"} (${profile.title||"senior professional"}).
 Period: ${weekAgoStr} to ${weekStr}
 
@@ -2204,15 +2246,20 @@ NEW CONTACTS ADDED: ${newContacts.length}${newContacts.length>0?" — "+newConta
 
 Write a sharp, personalised Weekly Digest in exactly 4 sections. Use **bold** for key names and numbers. Address the user directly using "you" and "your":
 
-**WEEK IN REVIEW** 2-3 sentences summarising what was accomplished — activity logged, events completed, new opportunities added. Be specific with names.
+**WEEK IN REVIEW**
+2-3 sentences summarising what was accomplished this week — activity logged, events completed, new opportunities added. Be specific with names.
 
-**PIPELINE HEALTH** 2-3 sentences on the current state — what's hot, what's stalled, total value vs goal. Be direct about gaps.
+**PIPELINE HEALTH**
+2-3 sentences on the current state of the pipeline — what's hot, what's stalled, the total value picture vs the goal if set. Be direct about gaps.
 
-**NEXT WEEK PRIORITIES** 2-3 sentences on the 2-3 highest-leverage actions for next week. Name specific companies and actions.
+**NEXT WEEK PRIORITIES**
+2-3 sentences on the 2-3 highest-leverage actions to take next week based on the pipeline and activity data. Name specific companies and recommended actions.
 
-**WATCH LIST** 1-2 sentences flagging dormant opportunities or upcoming events needing preparation.
+**WATCH LIST**
+1-2 sentences flagging any opportunities that have been dormant for over 7 days with no activity logged, or upcoming calendar events that need preparation.
 
-Max 200 words total. Be specific, analytical, direct. Reference real data.`;
+Max 200 words total. Be specific, analytical, direct. Reference real data — company names, dates, numbers.`;
+
     try {
       const blocks=await callLLM(provider,apiKey,[{role:"user",content:prompt}],[],"You are a sharp executive intelligence advisor. Write concise, data-driven weekly digests.","DIGEST",null);
       setWeeklyDigest(stripCiteTags(blocks.map(b=>b.text).join("").trim())||"Digest generation failed.");
@@ -2292,10 +2339,10 @@ Use "you have", "your pipeline", "you should" — never "Young has" or "the user
         <div style={{fontSize:15,color:t.textMuted}}>Here's your opportunity intelligence for {now.toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long"})}.</div>
         <div style={{display:"flex",gap:8,marginTop:8,flexWrap:"wrap"}}>
           <button onClick={generateBrief} disabled={briefLoading} style={{...btn0,display:"inline-flex",alignItems:"center",gap:7,padding:"8px 14px",borderRadius:8,fontSize:15,fontWeight:700,background:briefLoading?t.input:"linear-gradient(135deg,"+t.accent+"20,"+t.indigo+"20)",border:"1px solid "+(briefLoading?t.border:t.accent+"40"),color:briefLoading?t.textDim:t.accent}}>
-            {briefLoading?<><Ic.Loader2 size={13}/> Generating brief...</>:<><Ic.Zap size={13}/> Morning Brief</>}
+            {briefLoading?<><Ic.Loader2 size={13}/> Generating brief…</>:<><Ic.Zap size={13}/> Morning Brief</>}
           </button>
           <button onClick={generateWeeklyDigest} disabled={digestLoading} style={{...btn0,display:"inline-flex",alignItems:"center",gap:7,padding:"8px 14px",borderRadius:8,fontSize:15,fontWeight:700,background:digestLoading?t.input:"linear-gradient(135deg,#38bdf820,#818cf820)",border:"1px solid "+(digestLoading?t.border:"#38bdf840"),color:digestLoading?t.textDim:"#38bdf8"}}>
-            {digestLoading?<><Ic.Loader2 size={13}/> Generating digest...</>:<><Ic.BarChart2 size={13}/> Weekly Digest</>}
+            {digestLoading?<><Ic.Loader2 size={13}/> Generating digest…</>:<><Ic.BarChart2 size={13}/> Weekly Digest</>}
           </button>
         </div>
         {morningBrief&&<div style={{marginTop:12,padding:"14px 16px",background:t.card,border:"1px solid "+t.accent+"25",borderRadius:10,fontSize:15,color:t.textMuted,lineHeight:1.8}}>
@@ -2306,7 +2353,20 @@ Use "you have", "your pipeline", "you should" — never "Young has" or "the user
         {weeklyDigest&&<div style={{marginTop:12,padding:"14px 16px",background:t.card,border:"1px solid #38bdf825",borderRadius:10,fontSize:15,color:t.textMuted,lineHeight:1.8}}>
           <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
             <span style={{fontSize:12,fontWeight:700,letterSpacing:"0.08em",color:"#38bdf8"}}>WEEKLY DIGEST</span>
-            {saveToVault&&<button onClick={()=>{saveToVault({title:"Weekly Digest — "+new Date().toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"}),docTypeLabel:"Weekly Digest",content:weeklyDigest,contentType:"document",sourceOpportunity:"Home"});setDigestSaved(true);setTimeout(()=>setDigestSaved(false),2500);}} style={{...btn0,display:"inline-flex",alignItems:"center",gap:4,fontSize:11,fontWeight:700,padding:"2px 9px",borderRadius:4,background:digestSaved?"#38bdf820":"transparent",border:"1px solid "+(digestSaved?"#38bdf850":"#38bdf830"),color:"#38bdf8",marginLeft:"auto"}}><Ic.Archive size={11}/>{digestSaved?"Saved!":"Save to Vault"}</button>}
+            <span style={{fontSize:11,color:t.textDim,marginLeft:2}}>{new Date().toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</span>
+            {saveToVault&&<button onClick={()=>{
+              saveToVault({
+                title:"Weekly Digest — "+new Date().toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"}),
+                docTypeLabel:"Weekly Digest",
+                content: weeklyDigest,
+                contentType:"document",
+                sourceOpportunity:"Home",
+              });
+              setDigestSaved(true);
+              setTimeout(()=>setDigestSaved(false),2500);
+            }} style={{...btn0,display:"inline-flex",alignItems:"center",gap:4,fontSize:11,fontWeight:700,padding:"2px 9px",borderRadius:4,background:digestSaved?"#38bdf820":"transparent",border:"1px solid "+(digestSaved?"#38bdf850":"#38bdf830"),color:"#38bdf8",marginLeft:"auto"}}>
+              <Ic.Archive size={11}/>{digestSaved?"Saved!":"Save to Vault"}
+            </button>}
           </div>
           {renderMD(weeklyDigest,t)}
           <button onClick={()=>setWeeklyDigest(null)} style={{...btn0,marginTop:10,fontSize:15,color:t.textDim,background:"transparent",padding:0}}>Dismiss</button>
@@ -2347,7 +2407,7 @@ Use "you have", "your pipeline", "you should" — never "Young has" or "the user
 
       {/* Module launcher */}
       <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:8}}>LAUNCH A MODULE</div>
-      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(4,1fr)",gap:8}}>
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(5,1fr)",gap:8}}>
         {modules.map(m=>(
           <button key={m.key} onClick={()=>{ if(!profileComplete&&gatedModules&&gatedModules.includes(m.key)) return; setActiveModule(m.key); }} style={{...btn0,padding:"12px 12px",background:t.card,border:"1px solid "+m.color+"25",borderRadius:8,textAlign:"left",cursor:!profileComplete&&gatedModules&&gatedModules.includes(m.key)?"not-allowed":"pointer",transition:"all 0.2s",opacity:!profileComplete&&gatedModules&&gatedModules.includes(m.key)?0.45:1}} title={!profileComplete&&gatedModules&&gatedModules.includes(m.key)?"Complete your profile in Settings first":m.label}>
             <div style={{fontSize:20,marginBottom:6}}>{m.icon}</div>
@@ -2790,6 +2850,8 @@ const TaxOptimiserPanel = ({item,profile,apiKey,provider,t,onClose}) => {
   const incomeType=item.estimatedFee||item.entryCost?"fee-based income":item.equity?"equity / capital gain":"mixed income and equity";
   const sourceCountry=item.region||"unknown";
 
+  useEffect(()=>{ runAnalysis(); },[]);
+
   const runAnalysis=async()=>{
     if(!apiKey){setError("No API key — add it in Settings.");return;}
     setLoading(true);setError(null);setAnalysis(null);
@@ -2825,8 +2887,6 @@ Return 2-3 options. OUTPUT ONLY JSON.`;
     } catch(e){ setError("Analysis failed: "+e.message); }
     setLoading(false);
   };
-
-  useEffect(()=>{ if(apiKey && profile && item) runAnalysis(); },[apiKey, provider]);
 
   const effColor=e=>e==="high"?"#10b981":e==="medium"?"#f59e0b":"#ef4444";
   const urgColor=u=>u==="high"?"#ef4444":u==="medium"?"#f59e0b":u==="low"?"#3b82f6":t.textDim;
@@ -3049,11 +3109,12 @@ const NETWORK_STRATEGIES = {
   }
 };
 
-const NetworkIntelligencePanel = ({item,profile,apiKey,provider,t,onClose,onSaveAnalysis}) => {
+const NetworkIntelligencePanel = ({item,profile,apiKey,provider,t,onClose,onSaveAnalysis,onSaveToVault,onSaveContact}) => {
   const [analysis,setAnalysis]=useState(item.networkAnalysis||null);
   const [loading,setLoading]=useState(false);
   const [error,setError]=useState(null);
   const [target,setTarget]=useState(item.name||"");
+  const [savedToVault,setSavedToVault]=useState(false);
   const cachedAt = item.networkAnalysedAt ? new Date(item.networkAnalysedAt).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"}) : null;
 
   const strategy = NETWORK_STRATEGIES[item.source] || NETWORK_STRATEGIES.default;
@@ -3158,6 +3219,22 @@ ${(analysis.mutualOrgs||[]).filter(Boolean).length>0?`<h2>Shared Organisations</
             {analysis&&!loading&&<button onClick={handlePrint} style={{...btn0,display:"flex",alignItems:"center",gap:5,padding:"7px 12px",borderRadius:7,fontSize:15,fontWeight:700,background:t.indigoDim,border:"1px solid "+t.indigo+"40",color:t.indigo,flexShrink:0}}>
               🖨 Print
             </button>}
+            {analysis&&!loading&&onSaveToVault&&<button onClick={()=>{
+              onSaveToVault({
+                title:"Network Intel — "+(target||item.name||""),
+                docTypeLabel:"Network Intelligence",
+                content: JSON.stringify(analysis),
+                contentType:"network-intel",
+                sourceOpportunity: target||item.name||"",
+                sourceItem: item,
+                niTarget: target||item.name||"",
+                niRegion: item.region||"",
+              });
+              setSavedToVault(true);
+              setTimeout(()=>setSavedToVault(false),2500);
+            }} style={{...btn0,display:"flex",alignItems:"center",gap:5,padding:"7px 12px",borderRadius:7,fontSize:15,fontWeight:700,background:savedToVault?"#38bdf820":"transparent",border:"1px solid "+(savedToVault?"#38bdf850":t.border),color:savedToVault?"#38bdf8":t.textMuted,flexShrink:0}}>
+              <Ic.Archive size={13}/>{savedToVault?"Saved!":"Save to Vault"}
+            </button>}
             <button onClick={onClose} style={{...btn0,width:30,height:30,borderRadius:7,background:t.input,border:"1px solid "+t.border,color:t.textMuted,fontSize:18,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>×</button>
           </div>
           <div style={{display:"flex",gap:8}}>
@@ -3191,6 +3268,7 @@ ${(analysis.mutualOrgs||[]).filter(Boolean).length>0?`<h2>Shared Organisations</
                         <div style={{fontSize:14,fontWeight:500,color:t.textMuted}}>{c.role}</div>
                       </div>
                       <span style={{fontSize:12,fontWeight:700,padding:"3px 9px",borderRadius:4,background:warmColor(c.warmthLevel)+"20",color:warmColor(c.warmthLevel),textTransform:"uppercase",flexShrink:0}}>{c.warmthLevel}</span>
+                      {onSaveContact&&<button onClick={()=>onSaveContact({name:c.name,role:c.role,company:target||item.name||"",warmth:c.warmthLevel==="hot"?"hot":c.warmthLevel==="warm"?"warm":"cold",linkedOpportunities:item.name?[item.name]:[],source:"network-intel"})} style={{...btn0,display:"inline-flex",alignItems:"center",gap:3,fontSize:11,fontWeight:700,padding:"3px 8px",borderRadius:4,background:"#2dd4bf15",border:"1px solid #2dd4bf40",color:"#2dd4bf",flexShrink:0}}>+ Save</button>}
                     </div>
                     <div style={{fontSize:15,color:t.textMuted,lineHeight:1.6,marginBottom:5}}><strong style={{color:t.indigo}}>Path: </strong>{c.connectionPath}</div>
                     <div style={{fontSize:14,color:t.textMuted,lineHeight:1.65}}>{c.rationale}</div>
@@ -3241,11 +3319,12 @@ ${(analysis.mutualOrgs||[]).filter(Boolean).length>0?`<h2>Shared Organisations</
 };
 
 // ─── DOCUMENT GENERATOR ──────────────────────────────────────────────────────
-const DocumentGenerator = ({item,profile,apiKey,provider,t,onClose}) => {
+const DocumentGenerator = ({item,profile,apiKey,provider,t,onClose,onSaveToVault}) => {
   const [docType,setDocType]=useState(null); // null = auto-select first relevant
   const [result,setResult]=useState(null);
   const [loading,setLoading]=useState(false);
   const [copied,setCopied]=useState(false);
+  const [savedToVault,setSavedToVault]=useState(false);
   const [showAll,setShowAll]=useState(false);
 
   const DOC_TYPES=[
@@ -3310,7 +3389,7 @@ const DocumentGenerator = ({item,profile,apiKey,provider,t,onClose}) => {
 
   const generate=async()=>{
     if(!apiKey){setResult("No API key configured. Add your key in Settings.");return;}
-    setLoading(true);setResult(null);
+    setLoading(true);setResult(null);setSavedToVault(false);
     const profCtx=`NAME: ${profile.name||"User"}\nTITLE: ${profile.title||""}\nLOCATION: ${profile.location||""}\nSUMMARY: ${profile.summary||""}\nHIGHLIGHTS:\n${(profile.highlights||[]).map(h=>"- "+h).join("\n")}\nVALUE PROPOSITION: ${profile.boardValue||""}`;
     const oppCtx=`OPPORTUNITY: ${item.name||""}
 REGION: ${item.region||""}
@@ -3581,6 +3660,19 @@ ${htmlLines}
                 <button onClick={generate} style={{...btn0,fontSize:15,fontWeight:600,padding:"4px 10px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted,display:"flex",alignItems:"center",gap:4}}>
                   <Ic.Loader2 size={10}/> Regen
                 </button>
+                {onSaveToVault&&<button onClick={()=>{
+                  onSaveToVault({
+                    title: activeDoc.label+" — "+(item.name||""),
+                    docTypeLabel: activeDoc.label,
+                    content: result,
+                    sourceOpportunity: item.name||"",
+                    sourceItem: item,
+                  });
+                  setSavedToVault(true);
+                  setTimeout(()=>setSavedToVault(false), 2500);
+                }} style={{...btn0,fontSize:15,fontWeight:600,padding:"4px 10px",borderRadius:5,background:savedToVault?"#38bdf820":"transparent",border:"1px solid "+(savedToVault?"#38bdf850":t.border),color:savedToVault?"#38bdf8":t.textMuted,display:"flex",alignItems:"center",gap:4}}>
+                  <Ic.Archive size={10}/>{savedToVault?"Saved!":"Save to Vault"}
+                </button>}
               </div>
             </div>
             <div style={{background:t.input,border:"1px solid "+t.border,borderRadius:8,padding:"18px 20px",fontSize:15,color:t.text,lineHeight:1.75,maxHeight:440,overflowY:"auto"}}>
@@ -3589,6 +3681,652 @@ ${htmlLines}
           </>}
         </div>
       </div>
+    </div>
+  );
+};
+
+// ─── MODULE: CONTROL TOWER ────────────────────────────────────────────────────
+const ControlTowerModule = ({t, isMobile, saved, activityLog, contacts, calendarEvents, setActiveModule}) => {
+  const TC = {board:"#6ee7b7", exec:"#c084fc", hustle:"#fb923c", venture:"#818cf8", deal:"#f6c90e"};
+  const [selectedOpp, setSelectedOpp] = useState(null);
+
+  const now = new Date();
+  const DAY = 24*60*60*1000;
+
+  // Derived KPIs — all computed live from real data
+  const activeOpps = saved.filter(s => {
+    const entries = (activityLog||[]).filter(e => e.pipelineCardId === (s.id||s.name));
+    if (!entries.length) return false;
+    const latest = new Date(Math.max(...entries.map(e => new Date(e.loggedAt))));
+    return (now - latest) < 14 * DAY;
+  });
+
+  const dormantOpps = saved.filter(s => {
+    const entries = (activityLog||[]).filter(e => e.pipelineCardId === (s.id||s.name));
+    if (!entries.length) return true;
+    const latest = new Date(Math.max(...entries.map(e => new Date(e.loggedAt))));
+    return (now - latest) >= 14 * DAY;
+  });
+
+  const upcomingEvents = (calendarEvents||[])
+    .filter(e => !e.completed && new Date(e.datetime) >= now)
+    .sort((a,b) => new Date(a.datetime) - new Date(b.datetime))
+    .slice(0, 10);
+
+  const overdueEvents = (calendarEvents||[])
+    .filter(e => !e.completed && new Date(e.datetime) < now)
+    .sort((a,b) => new Date(b.datetime) - new Date(a.datetime))
+    .slice(0, 5);
+
+  const actionsThisWeek = (calendarEvents||[]).filter(e => {
+    const d = new Date(e.datetime);
+    return d >= now && d <= new Date(now.getTime() + 7*DAY);
+  });
+
+  const hotCount = saved.filter(s => s.status === "HOT" || s.status === "PURSUE" || s.status === "BUILD").length;
+
+  // Pipeline stages derived from kanbanStage or status
+  const getStage = (s) => {
+    const ks = (s.kanbanStage||"").toLowerCase();
+    const st = (s.status||"").toLowerCase();
+    if (ks === "decision" || st === "decision") return "decision";
+    if (ks === "talking" || ks === "in conversation" || st === "active") return "talking";
+    if (ks === "outreach" || ks === "outreach sent") return "outreach";
+    if (ks === "researching" || ks === "research" || st === "researching") return "research";
+    return "saved";
+  };
+
+  const STAGES = [
+    {key:"saved", label:"Saved", sub:"identified"},
+    {key:"research", label:"Researching", sub:"NI / docs"},
+    {key:"outreach", label:"Outreach", sub:"in contact"},
+    {key:"talking", label:"Talking", sub:"active conv."},
+    {key:"decision", label:"Decision", sub:"close stage"},
+  ];
+
+  // Sectors summary
+  const sectors = {};
+  saved.forEach(s => { sectors[s.sector||"Other"] = (sectors[s.sector||"Other"]||0)+1; });
+  const topSectors = Object.entries(sectors).sort((a,b)=>b[1]-a[1]).slice(0,4);
+
+  // Activity this week
+  const weekAgo = new Date(now.getTime() - 7*DAY);
+  const recentActivity = (activityLog||[]).filter(e => new Date(e.loggedAt) >= weekAgo);
+  const actByType = {};
+  recentActivity.forEach(e => { actByType[e.actionType] = (actByType[e.actionType]||0)+1; });
+
+  const typeColor = {board:"#6ee7b7",exec:"#c084fc",hustle:"#fb923c",venture:"#818cf8",deal:"#f6c90e"};
+  const getOppColor = (s) => {
+    const hasRecent = activeOpps.some(a => a.id === s.id || a.name === s.name);
+    return hasRecent ? (typeColor[s.source]||"#818cf8") : "#9ca3af";
+  };
+
+  const calColor = {call:"#0891b2","follow-up":"#7c3aed",meeting:"#ea580c",deadline:"#dc2626",research:"#16a34a",outreach:"#4f46e5",custom:"#a78bfa"};
+
+  const s = {
+    card: {background:t.card, border:"1px solid "+t.border, borderRadius:10, padding:"12px 14px"},
+    label: {fontSize:10, fontWeight:700, letterSpacing:"0.07em", color:t.textDim, marginBottom:8},
+    spokeItem: {fontSize:11, color:t.textMuted, padding:"3px 0", borderBottom:"1px solid "+t.border+"60", display:"flex", justifyContent:"space-between", alignItems:"center"},
+  };
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+
+      {/* Top stat pills */}
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+        <span style={{fontSize:13,color:t.textMuted}}>{saved.length} opportunities</span>
+        <span style={{color:t.textDim}}>·</span>
+        {Object.entries({board:"#6ee7b7",exec:"#c084fc",hustle:"#fb923c",venture:"#818cf8",deal:"#f6c90e"}).map(([src,col])=>{
+          const cnt = saved.filter(s=>s.source===src).length;
+          if(!cnt) return null;
+          return <span key={src} style={{fontSize:11,fontWeight:700,padding:"2px 9px",borderRadius:20,border:"1px solid "+col+"40",color:col,background:col+"12"}}>{cnt} {src}</span>;
+        })}
+        {dormantOpps.length>0&&<span style={{fontSize:11,fontWeight:700,padding:"2px 9px",borderRadius:20,border:"1px solid #ef444440",color:"#ef4444",background:"#ef444412"}}>{dormantOpps.length} dormant</span>}
+      </div>
+
+      {/* Selected opp detail */}
+      {selectedOpp&&(()=>{
+        const color = typeColor[selectedOpp.source]||"#818cf8";
+        const oppActivity = (activityLog||[]).filter(e=>e.pipelineCardId===(selectedOpp.id||selectedOpp.name)).sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt));
+        const lastAct = oppActivity[0];
+        return (
+          <div style={{...s.card, border:"1px solid "+color+"40", background:t.card}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontSize:14,fontWeight:700,color:t.text}}>{selectedOpp.name}</span>
+                <span style={{fontSize:10,padding:"2px 7px",borderRadius:3,background:color+"18",color}}>{(selectedOpp.source||"opp").toUpperCase()}</span>
+                <span style={{fontSize:10,padding:"2px 7px",borderRadius:3,background:activeOpps.some(a=>a.id===selectedOpp.id||a.name===selectedOpp.name)?"#16a34a18":"#9ca3af18",color:activeOpps.some(a=>a.id===selectedOpp.id||a.name===selectedOpp.name)?"#16a34a":"#9ca3af"}}>
+                  {activeOpps.some(a=>a.id===selectedOpp.id||a.name===selectedOpp.name)?"Active":"Dormant"}
+                </span>
+              </div>
+              <button onClick={()=>setSelectedOpp(null)} style={{...btn0,background:"none",color:t.textDim,fontSize:16,padding:0}}>×</button>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:10}}>
+              {[
+                {label:"Region",val:selectedOpp.region||"—"},
+                {label:"Sector",val:selectedOpp.sector||"—"},
+                {label:"Status",val:selectedOpp.status||"—"},
+                {label:"Activity entries",val:oppActivity.length},
+                {label:"Last logged",val:lastAct?new Date(lastAct.loggedAt).toLocaleDateString("en-GB",{day:"numeric",month:"short"}):"Never"},
+                {label:"Notes",val:selectedOpp.notes?"Yes":"None"},
+              ].map((stat,i)=>(
+                <div key={i} style={{background:t.input,borderRadius:6,padding:"6px 9px"}}>
+                  <div style={{fontSize:10,color:t.textDim,marginBottom:1}}>{stat.label}</div>
+                  <div style={{fontSize:12,fontWeight:600,color:t.text}}>{stat.val}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={()=>setSelectedOpp(null)} style={{...btn0,fontSize:11,padding:"4px 10px",borderRadius:5,border:"1px solid "+t.border,color:t.textMuted,background:"transparent"}}>Close</button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Hub + spokes */}
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 180px 1fr",gap:12,alignItems:"start"}}>
+
+        {/* Left spokes */}
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          <div style={s.card}>
+            <div style={{...s.label,color:"#c084fc"}}>PIPELINE HEALTH</div>
+            {[
+              {label:"HOT / PURSUE",val:hotCount,col:"#dc2626"},
+              {label:"In outreach / talking",val:saved.filter(s=>["outreach","talking","decision"].includes(getStage(s))).length,col:"#16a34a"},
+              {label:"Active (<14d)",val:activeOpps.length,col:"#16a34a"},
+              {label:"Dormant (>14d)",val:dormantOpps.length,col:"#9ca3af"},
+            ].map((item,i)=>(
+              <div key={i} style={s.spokeItem}>
+                <span>{item.label}</span>
+                <span style={{fontWeight:600,color:item.col}}>{item.val}</span>
+              </div>
+            ))}
+          </div>
+          <div style={s.card}>
+            <div style={{...s.label,color:"#16a34a"}}>ACTIVITY THIS WEEK</div>
+            {recentActivity.length===0
+              ? <div style={{fontSize:12,color:t.textDim,fontStyle:"italic"}}>No activity logged this week</div>
+              : [
+                  {label:"Total logged",val:recentActivity.length,col:"#16a34a"},
+                  ...Object.entries(actByType).map(([type,cnt])=>({label:type.charAt(0).toUpperCase()+type.slice(1),val:cnt,col:calColor[type]||"#818cf8"}))
+                ].map((item,i)=>(
+                  <div key={i} style={s.spokeItem}>
+                    <span>{item.label}</span>
+                    <span style={{fontWeight:600,color:item.col}}>{item.val}</span>
+                  </div>
+                ))
+            }
+          </div>
+        </div>
+
+        {/* Hub centre */}
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
+          <div style={{width:130,height:130,borderRadius:"50%",border:"1.5px solid "+t.border,background:t.card,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:2,flexShrink:0}}>
+            <div style={{fontSize:24,marginBottom:2}}>⚡</div>
+            <div style={{fontSize:11,fontWeight:700,color:t.text}}>TorqueOS</div>
+            <div style={{fontSize:10,color:t.textDim}}>control tower</div>
+          </div>
+          <div style={{width:2,height:12,background:t.border,margin:"0 auto"}}/>
+          <div style={{width:"100%",background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
+            <div style={{fontSize:22,fontWeight:700,color:"#16a34a"}}>{activeOpps.length}</div>
+            <div style={{fontSize:10,color:t.textDim,marginTop:1}}>active opportunities</div>
+            <div style={{fontSize:10,color:"#16a34a",marginTop:2}}>activity logged &lt;14 days</div>
+          </div>
+          <div style={{width:"100%",background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
+            <div style={{fontSize:22,fontWeight:700,color:"#0891b2"}}>{actionsThisWeek.length + overdueEvents.length}</div>
+            <div style={{fontSize:10,color:t.textDim,marginTop:1}}>actions this week</div>
+            <div style={{fontSize:10,marginTop:2,color:overdueEvents.length>0?"#dc2626":"#16a34a"}}>
+              {overdueEvents.length>0?overdueEvents.length+" overdue · ":""}{actionsThisWeek.length} upcoming
+            </div>
+          </div>
+        </div>
+
+        {/* Right spokes */}
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          <div style={s.card}>
+            <div style={{...s.label,color:"#fb923c"}}>CONTACTS CRM</div>
+            {[
+              {label:"Saved contacts",val:(contacts||[]).length,col:"#fb923c"},
+              {label:"Hot warmth",val:(contacts||[]).filter(c=>c.warmth==="hot").length,col:"#dc2626"},
+              {label:"Warm",val:(contacts||[]).filter(c=>c.warmth==="warm").length,col:"#f59e0b"},
+              {label:"Opps with contacts",val:saved.filter(s=>(contacts||[]).some(c=>c.company&&s.name&&s.name.toLowerCase().includes(c.company.toLowerCase()))).length,col:"#16a34a"},
+            ].map((item,i)=>(
+              <div key={i} style={s.spokeItem}>
+                <span>{item.label}</span>
+                <span style={{fontWeight:600,color:item.col}}>{item.val}</span>
+              </div>
+            ))}
+          </div>
+          <div style={s.card}>
+            <div style={{...s.label,color:"#be185d"}}>TOP SECTORS</div>
+            {topSectors.length===0
+              ? <div style={{fontSize:12,color:t.textDim,fontStyle:"italic"}}>No pipeline data yet</div>
+              : topSectors.map(([sector,count],i)=>(
+                  <div key={i} style={s.spokeItem}>
+                    <span>{sector}</span>
+                    <span style={{fontWeight:600,color:"#be185d"}}>{count} {count===1?"opp":"opps"}</span>
+                  </div>
+                ))
+            }
+          </div>
+        </div>
+      </div>
+
+      {/* Timeline */}
+      <div style={s.card}>
+        <div style={s.label}>UPCOMING ACTIONS <span style={{fontWeight:400,letterSpacing:0,color:t.textDim}}>— next 14 days</span></div>
+        {overdueEvents.length>0&&<div style={{display:"flex",gap:6,marginBottom:8,flexWrap:"wrap"}}>
+          {overdueEvents.map((ev,i)=>(
+            <div key={i} style={{flexShrink:0,minWidth:110,padding:"6px 9px",borderRadius:7,border:"1px solid #ef444430",background:"#ef444410"}}>
+              <div style={{fontSize:10,color:"#dc2626",marginBottom:2}}>overdue</div>
+              <div style={{fontSize:11,fontWeight:600,color:t.text,lineHeight:1.3}}>{ev.cardName}</div>
+              <span style={{fontSize:10,padding:"1px 5px",borderRadius:3,background:calColor[ev.actionType]+"18"||"#81cf820",color:calColor[ev.actionType]||"#16a34a"}}>{ev.actionType}</span>
+            </div>
+          ))}
+        </div>}
+        {upcomingEvents.length===0&&overdueEvents.length===0
+          ? <div style={{fontSize:12,color:t.textDim,fontStyle:"italic"}}>No upcoming events scheduled. Add actions via the Calendar.</div>
+          : <div style={{display:"flex",gap:8,overflowX:"auto",paddingBottom:4}}>
+              {upcomingEvents.map((ev,i)=>{
+                const evDate = new Date(ev.datetime);
+                const daysAway = Math.ceil((evDate-now)/DAY);
+                const col = calColor[ev.actionType]||"#818cf8";
+                return (
+                  <div key={i} style={{flexShrink:0,minWidth:118,display:"flex",flexDirection:"column",gap:3}}>
+                    <div style={{fontSize:10,color:t.textDim}}>
+                      {evDate.toLocaleDateString("en-GB",{day:"numeric",month:"short"})}
+                      {daysAway<=2&&<span style={{marginLeft:4,fontSize:9,padding:"1px 5px",borderRadius:3,background:"#dc262618",color:"#dc2626"}}>soon</span>}
+                    </div>
+                    <div style={{fontSize:11,fontWeight:600,color:t.text,lineHeight:1.3}}>{ev.cardName}</div>
+                    <span style={{fontSize:10,padding:"1px 6px",borderRadius:3,background:col+"18",color:col,display:"inline-block",width:"fit-content"}}>{ev.actionType}</span>
+                  </div>
+                );
+              })}
+            </div>
+        }
+      </div>
+
+      {/* Legend */}
+      <div style={{display:"flex",flexWrap:"wrap",gap:12}}>
+        {[["#6ee7b7","Board / NED"],["#c084fc","Executive"],["#fb923c","Side hustle"],["#818cf8","Venture"],["#f6c90e","Deal"],["#16a34a","Active (<14d)"],["#9ca3af","Dormant (>14d)"]].map(([col,lbl])=>(
+          <span key={lbl} style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:t.textDim}}>
+            <span style={{width:8,height:8,borderRadius:"50%",background:col,display:"inline-block",flexShrink:0}}/>
+            {lbl}
+          </span>
+        ))}
+      </div>
+
+    </div>
+  );
+};
+
+// ─── MODULE: DOCUMENT VAULT ───────────────────────────────────────────────────
+const DocumentVaultModule = ({t, isMobile, vault, setVault, onRegenerate}) => {
+  const [selectedId, setSelectedId] = useState(null);
+  const [search, setSearch] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null);
+
+  const filtered = (vault||[]).filter(d =>
+    !search.trim() ||
+    (d.title||"").toLowerCase().includes(search.toLowerCase()) ||
+    (d.type||"").toLowerCase().includes(search.toLowerCase()) ||
+    (d.sourceOpportunity||"").toLowerCase().includes(search.toLowerCase())
+  );
+
+  const selected = filtered.find(d => d.id === selectedId) || filtered[0] || null;
+
+  const deleteDoc = (id) => {
+    const next = vault.filter(d => d.id !== id);
+    setVault(next);
+    storage.set("oos-vault", next);
+    if (selectedId === id) setSelectedId(null);
+    setConfirmDelete(null);
+  };
+
+  const copyDoc = (content) => {
+    navigator.clipboard.writeText(content||"").catch(()=>{});
+  };
+
+  const printDoc = (doc) => {
+    if (doc.contentType === "network-intel") {
+      try {
+        const a = JSON.parse(doc.content||"{}");
+        const wc=w=>w==="hot"?"#ef4444":w==="warm"?"#f59e0b":"#3b82f6";
+        const contacts=(a.keyContacts||[]).map(c=>`<div style="border:1px solid #e5e7eb;border-left:4px solid ${wc(c.warmthLevel)};border-radius:8px;padding:12px 14px;margin-bottom:10px;"><div style="display:flex;justify-content:space-between;margin-bottom:6px;"><strong>${c.name}</strong><span style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;background:${wc(c.warmthLevel)}22;color:${wc(c.warmthLevel)};text-transform:uppercase">${c.warmthLevel}</span></div><div style="font-size:12px;color:#6b7280;margin-bottom:4px;">${c.role}</div><div style="font-size:13px;color:#374151;margin-bottom:4px;"><strong style="color:#4f46e5">Path: </strong>${c.connectionPath}</div><div style="font-size:12px;color:#6b7280">${c.rationale}</div></div>`).join("");
+        const angles=(a.networkAngles||[]).map((x,i)=>`<div style="display:flex;gap:8px;margin-bottom:6px;"><span style="font-weight:700;color:#4f46e5;min-width:16px">${i+1}.</span><span style="font-size:13px;color:#374151">${x}</span></div>`).join("");
+        const icebreakers=(a.icebreakers||[]).map(x=>`<div style="padding:7px 10px;background:#f3f4f6;border-radius:5px;font-size:13px;color:#374151;margin-bottom:5px;border-left:2px solid #818cf8">"${x}"</div>`).join("");
+        const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${doc.title}</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;padding:40px;color:#111;line-height:1.7;}h1{font-size:20px;font-weight:800;margin-bottom:4px;}h2{font-size:14px;font-weight:700;color:#6b7280;letter-spacing:0.06em;text-transform:uppercase;margin:20px 0 8px;}p.meta{font-size:13px;color:#6b7280;margin-bottom:24px;}.summary{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px;font-size:14px;color:#374151;margin-bottom:20px;line-height:1.7;}.approach{background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:12px 14px;font-size:13px;color:#166534;margin-bottom:16px;}.footer{font-size:11px;color:#9ca3af;font-style:italic;text-align:center;margin-top:32px;padding-top:16px;border-top:1px solid #f3f4f6;}</style></head><body><h1>🕸 Network Intelligence</h1><p class="meta">Target: <strong>${doc.niTarget||doc.sourceOpportunity||""}</strong> · ${doc.niRegion||""} · ${new Date(doc.savedAt).toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}</p>${a.targetSummary?`<div class="summary">${a.targetSummary}</div>`:""}<h2>Key Contacts</h2>${contacts}${a.recommendedApproach?`<h2>Recommended Approach</h2><div class="approach">${a.recommendedApproach}</div>`:""}${angles?`<h2>Network Angles</h2>${angles}`:""}${icebreakers?`<h2>Conversation Starters</h2>${icebreakers}`:""}${(a.mutualOrgs||[]).filter(Boolean).length>0?`<h2>Shared Organisations</h2><div>${a.mutualOrgs.filter(Boolean).map(o=>`<span style="display:inline-block;padding:3px 10px;background:#ede9fe;color:#4f46e5;border-radius:4px;font-size:12px;margin:0 4px 4px 0">${o}</span>`).join("")}</div>`:""}<p class="footer">Saved in TorqueOS Document Vault</p></body></html>`;
+        const w=window.open("","_blank"); w.document.write(html); w.document.close(); w.focus(); setTimeout(()=>w.print(),400);
+      } catch(e) {}
+      return;
+    }
+    const lines = (doc.content||"").split("\n");
+    const htmlLines = lines.map(line => {
+      const tr = line.trim();
+      if (!tr) return "<br>";
+      if (/^[A-Z][A-Z\s\-&\/]{3,}$/.test(tr) && !tr.includes(".") && tr.length < 60)
+        return `<h2>${tr}</h2>`;
+      if (/^[-–]\s+(.*)/.test(tr)) return `<p class="bullet">– ${tr.replace(/^[-–]\s+/,"")}</p>`;
+      return `<p>${tr}</p>`;
+    }).join("\n");
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${doc.title}</title>
+<style>body{font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;padding:40px;color:#111;line-height:1.7;font-size:15px;}h1{font-size:22px;font-weight:700;margin:0 0 6px;}h2{font-size:13px;font-weight:700;letter-spacing:0.06em;color:#6b7280;margin:24px 0 8px;padding-bottom:5px;border-bottom:1px solid #e5e7eb;text-transform:uppercase;}p{margin:0 0 8px;color:#374151;}p.bullet{padding-left:14px;}p.meta{font-size:13px;color:#6b7280;margin-bottom:24px;}.footer{font-size:11px;color:#9ca3af;font-style:italic;text-align:center;margin-top:32px;padding-top:16px;border-top:1px solid #f3f4f6;}</style>
+</head><body><h1>${doc.title}</h1><p class="meta">${doc.sourceOpportunity||""} · ${new Date(doc.savedAt).toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}</p>${htmlLines}<p class="footer">Saved in TorqueOS Document Vault</p></body></html>`;
+    const w = window.open("","_blank");
+    w.document.write(typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html,{WHOLE_DOCUMENT:true,ADD_TAGS:["style","meta","link"],ADD_ATTR:["target"]}):html);
+    w.document.close();
+    w.focus();
+    setTimeout(()=>w.print(), 400);
+  };
+
+  const vaultColor = "#38bdf8";
+
+  if (!vault || vault.length === 0) {
+    return (
+      <div style={{textAlign:"center",padding:"60px 24px",color:t.textDim}}>
+        <div style={{fontSize:48,marginBottom:14}}>📄</div>
+        <div style={{fontSize:16,fontWeight:700,color:t.text,marginBottom:8}}>Your Vault is empty</div>
+        <div style={{fontSize:14,color:t.textMuted,maxWidth:360,margin:"0 auto"}}>Generate documents from any opportunity card using the Docs button, then save them here. All generated content — board applications, outreach sequences, bios, briefings — lands in one place.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{display:"flex",flexDirection:isMobile?"column":"row",gap:8,flex:1,overflow:"hidden"}}>
+      {/* Left panel — document list */}
+      <div style={{width:isMobile?"100%":260,flexShrink:0,display:"flex",flexDirection:"column",gap:6,overflowY:"auto",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
+        <div style={{position:"relative"}}>
+          <Ic.Search size={13} style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:t.textDim,pointerEvents:"none"}}/>
+          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search vault…" style={{width:"100%",padding:"8px 10px 8px 30px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:7,color:t.text,fontSize:14,fontFamily:"inherit",boxSizing:"border-box"}}/>
+        </div>
+        <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,padding:"2px 2px"}}>{filtered.length} DOCUMENT{filtered.length!==1?"S":""}</div>
+        {filtered.map(doc => (
+          <div key={doc.id} onClick={()=>setSelectedId(doc.id)} style={{background:t.card,border:"1px solid "+(selectedId===doc.id||(!selectedId&&doc===filtered[0])?vaultColor+"50":t.border),borderLeft:"3px solid "+(selectedId===doc.id||(!selectedId&&doc===filtered[0])?vaultColor:t.border),borderRadius:8,padding:"10px 12px",cursor:"pointer",transition:"all 0.15s"}}>
+            <div style={{fontSize:13,fontWeight:700,color:t.text,marginBottom:3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{doc.title}</div>
+            <div style={{display:"flex",alignItems:"center",gap:5,flexWrap:"wrap"}}>
+              {doc.type&&<span style={{fontSize:11,fontWeight:600,padding:"1px 6px",borderRadius:3,background:vaultColor+"15",color:vaultColor}}>{doc.type}</span>}
+              {doc.sourceOpportunity&&<span style={{fontSize:11,color:t.textMuted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:110}}>{doc.sourceOpportunity}</span>}
+            </div>
+            <div style={{fontSize:11,color:t.textDim,marginTop:4}}>{new Date(doc.savedAt).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Right panel — viewer */}
+      {selected && (
+        <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",overflow:"hidden",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
+          {/* Doc header */}
+          <div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 16px",marginBottom:8,flexShrink:0}}>
+            <div style={{display:"flex",alignItems:"flex-start",gap:12,marginBottom:8}}>
+              <div style={{width:36,height:36,borderRadius:9,background:vaultColor+"18",border:"1px solid "+vaultColor+"30",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>{selected.contentType==="network-intel"?"🕸":"📄"}</div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:16,fontWeight:700,color:t.text,marginBottom:2}}>{selected.title}</div>
+                <div style={{fontSize:12,color:t.textMuted}}>
+                  {selected.type&&<span style={{marginRight:8,padding:"1px 6px",borderRadius:3,background:vaultColor+"15",color:vaultColor,fontWeight:600}}>{selected.type}</span>}
+                  {selected.sourceOpportunity&&<span>{selected.sourceOpportunity} · </span>}
+                  {new Date(selected.savedAt).toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}
+                </div>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              <button onClick={()=>copyDoc(selected.content)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>
+                <Ic.Copy size={11}/> Copy
+              </button>
+              <button onClick={()=>printDoc(selected)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:t.indigoDim,border:"1px solid "+t.indigo+"40",color:t.indigo}}>
+                <Ic.Printer size={11}/> Print
+              </button>
+              {onRegenerate&&selected.sourceItem&&<button onClick={()=>onRegenerate(selected.sourceItem)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:t.goldDim,border:"1px solid "+t.gold+"40",color:t.gold}}>
+                <Ic.RefreshCw size={11}/> Regenerate
+              </button>}
+              <button onClick={()=>setConfirmDelete(selected.id)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:"transparent",border:"1px solid rgba(239,68,68,0.25)",color:"#ef4444",marginLeft:"auto"}}>
+                <Ic.Trash2 size={11}/> Delete
+              </button>
+            </div>
+            {confirmDelete===selected.id&&(
+              <div style={{marginTop:10,padding:"8px 12px",background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.25)",borderRadius:6,display:"flex",alignItems:"center",gap:10}}>
+                <span style={{fontSize:13,color:"#ef4444",flex:1}}>Delete this document? This cannot be undone.</span>
+                <button onClick={()=>deleteDoc(selected.id)} style={{...btn0,fontSize:12,fontWeight:700,padding:"4px 10px",borderRadius:5,background:"#ef4444",color:"#fff",border:"none"}}>Delete</button>
+                <button onClick={()=>setConfirmDelete(null)} style={{...btn0,fontSize:12,padding:"4px 10px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
+              </div>
+            )}
+          </div>
+          {/* Document content */}
+          <div style={{flex:1,overflowY:"auto",minHeight:0,background:t.input,border:"1px solid "+t.border,borderRadius:8,padding:"20px 24px",fontSize:14,color:t.text,lineHeight:1.8,fontFamily:"inherit"}}>
+            {selected.contentType==="network-intel" ? (()=>{
+              const warmColor=w=>w==="hot"?"#ef4444":w==="warm"?"#f59e0b":"#3b82f6";
+              let a={};
+              try { a=JSON.parse(selected.content||"{}"); } catch(e){}
+              return <>
+                {a.targetSummary&&<div style={{padding:"10px 12px",background:t.card,border:"1px solid "+t.border,borderRadius:7,fontSize:14,color:t.textMuted,lineHeight:1.65,marginBottom:14}}>{a.targetSummary}</div>}
+                {(a.keyContacts||[]).length>0&&<>
+                  <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",color:t.textDim,marginBottom:8}}>KEY CONTACTS</div>
+                  {(a.keyContacts||[]).map((c,i)=>(
+                    <div key={i} style={{background:t.card,border:"1px solid "+t.border,borderLeft:"3px solid "+warmColor(c.warmthLevel),borderRadius:7,padding:"10px 12px",marginBottom:8}}>
+                      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:5}}>
+                        <div style={{width:26,height:26,borderRadius:"50%",background:warmColor(c.warmthLevel)+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:700,color:warmColor(c.warmthLevel),flexShrink:0}}>{(c.name||"?")[0]}</div>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontSize:14,fontWeight:700,color:t.text}}>{c.name}</div>
+                          <div style={{fontSize:12,color:t.textMuted}}>{c.role}</div>
+                        </div>
+                        <span style={{fontSize:11,fontWeight:700,padding:"2px 7px",borderRadius:3,background:warmColor(c.warmthLevel)+"20",color:warmColor(c.warmthLevel),textTransform:"uppercase"}}>{c.warmthLevel}</span>
+                      </div>
+                      <div style={{fontSize:13,color:t.textMuted,lineHeight:1.6,marginBottom:4}}><strong style={{color:t.indigo}}>Path: </strong>{c.connectionPath}</div>
+                      <div style={{fontSize:12,color:t.textDim,lineHeight:1.55}}>{c.rationale}</div>
+                    </div>
+                  ))}
+                </>}
+                {(a.networkAngles||[]).length>0&&<>
+                  <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",color:t.textDim,marginTop:14,marginBottom:8}}>NETWORK ANGLES</div>
+                  {(a.networkAngles||[]).map((x,i)=><div key={i} style={{display:"flex",gap:7,marginBottom:6,alignItems:"flex-start"}}><span style={{width:16,height:16,borderRadius:"50%",background:t.indigoDim,color:t.indigo,fontSize:11,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:2}}>{i+1}</span><span style={{fontSize:13,color:t.textMuted,lineHeight:1.6}}>{x}</span></div>)}
+                </>}
+                {a.recommendedApproach&&<>
+                  <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",color:t.accent,marginTop:14,marginBottom:7}}>RECOMMENDED APPROACH</div>
+                  <div style={{padding:"9px 12px",background:t.accentDim,border:"1px solid "+t.accent+"25",borderRadius:6,fontSize:13,color:t.textMuted,lineHeight:1.65}}>{a.recommendedApproach}</div>
+                </>}
+                {(a.icebreakers||[]).length>0&&<>
+                  <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",color:t.textDim,marginTop:14,marginBottom:7}}>CONVERSATION STARTERS</div>
+                  {(a.icebreakers||[]).map((x,i)=><div key={i} style={{padding:"7px 10px",background:t.card,borderRadius:5,fontSize:13,color:t.textMuted,marginBottom:5,borderLeft:"2px solid "+t.indigo+"50",lineHeight:1.6}}>"{x}"</div>)}
+                </>}
+                {(a.mutualOrgs||[]).filter(Boolean).length>0&&<>
+                  <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",color:t.textDim,marginTop:14,marginBottom:7}}>SHARED ORGANISATIONS</div>
+                  <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>{(a.mutualOrgs||[]).filter(Boolean).map((o,i)=><span key={i} style={{fontSize:12,padding:"3px 8px",borderRadius:4,background:t.indigoDim,color:t.indigo,fontWeight:500}}>{o}</span>)}</div>
+                </>}
+              </>;
+            })() : (selected.content||"").split("\n").map((line,i)=>{
+              const tr = line.trim();
+              if (!tr) return <div key={i} style={{height:10}}/>;
+              if (/^[A-Z][A-Z\s\-&\/]{3,}$/.test(tr) && !tr.includes(".") && tr.length < 60)
+                return <div key={i} style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",color:t.textDim,marginTop:18,marginBottom:5,paddingBottom:4,borderBottom:"1px solid "+t.border}}>{tr}</div>;
+              if (/^[-–]\s+/.test(tr))
+                return <div key={i} style={{paddingLeft:14,color:t.textMuted,marginBottom:2}}>– {tr.replace(/^[-–]\s+/,"")}</div>;
+              return <div key={i} style={{color:t.text,marginBottom:2}}>{line}</div>;
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// --- MODULE: CONTACTS CRM ---
+const ContactsModule = ({t, isMobile, contacts, setContacts, activityLog, saved, onNavigateToNetwork}) => {
+  const [selectedId, setSelectedId] = useState(null);
+  const [search, setSearch] = useState("");
+  const [warmthFilter, setWarmthFilter] = useState("ALL");
+  const [editingContact, setEditingContact] = useState(null);
+  const [editNote, setEditNote] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const contactColor = "#2dd4bf";
+
+  const warmthOrder = {hot:0, warm:1, cold:2};
+  const warmthColor = w => w==="hot"?"#ef4444":w==="warm"?"#f59e0b":"#3b82f6";
+
+  const filtered = (contacts||[])
+    .filter(c => warmthFilter==="ALL" || c.warmth===warmthFilter)
+    .filter(c => !search.trim() ||
+      (c.name||"").toLowerCase().includes(search.toLowerCase()) ||
+      (c.company||"").toLowerCase().includes(search.toLowerCase()) ||
+      (c.role||"").toLowerCase().includes(search.toLowerCase()))
+    .sort((a,b) => (warmthOrder[a.warmth]||2)-(warmthOrder[b.warmth]||2) || (a.name||"").localeCompare(b.name||""));
+
+  const selected = filtered.find(c=>c.id===selectedId) || filtered[0] || null;
+
+  const updateContact = (id, patch) => {
+    setContacts(prev => prev.map(c => c.id===id ? {...c,...patch} : c));
+  };
+
+  const deleteContact = (id) => {
+    setContacts(prev => prev.filter(c=>c.id!==id));
+    setSelectedId(null);
+    setConfirmDelete(null);
+  };
+
+  const contactActivity = selected
+    ? (activityLog||[])
+        .filter(e => e.pipelineCardName && selected.company &&
+          e.pipelineCardName.toLowerCase().includes(selected.company.toLowerCase()))
+        .sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt))
+        .slice(0,10)
+    : [];
+
+  const linkedOpps = selected
+    ? (saved||[]).filter(s =>
+        (selected.linkedOpportunities||[]).includes(s.name) ||
+        (selected.company && (s.name||"").toLowerCase().includes(selected.company.toLowerCase())))
+    : [];
+
+  if (!contacts || contacts.length === 0) {
+    return (
+      <div style={{textAlign:"center",padding:"60px 24px",color:t.textDim}}>
+        <div style={{fontSize:48,marginBottom:14}}>👥</div>
+        <div style={{fontSize:16,fontWeight:700,color:t.text,marginBottom:8}}>No contacts yet</div>
+        <div style={{fontSize:14,color:t.textMuted,maxWidth:380,margin:"0 auto",lineHeight:1.6}}>Contacts are saved from Network Intelligence. Run a network analysis on any opportunity, then click "Save contact" on any key contact card. They'll appear here with warmth tracking, linked opportunities, and activity history.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{display:"flex",flexDirection:isMobile?"column":"row",gap:8,flex:1,overflow:"hidden"}}>
+      {/* Left panel — contacts list */}
+      <div style={{width:isMobile?"100%":260,flexShrink:0,display:"flex",flexDirection:"column",gap:6,overflowY:"auto",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
+        <div style={{position:"relative"}}>
+          <Ic.Search size={13} style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:t.textDim,pointerEvents:"none"}}/>
+          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search contacts…" style={{width:"100%",padding:"8px 10px 8px 30px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:7,color:t.text,fontSize:14,fontFamily:"inherit",boxSizing:"border-box"}}/>
+        </div>
+        <div style={{display:"flex",gap:4}}>
+          {["ALL","hot","warm","cold"].map(w=>(
+            <button key={w} onClick={()=>setWarmthFilter(w)} style={{...btn0,flex:1,padding:"4px 0",borderRadius:5,fontSize:11,fontWeight:700,border:"1px solid "+(warmthFilter===w?(w==="ALL"?contactColor:warmthColor(w))+"60":t.border),background:warmthFilter===w?(w==="ALL"?contactColor:warmthColor(w))+"15":"transparent",color:warmthFilter===w?(w==="ALL"?contactColor:warmthColor(w)):t.textMuted,textTransform:"capitalize"}}>{w==="ALL"?"All":w}</button>
+          ))}
+        </div>
+        <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim}}>{filtered.length} CONTACT{filtered.length!==1?"S":""}</div>
+        {filtered.map(c=>(
+          <div key={c.id} onClick={()=>setSelectedId(c.id)} style={{background:t.card,border:"1px solid "+(c.id===selectedId||(!selectedId&&c===filtered[0])?contactColor+"50":t.border),borderLeft:"3px solid "+(c.id===selectedId||(!selectedId&&c===filtered[0])?contactColor:warmthColor(c.warmth)),borderRadius:8,padding:"10px 12px",cursor:"pointer",transition:"all 0.15s"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+              <div style={{width:28,height:28,borderRadius:"50%",background:warmthColor(c.warmth)+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:700,color:warmthColor(c.warmth),flexShrink:0}}>{(c.name||"?")[0]}</div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:13,fontWeight:700,color:t.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.name}</div>
+                <div style={{fontSize:11,color:t.textMuted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.role&&c.company?c.role+" · "+c.company:c.role||c.company||""}</div>
+              </div>
+              <span style={{fontSize:10,fontWeight:700,padding:"1px 5px",borderRadius:3,background:warmthColor(c.warmth)+"20",color:warmthColor(c.warmth),textTransform:"uppercase",flexShrink:0}}>{c.warmth}</span>
+            </div>
+            {c.lastContactDate&&<div style={{fontSize:11,color:t.textDim}}>Last contact: {new Date(c.lastContactDate).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</div>}
+          </div>
+        ))}
+      </div>
+
+      {/* Right panel — contact detail */}
+      {selected&&(
+        <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",gap:8,overflowY:"auto",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
+          {/* Contact header card */}
+          <div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"14px 16px"}}>
+            <div style={{display:"flex",alignItems:"flex-start",gap:12,marginBottom:10}}>
+              <div style={{width:44,height:44,borderRadius:"50%",background:warmthColor(selected.warmth)+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,fontWeight:700,color:warmthColor(selected.warmth),flexShrink:0}}>{(selected.name||"?")[0]}</div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:16,fontWeight:700,color:t.text,marginBottom:2}}>{selected.name}</div>
+                <div style={{fontSize:13,color:t.textMuted}}>{selected.role}{selected.role&&selected.company?" · ":""}{selected.company}</div>
+                <div style={{display:"flex",gap:5,marginTop:5,flexWrap:"wrap"}}>
+                  {["hot","warm","cold"].map(w=>(
+                    <button key={w} onClick={()=>updateContact(selected.id,{warmth:w})} style={{...btn0,fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:4,border:"1px solid "+(selected.warmth===w?warmthColor(w)+"60":t.border),background:selected.warmth===w?warmthColor(w)+"18":"transparent",color:selected.warmth===w?warmthColor(w):t.textMuted,textTransform:"capitalize"}}>{w}</button>
+                  ))}
+                  {onNavigateToNetwork&&selected.company&&<button onClick={()=>onNavigateToNetwork(selected.company)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:4,fontSize:11,fontWeight:600,padding:"2px 9px",borderRadius:4,background:t.indigoDim,border:"1px solid "+t.indigo+"30",color:t.indigo,marginLeft:"auto"}}>
+                    <span>🕸</span> Run Network Intel
+                  </button>}
+                </div>
+              </div>
+              <button onClick={()=>setConfirmDelete(selected.id)} style={{...btn0,padding:4,background:"transparent",border:"none",color:t.textDim,flexShrink:0}}><Ic.Trash2 size={14}/></button>
+            </div>
+            {confirmDelete===selected.id&&(
+              <div style={{padding:"8px 10px",background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.25)",borderRadius:6,display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+                <span style={{fontSize:13,color:"#ef4444",flex:1}}>Delete this contact?</span>
+                <button onClick={()=>deleteContact(selected.id)} style={{...btn0,fontSize:12,fontWeight:700,padding:"3px 10px",borderRadius:5,background:"#ef4444",color:"#fff",border:"none"}}>Delete</button>
+                <button onClick={()=>setConfirmDelete(null)} style={{...btn0,fontSize:12,padding:"3px 8px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
+              </div>
+            )}
+            {/* Last contact date */}
+            <div style={{display:"flex",alignItems:"center",gap:8,marginTop:4}}>
+              <span style={{fontSize:12,color:t.textDim}}>Last contact:</span>
+              <input type="date" value={selected.lastContactDate||""} onChange={e=>updateContact(selected.id,{lastContactDate:e.target.value})} style={{background:t.input,border:"1px solid "+t.inputBorder,borderRadius:5,color:t.text,fontSize:12,padding:"2px 6px",fontFamily:"inherit"}}/>
+            </div>
+          </div>
+
+          {/* Notes */}
+          <div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 14px"}}>
+            <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:6}}>NOTES</div>
+            {editingContact===selected.id
+              ? <><textarea value={editNote} onChange={e=>setEditNote(e.target.value)} rows={3} style={{width:"100%",padding:"8px 10px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:6,color:t.text,fontSize:13,fontFamily:"inherit",resize:"vertical",boxSizing:"border-box",marginBottom:6}}/>
+                  <div style={{display:"flex",gap:6}}>
+                    <button onClick={()=>{updateContact(selected.id,{notes:editNote});setEditingContact(null);}} style={{...btn0,fontSize:12,fontWeight:700,padding:"4px 12px",borderRadius:5,background:contactColor+"20",border:"1px solid "+contactColor+"40",color:contactColor}}>Save</button>
+                    <button onClick={()=>setEditingContact(null)} style={{...btn0,fontSize:12,padding:"4px 10px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
+                  </div></>
+              : <div onClick={()=>{setEditingContact(selected.id);setEditNote(selected.notes||"");}} style={{fontSize:13,color:selected.notes?t.textMuted:t.textDim,lineHeight:1.6,cursor:"pointer",padding:"6px 8px",borderRadius:5,border:"1px dashed "+t.border,minHeight:32}}>{selected.notes||"Click to add notes…"}</div>
+            }
+          </div>
+
+          {/* Linked opportunities */}
+          {linkedOpps.length>0&&(
+            <div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 14px"}}>
+              <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:8}}>LINKED OPPORTUNITIES</div>
+              <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                {linkedOpps.map((opp,i)=>{
+                  const mc={board:"#6ee7b7",venture:"#818cf8",hustle:"#fb923c",deal:"#f6c90e",exec:"#c084fc"}[opp.source]||t.accent;
+                  return <div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 8px",background:t.input,borderRadius:6,border:"1px solid "+t.border}}>
+                    <span style={{fontSize:11,fontWeight:700,padding:"1px 6px",borderRadius:3,background:mc+"20",color:mc}}>{opp.source?.toUpperCase()||"OPP"}</span>
+                    <span style={{fontSize:13,color:t.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{opp.name}</span>
+                    <span style={{fontSize:11,color:t.textDim}}>{opp.status||""}</span>
+                  </div>;
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Activity history */}
+          <div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 14px"}}>
+            <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:8}}>ACTIVITY HISTORY {contactActivity.length>0&&<span style={{fontWeight:400,color:t.textDim}}>({contactActivity.length} entries)</span>}</div>
+            {contactActivity.length===0
+              ? <div style={{fontSize:13,color:t.textDim,fontStyle:"italic"}}>No activity logged for opportunities linked to {selected.company||selected.name}.</div>
+              : <div style={{display:"flex",flexDirection:"column",gap:1}}>
+                  {contactActivity.map((e,i)=>{
+                    const aType=ACTIVITY_TYPES.find(a=>a.key===e.actionType)||ACTIVITY_TYPES[5];
+                    const outcomeColor=e.outcome==="positive"?"#10b981":e.outcome==="negative"?"#ef4444":"#6b7280";
+                    const d=new Date(e.loggedAt);
+                    return <div key={e.id} style={{display:"flex",gap:8,alignItems:"flex-start",padding:"6px 0",borderBottom:i<contactActivity.length-1?"1px solid "+t.border+"50":"none"}}>
+                      <div style={{width:22,height:22,borderRadius:"50%",background:aType.color+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,flexShrink:0,marginTop:1}}>{aType.icon}</div>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{display:"flex",alignItems:"center",gap:5,flexWrap:"wrap"}}>
+                          <span style={{fontSize:12,fontWeight:700,color:aType.color}}>{aType.label}</span>
+                          <span style={{fontSize:10,fontWeight:700,padding:"1px 5px",borderRadius:3,background:outcomeColor+"18",color:outcomeColor,textTransform:"capitalize"}}>{e.outcome}</span>
+                          <span style={{fontSize:11,color:t.textDim,marginLeft:"auto"}}>{d.toLocaleDateString("en-GB",{day:"numeric",month:"short"})}</span>
+                        </div>
+                        {e.note&&<div style={{fontSize:12,color:t.textMuted,marginTop:2,lineHeight:1.5}}>{e.note}</div>}
+                        <div style={{fontSize:11,color:t.textDim,marginTop:1}}>{e.pipelineCardName}</div>
+                      </div>
+                    </div>;
+                  })}
+                </div>
+            }
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -3703,7 +4441,7 @@ const SettingsModule = ({t,profile,setProfile,apiKey,setApiKey,provider,setProvi
       // Also update local hash store so login still works
       const email = window.TorqueFirebase.getUserEmail();
       if(email){
-        const newHash = await hashPassword(pwNew); // now uses PBKDF2 with salt
+        const newHash = await hashPassword(pwNew);
         const users = storage.gget("oos-users")||{};
         if(users[email.toLowerCase()]){
           users[email.toLowerCase()].hash = newHash;
@@ -4015,530 +4753,15 @@ Return ONLY JSON, no markdown, no backticks.`;
   );
 };
 
-// ─── MODULE: CONTROL TOWER ────────────────────────────────────────────────────
-const ControlTowerModule = ({t, isMobile, saved, activityLog, contacts, calendarEvents, setActiveModule}) => {
-  const TC = {board:"#6ee7b7", exec:"#c084fc", hustle:"#fb923c", venture:"#818cf8", deal:"#f6c90e"};
-  const [selectedOpp, setSelectedOpp] = useState(null);
-
-  const now = new Date();
-  const DAY = 24*60*60*1000;
-
-  // Derived KPIs — all computed live from real data
-  const activeOpps = saved.filter(s => {
-    const entries = (activityLog||[]).filter(e => e.pipelineCardId === (s.id||s.name));
-    if (!entries.length) return false;
-    const latest = new Date(Math.max(...entries.map(e => new Date(e.loggedAt))));
-    return (now - latest) < 14 * DAY;
-  });
-
-  const dormantOpps = saved.filter(s => {
-    const entries = (activityLog||[]).filter(e => e.pipelineCardId === (s.id||s.name));
-    if (!entries.length) return true;
-    const latest = new Date(Math.max(...entries.map(e => new Date(e.loggedAt))));
-    return (now - latest) >= 14 * DAY;
-  });
-
-  const upcomingEvents = (calendarEvents||[])
-    .filter(e => !e.completed && new Date(e.datetime) >= now)
-    .sort((a,b) => new Date(a.datetime) - new Date(b.datetime))
-    .slice(0, 10);
-
-  const overdueEvents = (calendarEvents||[])
-    .filter(e => !e.completed && new Date(e.datetime) < now)
-    .sort((a,b) => new Date(b.datetime) - new Date(a.datetime))
-    .slice(0, 5);
-
-  const actionsThisWeek = (calendarEvents||[]).filter(e => {
-    const d = new Date(e.datetime);
-    return d >= now && d <= new Date(now.getTime() + 7*DAY);
-  });
-
-  const hotCount = saved.filter(s => s.status === "HOT" || s.status === "PURSUE" || s.status === "BUILD").length;
-
-  // Pipeline stages derived from kanbanStage or status
-  const getStage = (s) => {
-    const ks = (s.kanbanStage||"").toLowerCase();
-    const st = (s.status||"").toLowerCase();
-    if (ks === "decision" || st === "decision") return "decision";
-    if (ks === "talking" || ks === "in conversation" || st === "active") return "talking";
-    if (ks === "outreach" || ks === "outreach sent") return "outreach";
-    if (ks === "researching" || ks === "research" || st === "researching") return "research";
-    return "saved";
-  };
-
-  const STAGES = [
-    {key:"saved", label:"Saved", sub:"identified"},
-    {key:"research", label:"Researching", sub:"NI / docs"},
-    {key:"outreach", label:"Outreach", sub:"in contact"},
-    {key:"talking", label:"Talking", sub:"active conv."},
-    {key:"decision", label:"Decision", sub:"close stage"},
-  ];
-
-  // Sectors summary
-  const sectors = {};
-  saved.forEach(s => { sectors[s.sector||"Other"] = (sectors[s.sector||"Other"]||0)+1; });
-  const topSectors = Object.entries(sectors).sort((a,b)=>b[1]-a[1]).slice(0,4);
-
-  // Activity this week
-  const weekAgo = new Date(now.getTime() - 7*DAY);
-  const recentActivity = (activityLog||[]).filter(e => new Date(e.loggedAt) >= weekAgo);
-  const actByType = {};
-  recentActivity.forEach(e => { actByType[e.actionType] = (actByType[e.actionType]||0)+1; });
-
-  const typeColor = {board:"#6ee7b7",exec:"#c084fc",hustle:"#fb923c",venture:"#818cf8",deal:"#f6c90e"};
-  const getOppColor = (s) => {
-    const hasRecent = activeOpps.some(a => a.id === s.id || a.name === s.name);
-    return hasRecent ? (typeColor[s.source]||"#818cf8") : "#9ca3af";
-  };
-
-  const calColor = {call:"#0891b2","follow-up":"#7c3aed",meeting:"#ea580c",deadline:"#dc2626",research:"#16a34a",outreach:"#4f46e5",custom:"#a78bfa"};
-
-  const s = {
-    card: {background:t.card, border:"1px solid "+t.border, borderRadius:10, padding:"12px 14px"},
-    label: {fontSize:10, fontWeight:700, letterSpacing:"0.07em", color:t.textDim, marginBottom:8},
-    spokeItem: {fontSize:11, color:t.textMuted, padding:"3px 0", borderBottom:"1px solid "+t.border+"60", display:"flex", justifyContent:"space-between", alignItems:"center"},
-  };
-
-  return (
-    <div style={{display:"flex",flexDirection:"column",gap:12}}>
-
-      {/* Top stat pills */}
-      <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
-        <span style={{fontSize:13,color:t.textMuted}}>{saved.length} opportunities</span>
-        <span style={{color:t.textDim}}>·</span>
-        {Object.entries({board:"#6ee7b7",exec:"#c084fc",hustle:"#fb923c",venture:"#818cf8",deal:"#f6c90e"}).map(([src,col])=>{
-          const cnt = saved.filter(s=>s.source===src).length;
-          if(!cnt) return null;
-          return <span key={src} style={{fontSize:11,fontWeight:700,padding:"2px 9px",borderRadius:20,border:"1px solid "+col+"40",color:col,background:col+"12"}}>{cnt} {src}</span>;
-        })}
-        {dormantOpps.length>0&&<span style={{fontSize:11,fontWeight:700,padding:"2px 9px",borderRadius:20,border:"1px solid #ef444440",color:"#ef4444",background:"#ef444412"}}>{dormantOpps.length} dormant</span>}
-      </div>
-
-      {/* Selected opp detail */}
-      {selectedOpp&&(()=>{
-        const color = typeColor[selectedOpp.source]||"#818cf8";
-        const oppActivity = (activityLog||[]).filter(e=>e.pipelineCardId===(selectedOpp.id||selectedOpp.name)).sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt));
-        const lastAct = oppActivity[0];
-        return (
-          <div style={{...s.card, border:"1px solid "+color+"40", background:t.card}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-              <div style={{display:"flex",alignItems:"center",gap:8}}>
-                <span style={{fontSize:14,fontWeight:700,color:t.text}}>{selectedOpp.name}</span>
-                <span style={{fontSize:10,padding:"2px 7px",borderRadius:3,background:color+"18",color}}>{(selectedOpp.source||"opp").toUpperCase()}</span>
-                <span style={{fontSize:10,padding:"2px 7px",borderRadius:3,background:activeOpps.some(a=>a.id===selectedOpp.id||a.name===selectedOpp.name)?"#16a34a18":"#9ca3af18",color:activeOpps.some(a=>a.id===selectedOpp.id||a.name===selectedOpp.name)?"#16a34a":"#9ca3af"}}>
-                  {activeOpps.some(a=>a.id===selectedOpp.id||a.name===selectedOpp.name)?"Active":"Dormant"}
-                </span>
-              </div>
-              <button onClick={()=>setSelectedOpp(null)} style={{...btn0,background:"none",color:t.textDim,fontSize:16,padding:0}}>×</button>
-            </div>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:10}}>
-              {[
-                {label:"Region",val:selectedOpp.region||"—"},
-                {label:"Sector",val:selectedOpp.sector||"—"},
-                {label:"Status",val:selectedOpp.status||"—"},
-                {label:"Activity entries",val:oppActivity.length},
-                {label:"Last logged",val:lastAct?new Date(lastAct.loggedAt).toLocaleDateString("en-GB",{day:"numeric",month:"short"}):"Never"},
-                {label:"Notes",val:selectedOpp.notes?"Yes":"None"},
-              ].map((stat,i)=>(
-                <div key={i} style={{background:t.input,borderRadius:6,padding:"6px 9px"}}>
-                  <div style={{fontSize:10,color:t.textDim,marginBottom:1}}>{stat.label}</div>
-                  <div style={{fontSize:12,fontWeight:600,color:t.text}}>{stat.val}</div>
-                </div>
-              ))}
-            </div>
-            <div style={{display:"flex",gap:6}}>
-              <button onClick={()=>setSelectedOpp(null)} style={{...btn0,fontSize:11,padding:"4px 10px",borderRadius:5,border:"1px solid "+t.border,color:t.textMuted,background:"transparent"}}>Close</button>
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* Hub + spokes */}
-      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 180px 1fr",gap:12,alignItems:"start"}}>
-
-        {/* Left spokes */}
-        <div style={{display:"flex",flexDirection:"column",gap:10}}>
-          <div style={s.card}>
-            <div style={{...s.label,color:"#c084fc"}}>PIPELINE HEALTH</div>
-            {[
-              {label:"HOT / PURSUE",val:hotCount,col:"#dc2626"},
-              {label:"In outreach / talking",val:saved.filter(s=>["outreach","talking","decision"].includes(getStage(s))).length,col:"#16a34a"},
-              {label:"Active (<14d)",val:activeOpps.length,col:"#16a34a"},
-              {label:"Dormant (>14d)",val:dormantOpps.length,col:"#9ca3af"},
-            ].map((item,i)=>(
-              <div key={i} style={s.spokeItem}>
-                <span>{item.label}</span>
-                <span style={{fontWeight:600,color:item.col}}>{item.val}</span>
-              </div>
-            ))}
-          </div>
-          <div style={s.card}>
-            <div style={{...s.label,color:"#16a34a"}}>ACTIVITY THIS WEEK</div>
-            {recentActivity.length===0
-              ? <div style={{fontSize:12,color:t.textDim,fontStyle:"italic"}}>No activity logged this week</div>
-              : [
-                  {label:"Total logged",val:recentActivity.length,col:"#16a34a"},
-                  ...Object.entries(actByType).map(([type,cnt])=>({label:type.charAt(0).toUpperCase()+type.slice(1),val:cnt,col:calColor[type]||"#818cf8"}))
-                ].map((item,i)=>(
-                  <div key={i} style={s.spokeItem}>
-                    <span>{item.label}</span>
-                    <span style={{fontWeight:600,color:item.col}}>{item.val}</span>
-                  </div>
-                ))
-            }
-          </div>
-        </div>
-
-        {/* Hub centre */}
-        <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
-          <div style={{width:130,height:130,borderRadius:"50%",border:"1.5px solid "+t.border,background:t.card,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:2,flexShrink:0}}>
-            <div style={{fontSize:24,marginBottom:2}}>⚡</div>
-            <div style={{fontSize:11,fontWeight:700,color:t.text}}>TorqueOS</div>
-            <div style={{fontSize:10,color:t.textDim}}>control tower</div>
-          </div>
-          <div style={{width:2,height:12,background:t.border,margin:"0 auto"}}/>
-          <div style={{width:"100%",background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
-            <div style={{fontSize:22,fontWeight:700,color:"#16a34a"}}>{activeOpps.length}</div>
-            <div style={{fontSize:10,color:t.textDim,marginTop:1}}>active opportunities</div>
-            <div style={{fontSize:10,color:"#16a34a",marginTop:2}}>activity logged &lt;14 days</div>
-          </div>
-          <div style={{width:"100%",background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
-            <div style={{fontSize:22,fontWeight:700,color:"#0891b2"}}>{actionsThisWeek.length + overdueEvents.length}</div>
-            <div style={{fontSize:10,color:t.textDim,marginTop:1}}>actions this week</div>
-            <div style={{fontSize:10,marginTop:2,color:overdueEvents.length>0?"#dc2626":"#16a34a"}}>
-              {overdueEvents.length>0?overdueEvents.length+" overdue · ":""}{actionsThisWeek.length} upcoming
-            </div>
-          </div>
-        </div>
-
-        {/* Right spokes */}
-        <div style={{display:"flex",flexDirection:"column",gap:10}}>
-          <div style={s.card}>
-            <div style={{...s.label,color:"#fb923c"}}>CONTACTS CRM</div>
-            {[
-              {label:"Saved contacts",val:(contacts||[]).length,col:"#fb923c"},
-              {label:"Hot warmth",val:(contacts||[]).filter(c=>c.warmth==="hot").length,col:"#dc2626"},
-              {label:"Warm",val:(contacts||[]).filter(c=>c.warmth==="warm").length,col:"#f59e0b"},
-              {label:"Opps with contacts",val:saved.filter(s=>(contacts||[]).some(c=>c.company&&s.name&&s.name.toLowerCase().includes(c.company.toLowerCase()))).length,col:"#16a34a"},
-            ].map((item,i)=>(
-              <div key={i} style={s.spokeItem}>
-                <span>{item.label}</span>
-                <span style={{fontWeight:600,color:item.col}}>{item.val}</span>
-              </div>
-            ))}
-          </div>
-          <div style={s.card}>
-            <div style={{...s.label,color:"#be185d"}}>TOP SECTORS</div>
-            {topSectors.length===0
-              ? <div style={{fontSize:12,color:t.textDim,fontStyle:"italic"}}>No pipeline data yet</div>
-              : topSectors.map(([sector,count],i)=>(
-                  <div key={i} style={s.spokeItem}>
-                    <span>{sector}</span>
-                    <span style={{fontWeight:600,color:"#be185d"}}>{count} {count===1?"opp":"opps"}</span>
-                  </div>
-                ))
-            }
-          </div>
-        </div>
-      </div>
-
-      {/* Timeline */}
-      <div style={s.card}>
-        <div style={s.label}>UPCOMING ACTIONS <span style={{fontWeight:400,letterSpacing:0,color:t.textDim}}>— next 14 days</span></div>
-        {overdueEvents.length>0&&<div style={{display:"flex",gap:6,marginBottom:8,flexWrap:"wrap"}}>
-          {overdueEvents.map((ev,i)=>(
-            <div key={i} style={{flexShrink:0,minWidth:110,padding:"6px 9px",borderRadius:7,border:"1px solid #ef444430",background:"#ef444410"}}>
-              <div style={{fontSize:10,color:"#dc2626",marginBottom:2}}>overdue</div>
-              <div style={{fontSize:11,fontWeight:600,color:t.text,lineHeight:1.3}}>{ev.cardName}</div>
-              <span style={{fontSize:10,padding:"1px 5px",borderRadius:3,background:calColor[ev.actionType]+"18"||"#81cf820",color:calColor[ev.actionType]||"#16a34a"}}>{ev.actionType}</span>
-            </div>
-          ))}
-        </div>}
-        {upcomingEvents.length===0&&overdueEvents.length===0
-          ? <div style={{fontSize:12,color:t.textDim,fontStyle:"italic"}}>No upcoming events scheduled. Add actions via the Calendar.</div>
-          : <div style={{display:"flex",gap:8,overflowX:"auto",paddingBottom:4}}>
-              {upcomingEvents.map((ev,i)=>{
-                const evDate = new Date(ev.datetime);
-                const daysAway = Math.ceil((evDate-now)/DAY);
-                const col = calColor[ev.actionType]||"#818cf8";
-                return (
-                  <div key={i} style={{flexShrink:0,minWidth:118,display:"flex",flexDirection:"column",gap:3}}>
-                    <div style={{fontSize:10,color:t.textDim}}>
-                      {evDate.toLocaleDateString("en-GB",{day:"numeric",month:"short"})}
-                      {daysAway<=2&&<span style={{marginLeft:4,fontSize:9,padding:"1px 5px",borderRadius:3,background:"#dc262618",color:"#dc2626"}}>soon</span>}
-                    </div>
-                    <div style={{fontSize:11,fontWeight:600,color:t.text,lineHeight:1.3}}>{ev.cardName}</div>
-                    <span style={{fontSize:10,padding:"1px 6px",borderRadius:3,background:col+"18",color:col,display:"inline-block",width:"fit-content"}}>{ev.actionType}</span>
-                  </div>
-                );
-              })}
-            </div>
-        }
-      </div>
-
-      {/* Legend */}
-      <div style={{display:"flex",flexWrap:"wrap",gap:12}}>
-        {[["#6ee7b7","Board / NED"],["#c084fc","Executive"],["#fb923c","Side hustle"],["#818cf8","Venture"],["#f6c90e","Deal"],["#16a34a","Active (<14d)"],["#9ca3af","Dormant (>14d)"]].map(([col,lbl])=>(
-          <span key={lbl} style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:t.textDim}}>
-            <span style={{width:8,height:8,borderRadius:"50%",background:col,display:"inline-block",flexShrink:0}}/>
-            {lbl}
-          </span>
-        ))}
-      </div>
-
-    </div>
-  );
-};
-// ─── MODULE: DOCUMENT VAULT ───────────────────────────────────────────────────
-const DocumentVaultModule = ({t, isMobile, vault, setVault, onRegenerate}) => {
-  const [selectedId, setSelectedId] = useState(null);
-  const [search, setSearch] = useState("");
-  const [confirmDelete, setConfirmDelete] = useState(null);
-  const vaultColor = "#38bdf8";
-
-  const filtered = (vault||[]).filter(d =>
-    !search.trim() ||
-    (d.title||"").toLowerCase().includes(search.toLowerCase()) ||
-    (d.type||"").toLowerCase().includes(search.toLowerCase()) ||
-    (d.sourceOpportunity||"").toLowerCase().includes(search.toLowerCase())
-  );
-
-  const selected = filtered.find(d => d.id === selectedId) || filtered[0] || null;
-
-  const deleteDoc = (id) => {
-    const next = vault.filter(d => d.id !== id);
-    setVault(next);
-    storage.set("oos-vault", next);
-    if (selectedId === id) setSelectedId(null);
-    setConfirmDelete(null);
-  };
-
-  const copyDoc = (content) => { navigator.clipboard.writeText(content||"").catch(()=>{}); };
-
-  const printDoc = (doc) => {
-    if (doc.contentType === "network-intel") {
-      try {
-        const a = JSON.parse(doc.content||"{}");
-        const wc=w=>w==="hot"?"#ef4444":w==="warm"?"#f59e0b":"#3b82f6";
-        const contacts=(a.keyContacts||[]).map(c=>`<div style="border:1px solid #e5e7eb;border-left:4px solid ${wc(c.warmthLevel)};border-radius:8px;padding:12px 14px;margin-bottom:10px;"><strong>${c.name}</strong> — ${c.role}<br><strong style="color:#4f46e5">Path:</strong> ${c.connectionPath}</div>`).join("");
-        const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${doc.title}</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;padding:40px;color:#111;line-height:1.7;}</style></head><body><h1>Network Intelligence</h1><p>${doc.niTarget||""} · ${new Date(doc.savedAt).toLocaleDateString("en-GB")}</p>${a.targetSummary?`<p>${a.targetSummary}</p>`:""}<h2>Key Contacts</h2>${contacts}</body></html>`;
-        const w=window.open("","_blank"); w.document.write(typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html,{WHOLE_DOCUMENT:true,ADD_TAGS:["style","meta","link"],ADD_ATTR:["target"]}):html); w.document.close(); w.focus(); setTimeout(()=>w.print(),400);
-      } catch(e) {}
-      return;
-    }
-    const lines = (doc.content||"").split("\n");
-    const htmlLines = lines.map(line => {
-      const tr = line.trim();
-      if (!tr) return "<br>";
-      if (/^[A-Z][A-Z\s\-&\/]{3,}$/.test(tr) && !tr.includes(".") && tr.length < 60) return `<h2>${tr}</h2>`;
-      if (/^[-]\s+(.*)/.test(tr)) return `<p style="padding-left:14px">- ${tr.replace(/^[-]\s+/,"")}</p>`;
-      return `<p>${tr}</p>`;
-    }).join("\n");
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${doc.title}</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;padding:40px;color:#111;line-height:1.7;font-size:15px;}h2{font-size:13px;font-weight:700;letter-spacing:0.06em;color:#6b7280;margin:24px 0 8px;text-transform:uppercase;border-bottom:1px solid #e5e7eb;padding-bottom:5px;}p{margin:0 0 8px;color:#374151;}</style></head><body><h1>${doc.title}</h1><p style="color:#6b7280">${doc.sourceOpportunity||""} · ${new Date(doc.savedAt).toLocaleDateString("en-GB")}</p>${htmlLines}<p style="font-size:11px;color:#9ca3af;margin-top:32px;text-align:center">Saved in TorqueOS Document Vault</p></body></html>`;
-    const w = window.open("","_blank");
-    w.document.write(typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html,{WHOLE_DOCUMENT:true,ADD_TAGS:["style","meta","link"],ADD_ATTR:["target"]}):html);
-    w.document.close(); w.focus(); setTimeout(()=>w.print(), 400);
-  };
-
-  if (!vault || vault.length === 0) return (
-    <div style={{textAlign:"center",padding:"60px 24px",color:t.textDim}}>
-      <div style={{fontSize:48,marginBottom:14}}>📄</div>
-      <div style={{fontSize:16,fontWeight:700,color:t.text,marginBottom:8}}>Your Vault is empty</div>
-      <div style={{fontSize:14,color:t.textMuted,maxWidth:360,margin:"0 auto",lineHeight:1.6}}>Generate documents from any opportunity card using the Docs button, then save them here. All generated content — board applications, outreach sequences, bios, briefings — lands in one place.</div>
-    </div>
-  );
-
-  return (
-    <div style={{display:"flex",flexDirection:isMobile?"column":"row",gap:8,flex:1,overflow:"hidden"}}>
-      <div style={{width:isMobile?"100%":260,flexShrink:0,display:"flex",flexDirection:"column",gap:6,overflowY:"auto",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
-        <div style={{position:"relative"}}>
-          <Ic.Search size={13} style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:t.textDim,pointerEvents:"none"}}/>
-          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search vault..." style={{width:"100%",padding:"8px 10px 8px 30px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:7,color:t.text,fontSize:14,fontFamily:"inherit",boxSizing:"border-box"}}/>
-        </div>
-        <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,padding:"2px 2px"}}>{filtered.length} DOCUMENT{filtered.length!==1?"S":""}</div>
-        {filtered.map(doc => (
-          <div key={doc.id} onClick={()=>setSelectedId(doc.id)} style={{background:t.card,border:"1px solid "+(selectedId===doc.id||(!selectedId&&doc===filtered[0])?vaultColor+"50":t.border),borderLeft:"3px solid "+(selectedId===doc.id||(!selectedId&&doc===filtered[0])?vaultColor:t.border),borderRadius:8,padding:"10px 12px",cursor:"pointer",transition:"all 0.15s"}}>
-            <div style={{fontSize:13,fontWeight:700,color:t.text,marginBottom:3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{doc.title}</div>
-            <div style={{display:"flex",alignItems:"center",gap:5,flexWrap:"wrap"}}>
-              {doc.type&&<span style={{fontSize:11,fontWeight:600,padding:"1px 6px",borderRadius:3,background:vaultColor+"15",color:vaultColor}}>{doc.type}</span>}
-              {doc.sourceOpportunity&&<span style={{fontSize:11,color:t.textMuted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:110}}>{doc.sourceOpportunity}</span>}
-            </div>
-            <div style={{fontSize:11,color:t.textDim,marginTop:4}}>{new Date(doc.savedAt).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</div>
-          </div>
-        ))}
-      </div>
-      {selected && (
-        <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",overflow:"hidden",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
-          <div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 16px",marginBottom:8,flexShrink:0}}>
-            <div style={{fontSize:16,fontWeight:700,color:t.text,marginBottom:4}}>{selected.title}</div>
-            <div style={{fontSize:12,color:t.textMuted,marginBottom:8}}>{selected.type&&<span style={{marginRight:8,padding:"1px 6px",borderRadius:3,background:vaultColor+"15",color:vaultColor,fontWeight:600}}>{selected.type}</span>}{selected.sourceOpportunity} · {new Date(selected.savedAt).toLocaleDateString("en-GB")}</div>
-            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-              <button onClick={()=>copyDoc(selected.content)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}><Ic.Copy size={11}/> Copy</button>
-              <button onClick={()=>printDoc(selected)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:t.indigoDim,border:"1px solid "+t.indigo+"40",color:t.indigo}}><Ic.Printer size={11}/> Print</button>
-              {onRegenerate&&selected.sourceItem&&<button onClick={()=>onRegenerate(selected.sourceItem)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:t.goldDim,border:"1px solid "+t.gold+"40",color:t.gold}}><Ic.RefreshCw size={11}/> Regenerate</button>}
-              <button onClick={()=>setConfirmDelete(selected.id)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:5,fontSize:12,fontWeight:600,padding:"5px 10px",borderRadius:6,background:"transparent",border:"1px solid rgba(239,68,68,0.25)",color:"#ef4444",marginLeft:"auto"}}><Ic.Trash2 size={11}/> Delete</button>
-            </div>
-            {confirmDelete===selected.id&&<div style={{marginTop:10,padding:"8px 12px",background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.25)",borderRadius:6,display:"flex",alignItems:"center",gap:10}}>
-              <span style={{fontSize:13,color:"#ef4444",flex:1}}>Delete this document?</span>
-              <button onClick={()=>deleteDoc(selected.id)} style={{...btn0,fontSize:12,fontWeight:700,padding:"4px 10px",borderRadius:5,background:"#ef4444",color:"#fff",border:"none"}}>Delete</button>
-              <button onClick={()=>setConfirmDelete(null)} style={{...btn0,fontSize:12,padding:"4px 10px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
-            </div>}
-          </div>
-          <div style={{flex:1,overflowY:"auto",minHeight:0,background:t.input,border:"1px solid "+t.border,borderRadius:8,padding:"20px 24px",fontSize:14,color:t.text,lineHeight:1.8}}>
-            {selected.contentType==="network-intel" ? (()=>{
-              let a={}; try { a=JSON.parse(selected.content||"{}"); } catch(e){}
-              const warmColor=w=>w==="hot"?"#ef4444":w==="warm"?"#f59e0b":"#3b82f6";
-              return <>
-                {a.targetSummary&&<div style={{padding:"10px 12px",background:t.card,border:"1px solid "+t.border,borderRadius:7,fontSize:14,color:t.textMuted,lineHeight:1.65,marginBottom:14}}>{a.targetSummary}</div>}
-                {(a.keyContacts||[]).map((c,i)=>(
-                  <div key={i} style={{background:t.card,border:"1px solid "+t.border,borderLeft:"3px solid "+warmColor(c.warmthLevel),borderRadius:7,padding:"10px 12px",marginBottom:8}}>
-                    <div style={{fontSize:14,fontWeight:700,color:t.text}}>{c.name} <span style={{fontSize:11,fontWeight:700,padding:"2px 7px",borderRadius:3,background:warmColor(c.warmthLevel)+"20",color:warmColor(c.warmthLevel),textTransform:"uppercase",marginLeft:6}}>{c.warmthLevel}</span></div>
-                    <div style={{fontSize:12,color:t.textMuted,marginTop:2}}>{c.role}</div>
-                    <div style={{fontSize:13,color:t.textMuted,lineHeight:1.6,marginTop:4}}><strong style={{color:t.indigo}}>Path: </strong>{c.connectionPath}</div>
-                  </div>
-                ))}
-                {a.recommendedApproach&&<div style={{padding:"9px 12px",background:t.accentDim,border:"1px solid "+t.accent+"25",borderRadius:6,fontSize:13,color:t.textMuted,lineHeight:1.65,marginTop:10}}><strong style={{color:t.accent}}>Approach: </strong>{a.recommendedApproach}</div>}
-              </>;
-            })() : (selected.content||"").split("\n").map((line,i)=>{
-              const tr = line.trim();
-              if (!tr) return <div key={i} style={{height:10}}/>;
-              if (/^[A-Z][A-Z\s\-&\/]{3,}$/.test(tr) && !tr.includes(".") && tr.length < 60) return <div key={i} style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",color:t.textDim,marginTop:18,marginBottom:5,paddingBottom:4,borderBottom:"1px solid "+t.border}}>{tr}</div>;
-              return <div key={i} style={{color:t.text,marginBottom:2}}>{line}</div>;
-            })}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-// ─── MODULE: CONTACTS CRM ────────────────────────────────────────────────────
-const ContactsModule = ({t, isMobile, contacts, setContacts, activityLog, saved, onNavigateToNetwork}) => {
-  const [selectedId, setSelectedId] = useState(null);
-  const [search, setSearch] = useState("");
-  const [warmthFilter, setWarmthFilter] = useState("ALL");
-  const [editingContact, setEditingContact] = useState(null);
-  const [editNote, setEditNote] = useState("");
-  const [confirmDelete, setConfirmDelete] = useState(null);
-  const contactColor = "#2dd4bf";
-  const warmthColor = w => w==="hot"?"#ef4444":w==="warm"?"#f59e0b":"#3b82f6";
-  const warmthOrder = {hot:0, warm:1, cold:2};
-
-  const filtered = (contacts||[])
-    .filter(c => warmthFilter==="ALL" || c.warmth===warmthFilter)
-    .filter(c => !search.trim() || (c.name||"").toLowerCase().includes(search.toLowerCase()) || (c.company||"").toLowerCase().includes(search.toLowerCase()) || (c.role||"").toLowerCase().includes(search.toLowerCase()))
-    .sort((a,b) => (warmthOrder[a.warmth]||2)-(warmthOrder[b.warmth]||2) || (a.name||"").localeCompare(b.name||""));
-
-  const selected = filtered.find(c=>c.id===selectedId) || filtered[0] || null;
-  const updateContact = (id, patch) => setContacts(prev => prev.map(c => c.id===id ? {...c,...patch} : c));
-  const deleteContact = (id) => { setContacts(prev => prev.filter(c=>c.id!==id)); setSelectedId(null); setConfirmDelete(null); };
-
-  const contactActivity = selected ? (activityLog||[]).filter(e => e.pipelineCardName && selected.company && e.pipelineCardName.toLowerCase().includes(selected.company.toLowerCase())).sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt)).slice(0,10) : [];
-  const linkedOpps = selected ? (saved||[]).filter(s => (selected.linkedOpportunities||[]).includes(s.name) || (selected.company && (s.name||"").toLowerCase().includes(selected.company.toLowerCase()))) : [];
-
-  if (!contacts || contacts.length === 0) return (
-    <div style={{textAlign:"center",padding:"60px 24px",color:t.textDim}}>
-      <div style={{fontSize:48,marginBottom:14}}>👥</div>
-      <div style={{fontSize:16,fontWeight:700,color:t.text,marginBottom:8}}>No contacts yet</div>
-      <div style={{fontSize:14,color:t.textMuted,maxWidth:380,margin:"0 auto",lineHeight:1.6}}>Contacts are saved from Network Intelligence. Run a network analysis on any opportunity, then click "Save contact" on any key contact card.</div>
-    </div>
-  );
-
-  return (
-    <div style={{display:"flex",flexDirection:isMobile?"column":"row",gap:8,flex:1,overflow:"hidden"}}>
-      <div style={{width:isMobile?"100%":260,flexShrink:0,display:"flex",flexDirection:"column",gap:6,overflowY:"auto",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
-        <div style={{position:"relative"}}>
-          <Ic.Search size={13} style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:t.textDim,pointerEvents:"none"}}/>
-          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search contacts..." style={{width:"100%",padding:"8px 10px 8px 30px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:7,color:t.text,fontSize:14,fontFamily:"inherit",boxSizing:"border-box"}}/>
-        </div>
-        <div style={{display:"flex",gap:4}}>
-          {["ALL","hot","warm","cold"].map(w=>(
-            <button key={w} onClick={()=>setWarmthFilter(w)} style={{...btn0,flex:1,padding:"4px 0",borderRadius:5,fontSize:11,fontWeight:700,border:"1px solid "+(warmthFilter===w?(w==="ALL"?contactColor:warmthColor(w))+"60":t.border),background:warmthFilter===w?(w==="ALL"?contactColor:warmthColor(w))+"15":"transparent",color:warmthFilter===w?(w==="ALL"?contactColor:warmthColor(w)):t.textMuted,textTransform:"capitalize"}}>{w==="ALL"?"All":w}</button>
-          ))}
-        </div>
-        {filtered.map(c=>(
-          <div key={c.id} onClick={()=>setSelectedId(c.id)} style={{background:t.card,border:"1px solid "+(c.id===selectedId?contactColor+"50":t.border),borderLeft:"3px solid "+warmthColor(c.warmth),borderRadius:8,padding:"10px 12px",cursor:"pointer"}}>
-            <div style={{display:"flex",alignItems:"center",gap:8}}>
-              <div style={{width:28,height:28,borderRadius:"50%",background:warmthColor(c.warmth)+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:700,color:warmthColor(c.warmth),flexShrink:0}}>{(c.name||"?")[0]}</div>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{fontSize:13,fontWeight:700,color:t.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.name}</div>
-                <div style={{fontSize:11,color:t.textMuted}}>{c.role&&c.company?c.role+" · "+c.company:c.role||c.company||""}</div>
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-      {selected&&(
-        <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",gap:8,overflowY:"auto",maxHeight:isMobile?"none":"calc(100vh - 58px)"}}>
-          <div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"14px 16px"}}>
-            <div style={{display:"flex",alignItems:"flex-start",gap:12,marginBottom:10}}>
-              <div style={{width:44,height:44,borderRadius:"50%",background:warmthColor(selected.warmth)+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,fontWeight:700,color:warmthColor(selected.warmth),flexShrink:0}}>{(selected.name||"?")[0]}</div>
-              <div style={{flex:1}}>
-                <div style={{fontSize:16,fontWeight:700,color:t.text}}>{selected.name}</div>
-                <div style={{fontSize:13,color:t.textMuted}}>{selected.role}{selected.company?" · "+selected.company:""}</div>
-                <div style={{display:"flex",gap:5,marginTop:5}}>
-                  {["hot","warm","cold"].map(w=>(
-                    <button key={w} onClick={()=>updateContact(selected.id,{warmth:w})} style={{...btn0,fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:4,border:"1px solid "+(selected.warmth===w?warmthColor(w)+"60":t.border),background:selected.warmth===w?warmthColor(w)+"18":"transparent",color:selected.warmth===w?warmthColor(w):t.textMuted,textTransform:"capitalize"}}>{w}</button>
-                  ))}
-                  {onNavigateToNetwork&&selected.company&&<button onClick={()=>onNavigateToNetwork(selected.company)} style={{...btn0,display:"inline-flex",alignItems:"center",gap:4,fontSize:11,fontWeight:600,padding:"2px 9px",borderRadius:4,background:t.indigoDim,border:"1px solid "+t.indigo+"30",color:t.indigo,marginLeft:"auto"}}><span>🕸</span> Network Intel</button>}
-                </div>
-              </div>
-              <button onClick={()=>setConfirmDelete(selected.id)} style={{...btn0,padding:4,background:"transparent",border:"none",color:t.textDim}}><Ic.Trash2 size={14}/></button>
-            </div>
-            {confirmDelete===selected.id&&<div style={{padding:"8px 10px",background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.25)",borderRadius:6,display:"flex",alignItems:"center",gap:10}}>
-              <span style={{fontSize:13,color:"#ef4444",flex:1}}>Delete?</span>
-              <button onClick={()=>deleteContact(selected.id)} style={{...btn0,fontSize:12,fontWeight:700,padding:"3px 10px",borderRadius:5,background:"#ef4444",color:"#fff",border:"none"}}>Delete</button>
-              <button onClick={()=>setConfirmDelete(null)} style={{...btn0,fontSize:12,padding:"3px 8px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
-            </div>}
-          </div>
-          <div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 14px"}}>
-            <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:6}}>NOTES</div>
-            {editingContact===selected.id
-              ? <><textarea value={editNote} onChange={e=>setEditNote(e.target.value)} rows={3} style={{width:"100%",padding:"8px 10px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:6,color:t.text,fontSize:13,fontFamily:"inherit",resize:"vertical",boxSizing:"border-box",marginBottom:6}}/>
-                  <div style={{display:"flex",gap:6}}>
-                    <button onClick={()=>{updateContact(selected.id,{notes:editNote});setEditingContact(null);}} style={{...btn0,fontSize:12,fontWeight:700,padding:"4px 12px",borderRadius:5,background:contactColor+"20",border:"1px solid "+contactColor+"40",color:contactColor}}>Save</button>
-                    <button onClick={()=>setEditingContact(null)} style={{...btn0,fontSize:12,padding:"4px 10px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
-                  </div></>
-              : <div onClick={()=>{setEditingContact(selected.id);setEditNote(selected.notes||"");}} style={{fontSize:13,color:selected.notes?t.textMuted:t.textDim,lineHeight:1.6,cursor:"pointer",padding:"6px 8px",borderRadius:5,border:"1px dashed "+t.border,minHeight:32}}>{selected.notes||"Click to add notes..."}</div>
-            }
-          </div>
-          {linkedOpps.length>0&&<div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 14px"}}>
-            <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:8}}>LINKED OPPORTUNITIES</div>
-            {linkedOpps.map((opp,i)=>{
-              const mc={board:"#6ee7b7",venture:"#818cf8",hustle:"#fb923c",deal:"#f6c90e",exec:"#c084fc"}[opp.source]||t.accent;
-              return <div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 8px",background:t.input,borderRadius:6,border:"1px solid "+t.border,marginBottom:4}}>
-                <span style={{fontSize:11,fontWeight:700,padding:"1px 6px",borderRadius:3,background:mc+"20",color:mc}}>{(opp.source||"").toUpperCase()}</span>
-                <span style={{fontSize:13,color:t.text,flex:1}}>{opp.name}</span>
-              </div>;
-            })}
-          </div>}
-          {contactActivity.length>0&&<div style={{background:t.card,border:"1px solid "+t.border,borderRadius:8,padding:"12px 14px"}}>
-            <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:8}}>ACTIVITY ({contactActivity.length})</div>
-            {contactActivity.map((e,i)=>{
-              const aType=ACTIVITY_TYPES.find(a=>a.key===e.actionType)||ACTIVITY_TYPES[5];
-              return <div key={e.id} style={{display:"flex",gap:8,alignItems:"flex-start",padding:"6px 0",borderBottom:i<contactActivity.length-1?"1px solid "+t.border+"50":"none"}}>
-                <span style={{fontSize:12}}>{aType.icon}</span>
-                <div style={{flex:1}}>
-                  <div style={{fontSize:12,fontWeight:700,color:aType.color}}>{aType.label} <span style={{fontSize:11,color:t.textDim,fontWeight:400}}>{new Date(e.loggedAt).toLocaleDateString("en-GB",{day:"numeric",month:"short"})}</span></div>
-                  {e.note&&<div style={{fontSize:12,color:t.textMuted,marginTop:2}}>{e.note}</div>}
-                </div>
-              </div>;
-            })}
-          </div>}
-        </div>
-      )}
-    </div>
-  );
-};
-
 // ─── NETWORK MODULE PAGE ─────────────────────────────────────────────────────
 const NetworkModulePage = ({t,profile,apiKey,provider,isMobile,saved,onOpenChat,
-  niLoading,setNiLoading,niAnalysis,setNiAnalysis,niError,setNiError,niTarget,setNiTarget,niFreeSearch,setNiFreeSearch}) => {
+  niLoading,setNiLoading,niAnalysis,setNiAnalysis,niError,setNiError,niTarget,setNiTarget,niFreeSearch,setNiFreeSearch,onSaveToVault,onSaveContact}) => {
   const freeSearch=niFreeSearch; const setFreeSearch=setNiFreeSearch;
   const activeTarget=niTarget; const setActiveTarget=setNiTarget;
   const analysis=niAnalysis; const setAnalysis=setNiAnalysis;
   const loading=niLoading; const setLoading=setNiLoading;
   const error=niError; const setError=setNiError;
+  const [savedToVault,setSavedToVault]=useState(false);
   const moduleColors={board:"#6ee7b7",venture:"#818cf8",hustle:"#fb923c",deal:"#f6c90e",exec:"#c084fc"};
   const warmColor=w=>w==="hot"?"#ef4444":w==="warm"?"#f59e0b":"#3b82f6";
 
@@ -4587,6 +4810,16 @@ Return 2-4 key contacts relevant to the ${sourceLabel} goal. OUTPUT ONLY JSON.`;
   const launchSearch=()=>{
     if(!freeSearch.trim()) return;
     runAnalysis({name:freeSearch,region:"",sector:"",companyDescription:"",fitReasons:[]});
+  };
+
+  const handlePrint=()=>{
+    if(!analysis||!activeTarget) return;
+    const warmColor2=w=>w==="hot"?"#ef4444":w==="warm"?"#f59e0b":"#3b82f6";
+    const contacts=(analysis.keyContacts||[]).map(c=>`<div style="border:1px solid #e5e7eb;border-left:4px solid ${warmColor2(c.warmthLevel)};border-radius:8px;padding:12px 14px;margin-bottom:10px;"><div style="display:flex;justify-content:space-between;margin-bottom:6px;"><strong style="font-size:14px">${c.name}</strong><span style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;background:${warmColor2(c.warmthLevel)}22;color:${warmColor2(c.warmthLevel)};text-transform:uppercase">${c.warmthLevel}</span></div><div style="font-size:12px;color:#6b7280;margin-bottom:4px;">${c.role}</div><div style="font-size:13px;color:#374151;margin-bottom:4px;"><strong style="color:#4f46e5">Path: </strong>${c.connectionPath}</div><div style="font-size:12px;color:#6b7280;">${c.rationale}</div></div>`).join("");
+    const angles=(analysis.networkAngles||[]).map((a,i)=>`<div style="display:flex;gap:8px;margin-bottom:6px;"><span style="font-weight:700;color:#4f46e5;min-width:16px">${i+1}.</span><span style="font-size:13px;color:#374151">${a}</span></div>`).join("");
+    const icebreakers=(analysis.icebreakers||[]).map(a=>`<div style="padding:7px 10px;background:#f3f4f6;border-radius:5px;font-size:13px;color:#374151;margin-bottom:5px;border-left:2px solid #818cf8">"${a}"</div>`).join("");
+    const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Network Intelligence — ${activeTarget.name}</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;padding:40px;color:#111;line-height:1.7;}h1{font-size:20px;font-weight:800;margin-bottom:4px;}h2{font-size:14px;font-weight:700;color:#6b7280;letter-spacing:0.06em;text-transform:uppercase;margin:20px 0 8px;}p.meta{font-size:13px;color:#6b7280;margin-bottom:24px;}.summary{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px;font-size:14px;color:#374151;margin-bottom:20px;line-height:1.7;}.approach{background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:12px 14px;font-size:13px;color:#166534;margin-bottom:16px;}</style></head><body><h1>🕸 Network Intelligence</h1><p class="meta">Target: <strong>${activeTarget.name}</strong> · ${activeTarget.region||""} · ${new Date().toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}</p>${analysis.targetSummary?`<div class="summary">${analysis.targetSummary}</div>`:""}<h2>Key Contacts</h2>${contacts}${analysis.recommendedApproach?`<h2>Recommended Approach</h2><div class="approach">${analysis.recommendedApproach}</div>`:""}${angles?`<h2>Network Angles</h2>${angles}`:""}${icebreakers?`<h2>Conversation Starters</h2>${icebreakers}`:""}${(analysis.mutualOrgs||[]).filter(Boolean).length>0?`<h2>Shared Organisations</h2><div>${analysis.mutualOrgs.filter(Boolean).map(o=>`<span style="display:inline-block;padding:3px 10px;background:#ede9fe;color:#4f46e5;border-radius:4px;font-size:12px;margin:0 4px 4px 0">${o}</span>`).join("")}</div>`:""}<p style="font-size:11px;color:#9ca3af;margin-top:32px;font-style:italic;">Generated by TorqueOS for ${profile.name||"User"}</p></body></html>`;
+    const w=window.open("","_blank"); w.document.write(html); w.document.close(); w.focus(); setTimeout(()=>w.print(),400);
   };
 
   return (
@@ -4665,6 +4898,25 @@ Return 2-4 key contacts relevant to the ${sourceLabel} goal. OUTPUT ONLY JSON.`;
               <span style={{fontSize:11,fontWeight:700,padding:"1px 6px",borderRadius:3,background:mc+"20",color:mc,marginTop:3,display:"inline-block"}}>{sl} strategy</span>
             </div>
             <button onClick={()=>{setAnalysis(null);setActiveTarget(null);}} style={{...btn0,fontSize:15,color:t.textDim,background:"transparent",padding:"4px 8px",border:"1px solid "+t.border,borderRadius:5}}>Clear</button>
+            <button onClick={handlePrint} style={{...btn0,display:"flex",alignItems:"center",gap:4,fontSize:12,fontWeight:600,padding:"4px 10px",borderRadius:5,background:t.indigoDim,border:"1px solid "+t.indigo+"40",color:t.indigo,flexShrink:0}}>
+              <Ic.Printer size={11}/> Print
+            </button>
+            {onSaveToVault&&<button onClick={()=>{
+              onSaveToVault({
+                title:"Network Intel — "+(activeTarget.name||""),
+                docTypeLabel:"Network Intelligence",
+                content: JSON.stringify(analysis),
+                contentType:"network-intel",
+                sourceOpportunity: activeTarget.name||"",
+                sourceItem: activeTarget,
+                niTarget: activeTarget.name||"",
+                niRegion: activeTarget.region||"",
+              });
+              setSavedToVault(true);
+              setTimeout(()=>setSavedToVault(false),2500);
+            }} style={{...btn0,display:"flex",alignItems:"center",gap:4,fontSize:12,fontWeight:600,padding:"4px 10px",borderRadius:5,background:savedToVault?"#38bdf820":"transparent",border:"1px solid "+(savedToVault?"#38bdf850":t.border),color:savedToVault?"#38bdf8":t.textMuted,flexShrink:0}}>
+              <Ic.Archive size={11}/>{savedToVault?"Saved!":"Vault"}
+            </button>}
           </div>);})()}
 
           {/* Target summary */}
@@ -4683,6 +4935,7 @@ Return 2-4 key contacts relevant to the ${sourceLabel} goal. OUTPUT ONLY JSON.`;
                       <div style={{fontSize:14,fontWeight:500,color:t.textMuted}}>{c.role}</div>
                     </div>
                     <span style={{fontSize:12,fontWeight:700,padding:"2px 7px",borderRadius:4,background:warmColor(c.warmthLevel)+"20",color:warmColor(c.warmthLevel),textTransform:"uppercase",flexShrink:0}}>{c.warmthLevel}</span>
+                    {onSaveContact&&<button onClick={()=>onSaveContact({name:c.name,role:c.role,company:activeTarget.name||"",warmth:c.warmthLevel==="hot"?"hot":c.warmthLevel==="warm"?"warm":"cold",linkedOpportunities:activeTarget.name?[activeTarget.name]:[],source:"network-intel"})} style={{...btn0,display:"inline-flex",alignItems:"center",gap:3,fontSize:11,fontWeight:700,padding:"3px 8px",borderRadius:4,background:"#2dd4bf15",border:"1px solid #2dd4bf40",color:"#2dd4bf",flexShrink:0}}>+ Save</button>}
                   </div>
                   <div style={{fontSize:14,color:t.textMuted,lineHeight:1.65,marginBottom:6}}><strong style={{color:t.indigo,fontWeight:600}}>Path: </strong>{c.connectionPath}</div>
                   <div style={{fontSize:14,color:t.textMuted,lineHeight:1.65}}>{c.rationale}</div>
@@ -4741,6 +4994,79 @@ Return 2-4 key contacts relevant to the ${sourceLabel} goal. OUTPUT ONLY JSON.`;
 
 
 // ─── SCHEDULE EVENT MODAL ────────────────────────────────────────────────────
+// ─── ACTIVITY LOG MODAL ──────────────────────────────────────────────────────
+const ACTIVITY_TYPES = [
+  {key:"email",    label:"Email sent",        icon:"📧", color:"#6ee7b7"},
+  {key:"call",     label:"Call made",         icon:"📞", color:"#34d399"},
+  {key:"meeting",  label:"Meeting held",      icon:"🤝", color:"#818cf8"},
+  {key:"proposal", label:"Proposal submitted",icon:"📋", color:"#f6c90e"},
+  {key:"intro",    label:"Intro requested",   icon:"🔗", color:"#fb923c"},
+  {key:"note",     label:"Note",              icon:"📝", color:"#a78bfa"},
+];
+
+const ActivityLogModal = ({t, item, onSave, onClose}) => {
+  const [actionType, setActionType] = useState("email");
+  const [note, setNote] = useState("");
+  const [outcome, setOutcome] = useState("neutral");
+
+  const save = () => {
+    const entry = {
+      id: "al-"+Date.now(),
+      pipelineCardId: item.id||item.name,
+      pipelineCardName: item.name,
+      actionType,
+      note: note.trim(),
+      outcome,
+      loggedAt: new Date().toISOString(),
+    };
+    onSave(entry);
+    onClose();
+  };
+
+  const selectedType = ACTIVITY_TYPES.find(a=>a.key===actionType)||ACTIVITY_TYPES[0];
+  const outcomeColors = {positive:"#10b981", neutral:"#6b7280", negative:"#ef4444"};
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:16}} onClick={onClose}>
+      <div style={{background:t.surface,border:"1px solid "+t.border,borderRadius:14,padding:22,width:"100%",maxWidth:420,boxShadow:"0 24px 64px rgba(0,0,0,0.5)"}} onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
+          <div>
+            <div style={{fontSize:17,fontWeight:700,color:t.text,marginBottom:3}}>📋 Log Activity</div>
+            <div style={{fontSize:14,color:t.textMuted,fontWeight:500}}>{item.name}</div>
+          </div>
+          <button onClick={onClose} style={{background:"none",border:"none",color:t.textDim,cursor:"pointer",fontSize:20,lineHeight:1,padding:4}}>✕</button>
+        </div>
+
+        <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:8}}>ACTION TYPE</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:16}}>
+          {ACTIVITY_TYPES.map(a=>(
+            <button key={a.key} onClick={()=>setActionType(a.key)} style={{...btn0,display:"flex",alignItems:"center",gap:5,padding:"5px 10px",borderRadius:6,fontSize:13,fontWeight:600,border:"1px solid "+(actionType===a.key?a.color+"60":t.border),background:actionType===a.key?a.color+"18":"transparent",color:actionType===a.key?a.color:t.textMuted}}>
+              <span style={{fontSize:14}}>{a.icon}</span>{a.label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:6}}>OUTCOME</div>
+        <div style={{display:"flex",gap:6,marginBottom:16}}>
+          {["positive","neutral","negative"].map(o=>(
+            <button key={o} onClick={()=>setOutcome(o)} style={{...btn0,flex:1,padding:"6px 0",borderRadius:6,fontSize:13,fontWeight:600,border:"1px solid "+(outcome===o?outcomeColors[o]+"60":t.border),background:outcome===o?outcomeColors[o]+"18":"transparent",color:outcome===o?outcomeColors[o]:t.textMuted,textTransform:"capitalize"}}>{o}</button>
+          ))}
+        </div>
+
+        <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:6}}>NOTE <span style={{fontWeight:400,textTransform:"none",color:t.textDim}}>(optional)</span></div>
+        <textarea value={note} onChange={e=>setNote(e.target.value)} placeholder="What happened? Key points from the conversation…" rows={3} style={{width:"100%",padding:"9px 11px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:7,color:t.text,fontSize:14,fontFamily:"inherit",resize:"vertical",boxSizing:"border-box",marginBottom:16}}/>
+
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={save} style={{...btn0,flex:1,padding:"10px",borderRadius:8,fontSize:15,fontWeight:700,background:"linear-gradient(135deg,"+selectedType.color+","+selectedType.color+"cc)",color:"#07090f",border:"none"}}>
+            Save Entry
+          </button>
+          <button onClick={onClose} style={{...btn0,padding:"10px 16px",borderRadius:8,fontSize:15,fontWeight:600,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const ScheduleEventModal = ({t, item, events, onSave, onClose}) => {
   const ACTION_TYPES = [
     {key:"research",   label:"🔍 Research",      color:"#818cf8"},
@@ -4847,79 +5173,6 @@ const ScheduleEventModal = ({t, item, events, onSave, onClose}) => {
         <button onClick={save} style={{border:"none",width:"100%",padding:"12px",borderRadius:9,fontSize:15,fontWeight:700,color:"#07090f",background:"linear-gradient(135deg,#34d399,#06b6d4)",cursor:"pointer"}}>
           Save to Calendar →
         </button>
-      </div>
-    </div>
-  );
-};
-
-// ─── ACTIVITY LOG MODAL ──────────────────────────────────────────────────────
-const ACTIVITY_TYPES = [
-  {key:"email",    label:"Email sent",        icon:"📧", color:"#6ee7b7"},
-  {key:"call",     label:"Call made",         icon:"📞", color:"#34d399"},
-  {key:"meeting",  label:"Meeting held",      icon:"🤝", color:"#818cf8"},
-  {key:"proposal", label:"Proposal submitted",icon:"📋", color:"#f6c90e"},
-  {key:"intro",    label:"Intro requested",   icon:"🔗", color:"#fb923c"},
-  {key:"note",     label:"Note",              icon:"📝", color:"#a78bfa"},
-];
-
-const ActivityLogModal = ({t, item, onSave, onClose}) => {
-  const [actionType, setActionType] = useState("email");
-  const [note, setNote] = useState("");
-  const [outcome, setOutcome] = useState("neutral");
-
-  const save = () => {
-    const entry = {
-      id: "al-"+Date.now(),
-      pipelineCardId: item.id||item.name,
-      pipelineCardName: item.name,
-      actionType,
-      note: note.trim(),
-      outcome,
-      loggedAt: new Date().toISOString(),
-    };
-    onSave(entry);
-    onClose();
-  };
-
-  const selectedType = ACTIVITY_TYPES.find(a=>a.key===actionType)||ACTIVITY_TYPES[0];
-  const outcomeColors = {positive:"#10b981", neutral:"#6b7280", negative:"#ef4444"};
-
-  return (
-    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:16}} onClick={onClose}>
-      <div style={{background:t.surface,border:"1px solid "+t.border,borderRadius:14,padding:22,width:"100%",maxWidth:420,boxShadow:"0 24px 64px rgba(0,0,0,0.5)"}} onClick={e=>e.stopPropagation()}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
-          <div>
-            <div style={{fontSize:17,fontWeight:700,color:t.text,marginBottom:3}}>Log Activity</div>
-            <div style={{fontSize:14,color:t.textMuted,fontWeight:500}}>{item.name}</div>
-          </div>
-          <button onClick={onClose} style={{background:"none",border:"none",color:t.textDim,cursor:"pointer",fontSize:20,lineHeight:1,padding:4}}>x</button>
-        </div>
-
-        <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:8}}>ACTION TYPE</div>
-        <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:16}}>
-          {ACTIVITY_TYPES.map(a=>(
-            <button key={a.key} onClick={()=>setActionType(a.key)} style={{...btn0,display:"flex",alignItems:"center",gap:5,padding:"5px 10px",borderRadius:6,fontSize:13,fontWeight:600,border:"1px solid "+(actionType===a.key?a.color+"60":t.border),background:actionType===a.key?a.color+"18":"transparent",color:actionType===a.key?a.color:t.textMuted}}>
-              <span style={{fontSize:14}}>{a.icon}</span>{a.label}
-            </button>
-          ))}
-        </div>
-
-        <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:6}}>OUTCOME</div>
-        <div style={{display:"flex",gap:6,marginBottom:16}}>
-          {["positive","neutral","negative"].map(o=>(
-            <button key={o} onClick={()=>setOutcome(o)} style={{...btn0,flex:1,padding:"6px 0",borderRadius:6,fontSize:13,fontWeight:600,border:"1px solid "+(outcome===o?outcomeColors[o]+"60":t.border),background:outcome===o?outcomeColors[o]+"18":"transparent",color:outcome===o?outcomeColors[o]:t.textMuted,textTransform:"capitalize"}}>{o}</button>
-          ))}
-        </div>
-
-        <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,marginBottom:6}}>NOTE <span style={{fontWeight:400,textTransform:"none",color:t.textDim}}>(optional)</span></div>
-        <textarea value={note} onChange={e=>setNote(e.target.value)} placeholder="What happened? Key points..." rows={3} style={{width:"100%",padding:"9px 11px",background:t.input,border:"1px solid "+t.inputBorder,borderRadius:7,color:t.text,fontSize:14,fontFamily:"inherit",resize:"vertical",boxSizing:"border-box",marginBottom:16}}/>
-
-        <div style={{display:"flex",gap:8}}>
-          <button onClick={save} style={{...btn0,flex:1,padding:"10px",borderRadius:8,fontSize:15,fontWeight:700,background:"linear-gradient(135deg,"+selectedType.color+","+selectedType.color+"cc)",color:"#07090f",border:"none"}}>
-            Save Entry
-          </button>
-          <button onClick={onClose} style={{...btn0,padding:"10px 16px",borderRadius:8,fontSize:15,fontWeight:600,background:"transparent",border:"1px solid "+t.border,color:t.textMuted}}>Cancel</button>
-        </div>
       </div>
     </div>
   );
@@ -5225,11 +5478,9 @@ const LoginScreen = ({t, onLogin}) => {
     if(password.length<6){setError("Password must be at least 6 characters.");setLoading(false);return;}
     const users = storage.gget("oos-users")||{};
     if(mode==="login"){
-      // Try Firebase first — works on any device
       if(window.TorqueFirebase) {
         try {
           await window.TorqueFirebase.signIn(email.toLowerCase(), password);
-          // Firebase sign in worked — update local hash to PBKDF2 if legacy
           const existing = users[email.toLowerCase()];
           if (!existing || !existing.hash || !existing.hash.includes(":")) {
             const newHash = await hashPassword(password);
@@ -5240,15 +5491,11 @@ const LoginScreen = ({t, onLogin}) => {
           setLoading(false);
           onLogin(false);
           return;
-        } catch(e) {
-          // Firebase failed — fall through to local check
-        }
+        } catch(e) {}
       }
-      // Local fallback
       if(!users[email.toLowerCase()]){setError("No account found. Create one below.");setLoading(false);return;}
       const isValid = await verifyPassword(password, users[email.toLowerCase()].hash);
       if(!isValid){setError("Incorrect password.");setLoading(false);return;}
-      // Migrate legacy hash to PBKDF2 on successful login
       if(!users[email.toLowerCase()].hash.includes(":")){
         users[email.toLowerCase()].hash = await hashPassword(password);
         storage.gset("oos-users", users);
@@ -5256,7 +5503,6 @@ const LoginScreen = ({t, onLogin}) => {
       storage.gset("oos-session",{email:email.toLowerCase(), ts:Date.now()});
       onLogin(false);
     } else {
-      // Register — create both Firebase and local account
       let firebaseOk = false;
       if(window.TorqueFirebase) {
         try { await window.TorqueFirebase.signUp(email.toLowerCase(), password); firebaseOk = true; } catch(e) {
@@ -5267,7 +5513,7 @@ const LoginScreen = ({t, onLogin}) => {
           }
         }
       }
-      const hash = await hashPassword(password); // PBKDF2 with random salt
+      const hash = await hashPassword(password);
       users[email.toLowerCase()]={hash, createdAt:new Date().toISOString()};
       storage.gset("oos-users",users);
       storage.gset("oos-session",{email:email.toLowerCase(), ts:Date.now()});
@@ -6486,8 +6732,16 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
   const [provider,setProvider]=useState(()=>storage.get("oos-provider")||"claude");
   const [apiKey,setApiKey]=useState(()=>storage.get("oos-key")||"");
   const [profile,setProfile]=useState(()=>storage.get("oos-profile")||initialProfile||DEFAULT_PROFILE);
-  const [saved,setSaved]=useState(()=>storage.get("oos-saved")||[]);
-  const schedulePipelineSyncRef = React.useRef(null);
+  const [saved,setSavedRaw]=useState(()=>storage.get("oos-saved")||[]);
+  // Wrapped setSaved — every pipeline change auto-schedules a Firebase sync
+  const setSaved = React.useCallback((updater) => {
+    setSavedRaw(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      // Schedule sync after state settles
+      setTimeout(() => schedulePipelineSync(next), 0);
+      return next;
+    });
+  }, [schedulePipelineSync]);
   const [chatContext,setChatContext]=useState(null);
   const [chatBrief,setChatBrief]=useState(null);
   const [chatMessages,setChatMessages]=useState(()=>storage.get("oos-chat-messages")||[{role:"assistant",content:"Hi! I'm your AI Advisor. Ask me anything about your opportunities, pipeline, strategy, or how to use the app.",id:"w1"}]);
@@ -6496,44 +6750,14 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
   const saveCalendarEvents=(evts)=>{setCalendarEvents(evts);storage.set("oos-calendar-events",evts);};
   const [scheduleModalItem,setScheduleModalItem]=useState(null);
 
-  // ── Activity Log ──
-  const [activityLog, setActivityLogRaw] = useState(()=>storage.get("oos-activity-log")||[]);
-  const saveActivityEntry = React.useCallback((entry) => {
-    setActivityLogRaw(prev => { const next = [...prev, entry]; storage.set("oos-activity-log", next); return next; });
-  }, []);
-  const [activityLogItem, setActivityLogItem] = useState(null);
-
-  // ── Contacts CRM ──
-  const [contacts, setContactsRaw] = useState(()=>storage.get("oos-contacts")||[]);
-  const setContacts = React.useCallback((updater) => {
-    setContactsRaw(prev => { const next = typeof updater === "function" ? updater(prev) : updater; storage.set("oos-contacts", next); return next; });
-  }, []);
-  const saveContact = React.useCallback((contact) => {
-    setContactsRaw(prev => {
-      if(prev.some(c=>c.name===contact.name&&c.company===contact.company)) return prev;
-      const entry = { id:"ct-"+Date.now(), name:contact.name||"", role:contact.role||"", company:contact.company||"", warmth:contact.warmth||"cold", linkedOpportunities:contact.linkedOpportunities||[], notes:"", source:contact.source||"manual", createdAt:new Date().toISOString() };
-      const next = [entry, ...prev]; storage.set("oos-contacts", next); return next;
-    });
-  }, []);
-
-  // ── Document Vault ──
-  const [vault, setVaultRaw] = useState(()=>storage.get("oos-vault")||[]);
-  const setVault = (next) => { setVaultRaw(next); storage.set("oos-vault", next); };
-  const saveToVault = React.useCallback((doc) => {
-    setVaultRaw(prev => {
-      const entry = { id:"vault-"+Date.now(), title:doc.title||"Document", type:doc.docTypeLabel||"", content:doc.content||"", contentType:doc.contentType||"document", sourceOpportunity:doc.sourceOpportunity||"", sourceItem:doc.sourceItem||null, niTarget:doc.niTarget||"", niRegion:doc.niRegion||"", savedAt:new Date().toISOString() };
-      const next = [entry, ...prev]; storage.set("oos-vault", next); return next;
-    });
-  }, []);
-
   // ── Calendar reminder engine — checks every minute ──
   useEffect(()=>{
     const checkReminders=()=>{
       const now=new Date();
       const evts=storage.get("oos-calendar-events")||[];
       let changed=false;
-      const updated=evts.map(ev=>{
-        if(ev.completed||ev.reminded) return ev;
+      evts.forEach(ev=>{
+        if(ev.completed||ev.reminded) return;
         const evDate=new Date(ev.datetime);
         const diff=(evDate-now)/60000; // minutes
         if(diff<=0&&diff>-60){ // within the last hour
@@ -6543,12 +6767,11 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
               icon:"/favicon.ico"
             });
           }
+          ev.reminded=true;
           changed=true;
-          return {...ev, reminded:true};
         }
-        return ev;
       });
-      if(changed){setCalendarEvents(updated);storage.set("oos-calendar-events",updated);}
+      if(changed){setCalendarEvents([...evts]);storage.set("oos-calendar-events",evts);}
     };
     const interval=setInterval(checkReminders,60000);
     checkReminders();
@@ -6596,6 +6819,71 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
   const [niError,setNiError]=useState(null);
   const [niTarget,setNiTarget]=useState(null);
   const [niFreeSearch,setNiFreeSearch]=useState("");
+
+  // ── Activity Log ──
+  const [activityLog, setActivityLogRaw] = useState(()=>storage.get("oos-activity-log")||[]);
+  const saveActivityEntry = React.useCallback((entry) => {
+    setActivityLogRaw(prev => {
+      const next = [...prev, entry];
+      storage.set("oos-activity-log", next);
+      return next;
+    });
+  }, []);
+  const [activityLogItem, setActivityLogItem] = useState(null);
+
+  // ── Contacts CRM ──
+  const [contacts, setContactsRaw] = useState(()=>storage.get("oos-contacts")||[]);
+  const setContacts = React.useCallback((updater) => {
+    setContactsRaw(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      storage.set("oos-contacts", next);
+      return next;
+    });
+  }, []);
+  const saveContact = React.useCallback((contact) => {
+    setContactsRaw(prev => {
+      // Avoid exact duplicates by name+company
+      if(prev.some(c=>c.name===contact.name&&c.company===contact.company)) return prev;
+      const entry = {
+        id: "ct-"+Date.now(),
+        name: contact.name||"",
+        role: contact.role||"",
+        company: contact.company||"",
+        warmth: contact.warmth||"cold",
+        linkedOpportunities: contact.linkedOpportunities||[],
+        notes: contact.notes||"",
+        lastContactDate: contact.lastContactDate||"",
+        source: contact.source||"manual",
+        createdAt: new Date().toISOString(),
+      };
+      const next = [entry, ...prev];
+      storage.set("oos-contacts", next);
+      return next;
+    });
+  }, []);
+
+  // ── Document Vault ──
+  const [vault, setVaultRaw] = useState(()=>storage.get("oos-vault")||[]);
+  const setVault = (next) => { setVaultRaw(next); storage.set("oos-vault", next); };
+  const saveToVault = React.useCallback((doc) => {
+    setVaultRaw(prev => {
+      const entry = {
+        id: "vault-"+Date.now(),
+        title: doc.title || doc.docTypeLabel || "Document",
+        type: doc.docTypeLabel || doc.type || "",
+        content: doc.content || "",
+        contentType: doc.contentType || "document",
+        sourceOpportunity: doc.sourceOpportunity || "",
+        sourceItem: doc.sourceItem || null,
+        niTarget: doc.niTarget || "",
+        niRegion: doc.niRegion || "",
+        savedAt: new Date().toISOString(),
+      };
+      const next = [entry, ...prev];
+      storage.set("oos-vault", next);
+      return next;
+    });
+  }, []);
 
   const openChat = useCallback((item) => {
     setChatContext(item);
@@ -6709,21 +6997,16 @@ Be direct and specific. Reference the user's background. No generic advice. Max 
       });
     }, 300);
   }, []);
-  // Keep ref in sync so setSaved effect can access it without dependency issues
-  schedulePipelineSyncRef.current = schedulePipelineSync;
-  // Auto-sync pipeline to Firebase whenever saved changes
-  const savedInitRef = React.useRef(true);
-  useEffect(() => {
-    if (savedInitRef.current) { savedInitRef.current = false; return; } // skip initial mount
-    if (schedulePipelineSyncRef.current) schedulePipelineSyncRef.current(saved);
-  }, [saved]);
-  // Cleanup debounce timer on unmount (Bug 20)
-  useEffect(() => () => clearTimeout(pipelineSaveTimer.current), []);
 
   const toggleTheme=()=>setTheme(p=>p==="dark"?"light":"dark");
 
-  const chatSystemPrompt=useMemo(()=>{
+  const buildChatSystemPrompt=useCallback(()=>{
+    // Read everything fresh at call time — no stale deps, new features auto-included
     const p=profile;
+    const liveSaved=saved;
+    const liveContext=chatContext;
+    const liveNiAnalysis=niAnalysis;
+    const liveNiTarget=niTarget;
 
     const profileSection=`ABOUT THE USER:
 Name: ${p.name||"Not set"}
@@ -6753,88 +7036,58 @@ Monthly investable: ${p.monthlyInvestable?("$"+(p.monthlyInvestable).toLocaleStr
 Target geographies: ${(p.regions||[]).join(", ")||"Not set"}
 Target sectors: ${(p.defaultSectors||[]).join(", ")||"Not set"}
 Investment role: ${p.dmInvestmentRole||"Co-investor"}
-Ticket size: $${(p.dmTicketMin||25000).toLocaleString()} – $${(p.dmTicketMax||150000).toLocaleString()}
+Ticket size: $${(p.dmTicketMin||25000).toLocaleString()} - $${(p.dmTicketMax||150000).toLocaleString()}
 Deal stage preference: ${p.dmDealStage||"Any stage"}
 Value add: ${p.dmValueAdd||"Not set"}
 Red flags: ${p.dmRedFlags||"None specified"}`;
 
-    const pipelineSection=saved.length>0?`SAVED PIPELINE (${saved.length} opportunities):
-${saved.map(s=>{
-  try{const sc=scoreOpportunity(s,p);const isExec=s.source==="exec";return `- ${s.name} | ${s.source?.toUpperCase()||"?"} | ${s.region||""} | ${s.sector||""} | Status: ${s.status||"unreviewed"} | Kanban: ${s.kanbanStage||"tracking"} | Score: ${sc.total||"?"}/100${isExec?` | Probable role: ${s.probableRole||"n/a"} | Package: ${s.estimatedPackage||"n/a"}`:" | Fee: "+(s.estimatedFee||s.entryCost||s.equity||"n/a")}${s.annualUSD?" | Annual USD: $"+s.annualUSD.toLocaleString():""}${!isExec&&s.usdPerDay?" | $/day: $"+s.usdPerDay.toLocaleString():""}${s.effortRating?" | Effort: "+s.effortRating:""}${s.daysPerYear?" | Days/year: "+s.daysPerYear:""}${s.notes?" | Notes: "+s.notes:""}`;}
-  catch{return `- ${s.name} | ${s.source?.toUpperCase()||"?"} | ${s.region||""} | ${s.sector||""} | Status: ${s.status||"unreviewed"}${s.annualUSD?" | Annual USD: $"+s.annualUSD.toLocaleString():""}${s.notes?" | Notes: "+s.notes:""}`;}
-}).join("\n")}`:"SAVED PIPELINE: Empty — no saved opportunities yet.";
+    // Pipeline — from live React state (always current)
+    const pipelineSection=liveSaved.length>0?"SAVED PIPELINE ("+liveSaved.length+" opportunities):\n"+
+liveSaved.map(s=>{
+  try{const sc=scoreOpportunity(s,p);const isExec=s.source==="exec";return "- "+s.name+" | "+(s.source?.toUpperCase()||"?")+" | "+(s.region||"")+" | "+(s.sector||"")+" | Status: "+(s.status||"unreviewed")+" | Kanban: "+(s.kanbanStage||"tracking")+" | Score: "+(sc.total||"?")+"/100"+(isExec?" | Probable role: "+(s.probableRole||"n/a")+" | Package: "+(s.estimatedPackage||"n/a"):" | Fee: "+(s.estimatedFee||s.entryCost||s.equity||"n/a"))+(s.annualUSD?" | Annual USD: $"+s.annualUSD.toLocaleString():"")+((!isExec)&&s.usdPerDay?" | $/day: $"+s.usdPerDay.toLocaleString():"")+(s.effortRating?" | Effort: "+s.effortRating:"")+(s.daysPerYear?" | Days/year: "+s.daysPerYear:"")+(s.notes?" | Notes: "+s.notes:"");}
+  catch{return "- "+s.name+" | "+(s.source?.toUpperCase()||"?")+" | "+(s.region||"")+" | "+(s.sector||"")+" | Status: "+(s.status||"unreviewed")+(s.annualUSD?" | Annual USD: $"+s.annualUSD.toLocaleString():"")+(s.notes?" | Notes: "+s.notes:"");}
+}).join("\n")
+:"SAVED PIPELINE: Empty.";
 
+    // Calendar — read fresh from storage
     const calEvts=(()=>{try{return storage.get("oos-calendar-events")||[];}catch{return [];}})();
     const upcomingEvts=calEvts.filter(ev=>!ev.completed&&new Date(ev.datetime)>=new Date()).sort((a,b)=>new Date(a.datetime)-new Date(b.datetime));
-    const calendarSection=calEvts.length>0?`CALENDAR (${upcomingEvts.length} upcoming, ${calEvts.filter(e=>e.completed).length} completed):
-${upcomingEvts.slice(0,15).map(ev=>`- ${ev.actionType.toUpperCase()}: ${ev.cardName} | ${new Date(ev.datetime).toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})} ${new Date(ev.datetime).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})} | Source: ${ev.cardSource||"?"} | Status: ${ev.cardStatus||"?"} | Region: ${ev.cardRegion||"?"} | Fee: ${ev.cardFee||"?"}${ev.notes?" | Notes: "+ev.notes:""}`).join("\n")}${upcomingEvts.length===0?" (no upcoming events)":""}`:"CALENDAR: No events scheduled yet.";
+    const calendarSection=calEvts.length>0?"CALENDAR ("+upcomingEvts.length+" upcoming, "+calEvts.filter(e=>e.completed).length+" completed):\n"+
+upcomingEvts.slice(0,15).map(ev=>"- "+ev.actionType.toUpperCase()+": "+ev.cardName+" | "+new Date(ev.datetime).toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})+" "+new Date(ev.datetime).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})+" | Source: "+(ev.cardSource||"?")+" | Region: "+(ev.cardRegion||"?")+(ev.notes?" | Notes: "+ev.notes:"")).join("\n")+(upcomingEvts.length===0?" (no upcoming events)":"")
+:"CALENDAR: No events scheduled yet.";
 
-    const networkSection=niAnalysis&&niTarget?`NETWORK INTEL LAST RUN:
-Target: ${niTarget}
-Key contacts: ${(niAnalysis.keyContacts||[]).slice(0,3).map(c=>`${c.name} (${c.role}, warmth: ${c.warmthLevel})`).join(", ")||"None identified"}
-Recommended approach: ${niAnalysis.recommendedApproach||"Not set"}
-Network angles: ${(niAnalysis.networkAngles||[]).slice(0,3).join("; ")||"None"}`:
-    "NETWORK INTEL: Not yet run.";
+    // Activity log — read fresh from storage
+    const actLog=(()=>{try{return storage.get("oos-activity-log")||[];}catch{return [];}})();
+    const activitySection=actLog.length>0?"ACTIVITY LOG ("+actLog.length+" entries):\n"+
+actLog.slice().sort((a,b)=>new Date(b.loggedAt)-new Date(a.loggedAt)).slice(0,40).map(e=>{
+  const d=new Date(e.loggedAt);
+  const dateStr=d.toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"});
+  return "- "+dateStr+" | "+e.pipelineCardName+" | "+e.actionType.toUpperCase()+" | Outcome: "+e.outcome+(e.note?" | Note: "+e.note:"");
+}).join("\n")
+:"ACTIVITY LOG: No activity logged yet.";
 
-    const providerSection=`AI CONFIGURATION:
-Provider: ${provider||"claude"}
-API key: ${apiKey?"Configured":"Not configured"}`;
+    // Contacts — read fresh from storage
+    const contactsData=(()=>{try{return storage.get("oos-contacts")||[];}catch{return [];}})();
+    const contactsSection=contactsData.length>0?"CONTACTS CRM ("+contactsData.length+" contacts):\n"+
+contactsData.map(c=>"- "+c.name+" | "+(c.role||"")+" | "+(c.company||"")+" | Warmth: "+(c.warmth||"cold")+(c.linkedOpportunities&&c.linkedOpportunities.length>0?" | Linked: "+c.linkedOpportunities.join(", "):"")+(c.notes?" | Notes: "+c.notes:"")+(c.lastContactDate?" | Last contact: "+c.lastContactDate:"")).join("\n")
+:"CONTACTS CRM: No contacts saved yet.";
 
-    const contextSection=chatContext&&chatContext.name&&!chatContext.name.includes("Research")?`CURRENT OPPORTUNITY CONTEXT:
-Name: ${chatContext.name}
-Region: ${chatContext.region||""}
-Sector: ${chatContext.sector||""}
-Description: ${chatContext.companyDescription||chatContext.description||""}
-Fee/value: ${chatContext.estimatedFee||chatContext.entryCost||chatContext.equity||"Not specified"}
-Fit reasons: ${(chatContext.fitReasons||[]).join("; ")||"Not specified"}
-Status: ${chatContext.status||"unreviewed"}
-Kanban stage: ${chatContext.kanbanStage||"tracking"}
-Notes: ${chatContext.notes||"None"}`:
-    chatContext?`CURRENT MODULE CONTEXT: ${chatContext.name}`:"";
+    // Document Vault — read fresh from storage (summary only)
+    const vaultData=(()=>{try{return storage.get("oos-vault")||[];}catch{return [];}})();
+    const vaultSection=vaultData.length>0?"DOCUMENT VAULT ("+vaultData.length+" documents):\n"+
+vaultData.slice(0,20).map(d=>"- "+d.title+" | "+d.type+(d.sourceOpportunity?" | for: "+d.sourceOpportunity:"")+" | "+new Date(d.savedAt).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})).join("\n")
+:"DOCUMENT VAULT: No documents saved yet.";
 
-    return `You are an expert opportunity intelligence advisor for ${p.name||"the user"}. You have full access to all their app data — profile, pipeline, calendar, and network intel. Always reference real data in your answers, never give generic advice. For running new scans, direct the user to the Vibe Agent tab.
+    // Network Intel — from live React state
+    const networkSection=liveNiAnalysis&&liveNiTarget?"NETWORK INTEL LAST RUN:\nTarget: "+liveNiTarget+"\nKey contacts: "+((liveNiAnalysis.keyContacts||[]).slice(0,3).map(c=>c.name+" ("+c.role+", warmth: "+c.warmthLevel+")").join(", ")||"None identified")+"\nRecommended approach: "+(liveNiAnalysis.recommendedApproach||"Not set")+"\nNetwork angles: "+((liveNiAnalysis.networkAngles||[]).slice(0,3).join("; ")||"None")
+    :"NETWORK INTEL: Not yet run.";
 
-${profileSection}
+    const providerSection="AI CONFIGURATION:\nProvider: "+(provider||"claude")+"\nAPI key: "+(apiKey?"Configured":"Not configured");
 
-${taxSection}
+    const contextSection=liveContext&&liveContext.name&&!liveContext.name.includes("Research")?"CURRENT OPPORTUNITY CONTEXT:\nName: "+liveContext.name+"\nRegion: "+(liveContext.region||"")+"\nSector: "+(liveContext.sector||"")+"\nDescription: "+(liveContext.companyDescription||liveContext.description||"")+"\nFee/value: "+(liveContext.estimatedFee||liveContext.entryCost||liveContext.equity||"Not specified")+"\nFit reasons: "+((liveContext.fitReasons||[]).join("; ")||"Not specified")+"\nStatus: "+(liveContext.status||"unreviewed")+"\nKanban stage: "+(liveContext.kanbanStage||"tracking")+"\nNotes: "+(liveContext.notes||"None")
+    :liveContext?"CURRENT MODULE CONTEXT: "+liveContext.name:"";
 
-${goalSection}
-
-${thesisSection}
-
-${pipelineSection}
-
-${calendarSection}
-
-${networkSection}
-
-${providerSection}
-
-${contextSection}
-
-INSTRUCTIONS:
-- Always reference the user's actual data — name their specific companies, dates, stages, and scores
-- When asked for tables, use proper markdown table format with | headers | and aligned columns
-- For tax or structuring questions, note professional advice is needed
-- You can search the web for current market information
-- If asked about calendar, reference the exact events above with their dates and action types
-- If asked about pipeline status or scores, use the data above
-- If asked what to focus on, use scores, kanban stages, calendar events, and value analysis to give a prioritised view
-- VALUE ANALYSIS: Each saved opportunity may have annualUSD (annual earnings estimate), usdPerDay (earnings per day of effort), daysPerYear (commitment), and effortRating (LOW/MEDIUM/HIGH). Use these to answer questions like "which opportunity gives the best return on my time?" or "what should I prioritise?"
-- SIDE HUSTLE SCANNING: The minimum annual value filter replaces the old day rate filter. It sets the minimum yearly earnings threshold for scan results
-- FEE CALIBRATION: Board NED (listed) $40K-$120K/yr, Board NED (private) $15K-$50K/yr, Fractional Director $1.5K-$6K/day, Advisory retainer $2K-$8K/month, Keynote $3K-$15K/event
-
-APP MODULES:
-- Vibe Agent: Run AI-powered scans for new opportunities
-- Board Scout: Board director / NED / consultant mandates
-- Side Hustle Lab: Consulting gigs, fractional roles, advisory income
-- Executive Search: Director & C-suite full-time roles based on company hiring signals. Cards include probableRole, hiringSignal, estimatedPackage, packageBreakdown, annualUSD. Effort is always HIGH (full-time ~220 days/year). Value analysis shows total package not day rate.
-- Venture Scout: Startup investment and co-founder deals
-- Investment Thesis: Deal flow and co-investment opportunities
-- Pipeline: All saved opportunities with kanban board
-- Calendar: Schedule and track actions against saved cards
-- Network Intel: Warm introduction path analysis
-- Settings: Profile, API key, tax residence, financial goals`;
+    return "You are an expert opportunity intelligence advisor for "+(p.name||"the user")+". You have full access to all their app data - profile, pipeline, calendar, activity log, contacts, vault, and network intel. Always reference real data in your answers, never give generic advice. For running new scans, direct the user to the Vibe Agent tab.\n\n"+profileSection+"\n\n"+taxSection+"\n\n"+goalSection+"\n\n"+thesisSection+"\n\n"+pipelineSection+"\n\n"+calendarSection+"\n\n"+activitySection+"\n\n"+contactsSection+"\n\n"+vaultSection+"\n\n"+networkSection+"\n\n"+providerSection+(contextSection?"\n\n"+contextSection:"")+"\n\nINSTRUCTIONS:\n- Always reference the user's actual data - name their specific companies, dates, stages, and scores\n- When asked about activity history (e.g. \"what have I done on Maersk?\"), use the ACTIVITY LOG above filtered by company name\n- When asked which opportunities haven't been contacted, cross-reference pipeline cards against activity log entries\n- When asked about contacts or relationships, use the CONTACTS CRM data above\n- When asked about documents, use the DOCUMENT VAULT data above\n- When asked for tables, use proper markdown table format with | headers | and aligned columns\n- For tax or structuring questions, note professional advice is needed\n- You can search the web for current market information\n- If asked about calendar, reference the exact events above with their dates and action types\n- If asked about pipeline status or scores, use the data above\n- If asked what to focus on, use scores, kanban stages, calendar events, and value analysis to give a prioritised view\n- VALUE ANALYSIS: annualUSD = annual earnings estimate, usdPerDay = earnings per day, daysPerYear = commitment, effortRating = LOW/MEDIUM/HIGH\n- FEE CALIBRATION: Board NED (listed) $40K-$120K/yr, Board NED (private) $15K-$50K/yr, Fractional Director $1.5K-$6K/day, Advisory retainer $2K-$8K/month, Keynote $3K-$15K/event\n\nAPP MODULES: Vibe Agent (scans), Board Scout (NED/board), Side Hustle Lab (fractional/advisory), Executive Search (director/C-suite), Venture Scout (startups), Investment Thesis (deals), Pipeline (kanban), Calendar (scheduling), Network Intel (warm intros), Document Vault (saved docs), Contacts (CRM), Settings";
   },[profile,saved,chatContext,niAnalysis,niTarget,provider,apiKey]);
 
   // ── Unified scan runner — called from chat when scan commands are detected ──
@@ -6945,6 +7198,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
 
   const modules=[
     {key:"home",label:"Home",icon:"⚡",color:t.accent},
+    {key:"tower",label:"Control Tower",icon:"🗼",color:"#38bdf8"},
     {key:"board",label:"Board Scout",icon:"🏛",color:"#6ee7b7"},
     {key:"hustle",label:"Side Hustle Lab",icon:"💡",color:"#fb923c"},
     {key:"exec",label:"Executive Search",icon:"👔",color:"#c084fc"},
@@ -6954,7 +7208,6 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
     {key:"vibe",label:"Vibe Agent",icon:"⚡",color:"#a78bfa"},
     {key:"calendar",label:"Calendar",icon:"📆",color:"#34d399"},
     {key:"network",label:"Network Intel",icon:"🕸",color:"#818cf8"},
-    {key:"tower",label:"Control Tower",icon:"🗼",color:"#38bdf8"},
     {key:"_tools_",label:"TOOLS",icon:"",color:"",divider:true},
     {key:"vault",label:"Document Vault",icon:"📄",color:"#38bdf8"},
     {key:"contacts",label:"Contacts",icon:"👥",color:"#2dd4bf"},
@@ -7011,7 +7264,9 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
         {/* Nav items */}
         <div style={{flex:1,padding:"6px 8px"}}>
           {modules.map(m=>{
-            if(m.divider) return <div key={m.key} style={{fontSize:10,fontWeight:700,letterSpacing:"0.1em",color:t.textDim,padding:"14px 10px 4px",opacity:0.6}}>{m.label}</div>;
+            if(m.divider) return (
+              <div key={m.key} style={{fontSize:10,fontWeight:700,letterSpacing:"0.1em",color:t.textDim,padding:"14px 10px 4px",opacity:0.6}}>{m.label}</div>
+            );
             const locked = !profileComplete && gatedModules.includes(m.key);
             return (
             <button key={m.key} data-module={m.key} onClick={()=>{ if(locked) return; setActiveModule(m.key); }} style={navItemStyle(m)} title={locked?"Complete your profile in Settings first":m.label}>
@@ -7062,9 +7317,11 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
 
       {/* Mobile nav drawer */}
       {isMobile&&navOpen&&<div onClick={()=>setNavOpen(false)} style={{position:"fixed",inset:0,zIndex:300,background:"rgba(0,0,0,0.6)"}}>
-        <div onClick={e=>e.stopPropagation()} style={{position:"absolute",top:0,left:0,width:240,height:"100%",background:t.surface,borderRight:"1px solid "+t.border,padding:"60px 10px 20px",display:"flex",flexDirection:"column",gap:4}}>
+        <div onClick={e=>e.stopPropagation()} style={{position:"absolute",top:0,left:0,width:240,height:"100%",background:t.surface,borderRight:"1px solid "+t.border,padding:"60px 10px 20px",display:"flex",flexDirection:"column",gap:4,overflowY:"auto"}}>
           {modules.map(m=>{
-            if(m.divider) return <div key={m.key} style={{fontSize:10,fontWeight:700,letterSpacing:"0.1em",color:t.textDim,padding:"10px 10px 2px",opacity:0.6}}>{m.label}</div>;
+            if(m.divider) return (
+              <div key={m.key} style={{fontSize:10,fontWeight:700,letterSpacing:"0.1em",color:t.textDim,padding:"10px 10px 2px",opacity:0.6}}>{m.label}</div>
+            );
             const locked = !profileComplete && gatedModules.includes(m.key);
             return (
             <button key={m.key} data-module={m.key} onClick={()=>{ if(locked) return; setActiveModule(m.key);setNavOpen(false); }} style={{...navItemStyle(m)}} title={locked?"Complete your profile in Settings first":m.label}>
@@ -7079,7 +7336,6 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
               {m.key==="contacts"&&contacts.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#2dd4bf20",color:"#2dd4bf"}}>{contacts.length}</span>}
             </button>
           );})}
-
         </div>
       </div>}
 
@@ -7093,6 +7349,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
               <div style={{fontSize:16,fontWeight:800,color:t.text}}>{activeM.label}</div>
               <div style={{fontSize:15,color:t.textDim}}>
                 {activeModule==="home"&&"Your morning intelligence brief"}
+                {activeModule==="tower"&&"Live view of all your opportunities in motion"}
                 {activeModule==="board"&&"Board seats & consulting mandates"}
                 {activeModule==="venture"&&"Startup deals & business ideas"}
                 {activeModule==="hustle"&&"Fractional roles, advisory & paid gigs"}
@@ -7101,7 +7358,6 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
                 {activeModule==="pipeline"&&saved.length+" opportunities saved across all modules"}
                 {activeModule==="network"&&"Map warm intro paths from your professional network"}
                 {activeModule==="vibe"&&"Your autonomous opportunity agent — scan, plan, and discover"}
-                {activeModule==="tower"&&"Live view of all your opportunities in motion"}
                 {activeModule==="vault"&&vault.length+" document"+(vault.length!==1?"s":"")+" saved"}
                 {activeModule==="contacts"&&contacts.length+" contact"+(contacts.length!==1?"s":"")}
                 {activeModule==="settings"&&"Profile, API, tax profile & goal runway"}
@@ -7119,15 +7375,15 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
         <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column"}}>
           <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column",padding:activeModule==="vibe"?"0":isMobile?"10px 10px":"12px 14px"}}>
           {/* Single-column pages get their own scroll context */}
-          {(activeModule==="home"||activeModule==="settings"||activeModule==="pipeline"||activeModule==="calendar"||activeModule==="vault"||activeModule==="contacts"||activeModule==="tower")&&
+          {(activeModule==="home"||activeModule==="tower"||activeModule==="settings"||activeModule==="pipeline"||activeModule==="calendar"||activeModule==="vault"||activeModule==="contacts")&&
             <div style={{flex:1,overflowY:"auto",minHeight:0}}>
               {activeModule==="home"&&<CommandCenter t={t} profile={profile} saved={saved} isMobile={isMobile} setActiveModule={setActiveModule} apiKey={apiKey} provider={provider} profileComplete={profileComplete} gatedModules={gatedModules} activityLog={activityLog} contacts={contacts} saveToVault={saveToVault}/>}
+              {activeModule==="tower"&&<ControlTowerModule t={t} isMobile={isMobile} saved={saved} activityLog={activityLog} contacts={contacts} calendarEvents={calendarEvents} setActiveModule={setActiveModule}/>}
               {activeModule==="pipeline"&&<PipelineModule t={t} saved={saved} setSaved={setSaved} isMobile={isMobile} onOpenChat={(item)=>openChat(item)} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} onNavigateToSource={(item)=>{const tabMap={board:"saved",venture:"saved",hustle:"saved",deal:"saved",exec:"saved"};const modMap={board:"board",venture:"venture",hustle:"hustle",deal:"deal",exec:"exec"};const prefMap={board:"bs",venture:"vs",hustle:"sh",deal:"dm",exec:"es"};storage.set((prefMap[item.source]||"bs")+"-tab",tabMap[item.source]||"saved");setActiveModule(modMap[item.source]||"board");}}/>}
               {activeModule==="calendar"&&<CalendarModule t={t} isMobile={isMobile} events={calendarEvents} onSaveEvents={saveCalendarEvents} saved={saved} onScheduleItem={setScheduleModalItem} onNavigate={setActiveModule}/>}
               {activeModule==="settings"&&<SettingsModule t={t} profile={profile} setProfile={p=>{setProfile(p);storage.set("oos-profile",p);}} apiKey={apiKey} setApiKey={setApiKey} provider={provider} setProvider={setProvider} isMobile={isMobile} isNewUser={startOnSettings}/>}
               {activeModule==="vault"&&<DocumentVaultModule t={t} isMobile={isMobile} vault={vault} setVault={setVault} onRegenerate={(sourceItem)=>{setDocGenItem(sourceItem);}}/>}
               {activeModule==="contacts"&&<ContactsModule t={t} isMobile={isMobile} contacts={contacts} setContacts={setContacts} activityLog={activityLog} saved={saved} onNavigateToNetwork={(company)=>{setNiFreeSearch(company);setActiveModule("network");}}/>}
-              {activeModule==="tower"&&<ControlTowerModule t={t} isMobile={isMobile} saved={saved} activityLog={activityLog} contacts={contacts} calendarEvents={calendarEvents} setActiveModule={setActiveModule}/>}
             </div>
           }
           {/* Two-column pages manage their own scroll per panel */}
@@ -7175,7 +7431,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
       {/* Strategy Room / Chatbot */}
       {chatContext&&<StreamingChatbot
         apiKey={apiKey} provider={provider}
-        systemPrompt={chatSystemPrompt}
+        systemPromptBuilder={buildChatSystemPrompt}
         title={chatContext.name||"AI Advisor"}
         subtitle={"AI Advisor · "+activeM.label}
         icon="🧠"
@@ -7210,7 +7466,6 @@ function AppRoot() {
             setSession(sessionData);
           }
         }
-        // Signal auth check is done so loader can dismiss
         window.__firebaseAuthReady = true;
       });
       return true;
