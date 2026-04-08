@@ -1147,26 +1147,131 @@ const extractJSON = (blocks) => {
 // flow through OpportunityCard, scoring, pipeline save, and docs generation
 // without any additional branching logic downstream.
 const ADZUNA_COUNTRY_MAP = {
-  GB:"gb", US:"us", AU:"au", BR:"br", CA:"ca", DE:"de", FR:"fr", IN:"in",
+  GB:"gb", US:"us", USA:"us", AU:"au", BR:"br", CA:"ca", DE:"de", FR:"fr", IN:"in",
   IT:"it", MX:"mx", NL:"nl", NZ:"nz", PL:"pl", SG:"sg", ZA:"za", AT:"at",
   BE:"be", CH:"ch", ES:"es"
 };
 
-const fetchMuseJobs = async ({ countryNames, execFunction, module, onLog }) => {
+// Muse's `category` enum = job function. Map EXEC_FUNCTIONS (and the candidate's
+// own title as a fallback) onto the closest Muse category label so Exec Search
+// actually pulls function-relevant postings instead of a generic firehose.
+// Muse has no `industry` param, so sector targeting is done via post-filter.
+const MUSE_CATEGORY_MAP = {
+  "Supply Chain":"Business Operations",
+  "Operations":"Business Operations",
+  "Finance":"Accounting and Finance",
+  "Technology":"Computer and IT",
+  "Commercial":"Sales",
+  "General Management":"Management",
+  "HR & People":"HR",
+  "Legal & Compliance":"Legal Services",
+  "Strategy":"Management",
+  "Marketing":"Advertising and Marketing",
+  "Transformation":"Management"
+};
+
+// Distinctive keywords per sector used to post-filter Muse/Adzuna results against
+// the candidate's selected sectors. Muse exposes no industry API, and Adzuna's
+// category taxonomy is too coarse, so we match against job text instead.
+const SECTOR_KEYWORDS = {
+  "Software & SaaS":["software","saas","platform"],
+  "Artificial Intelligence":["artificial intelligence","machine learning","llm","ai/ml"],
+  "Cybersecurity":["security","cyber","infosec"],
+  "Data & Analytics":["analytics","data science","bi platform"],
+  "Telecommunications":["telecom","telco","wireless","5g"],
+  "E-Commerce":["e-commerce","ecommerce","marketplace"],
+  "FinTech":["fintech","payments","neobank"],
+  "Banking & Financial Services":["bank","financial services","lending","credit"],
+  "Investment & Private Equity":["private equity","investment","portfolio"],
+  "Insurance":["insurance","insurtech","reinsurance","underwriting"],
+  "Healthcare & Medicine":["hospital","clinic","healthcare","patient care","medical"],
+  "Pharmaceuticals":["pharma","drug","clinical"],
+  "Medical Devices":["medical device","medtech"],
+  "HealthTech":["healthtech","digital health"],
+  "Biotechnology":["biotech","biopharma","genom"],
+  "Manufacturing":["manufacturing","factory","plant","production"],
+  "Logistics & Supply Chain":["logistics","supply chain","freight","shipping","warehouse"],
+  "Transportation":["transport","mobility","fleet","trucking"],
+  "Mining & Resources":["mining","metals","extraction"],
+  "Oil & Gas":["oil","gas","petroleum","upstream","downstream"],
+  "Automotive":["automotive","vehicle","ev "],
+  "Aerospace & Defence":["aerospace","defense","defence","aviation"],
+  "Agriculture & Agribusiness":["agri","farming","crop","livestock"],
+  "Food & Beverage":["food","beverage","restaurant"],
+  "FMCG":["fmcg","consumer goods","cpg"],
+  "Renewables & CleanTech":["renewable","clean energy","solar","wind","cleantech"],
+  "Utilities":["utility","grid","power"],
+  "Real Estate & Property":["real estate","property","reit"],
+  "Construction & Engineering":["construction","builder","infrastructure"],
+  "Media & Publishing":["media","publishing","news"],
+  "Gaming":["gaming","esports","game studio"],
+  "Tourism & Hospitality":["hospitality","hotel","travel","tourism"],
+  "Education & Academia":["education","university","school","edtech","academic"],
+  "Government & Public Sector":["government","public sector","ministry","federal"],
+  "Non-profit & NGO":["nonprofit","non-profit","ngo","charity","foundation"]
+};
+
+const keywordsForSectors = (sectors) => {
+  const words = new Set();
+  (sectors||[]).forEach(s => {
+    const kws = SECTOR_KEYWORDS[s];
+    if(kws) kws.forEach(k=>words.add(k.toLowerCase()));
+    else {
+      // fall back to the most distinctive word of the sector label
+      const first = (s||"").split(/[ &]/)[0];
+      if(first && first.length>3) words.add(first.toLowerCase());
+    }
+  });
+  return Array.from(words);
+};
+
+const matchesAnyKeyword = (text, keywords) => {
+  if(!keywords || keywords.length===0) return true;
+  const t = (text||"").toLowerCase();
+  return keywords.some(k => t.includes(k));
+};
+
+const deriveMuseCategory = ({ execFunction, profileTitle }) => {
+  if(execFunction && MUSE_CATEGORY_MAP[execFunction]) return MUSE_CATEGORY_MAP[execFunction];
+  const title = (profileTitle||"").toLowerCase();
+  if(/supply chain|logistics|operations|\bcoo\b|\bops\b/.test(title)) return "Business Operations";
+  if(/finance|\bcfo\b|controller|treasur/.test(title)) return "Accounting and Finance";
+  if(/\bcto\b|engineer|software|technology|\bai\b|data/.test(title)) return "Computer and IT";
+  if(/sales|revenue|\bcro\b|commercial|\bbd\b/.test(title)) return "Sales";
+  if(/marketing|\bcmo\b|brand/.test(title)) return "Advertising and Marketing";
+  if(/\bhr\b|people|\bchro\b|talent/.test(title)) return "HR";
+  if(/legal|counsel|compliance/.test(title)) return "Legal Services";
+  if(/strategy|transform|\bceo\b|managing director|general manager/.test(title)) return "Management";
+  return "";
+};
+
+const fetchMuseJobs = async ({ countryNames, profile, execFunction, sectors, module, onLog }) => {
   try {
     onLog && onLog("📡 Querying The Muse live job board…");
     const levels = ["Senior Level","Management","Director","Executive"];
     const params = new URLSearchParams();
     levels.forEach(l => params.append("level", l));
-    (countryNames||[]).slice(0,3).forEach(c => params.append("location", c));
-    if(execFunction) params.append("category", execFunction);
+    // Prefer city-level location from profile; fall back to country names.
+    const locs = [];
+    const profCity = (((profile&&profile.location)||"").split(",")[0]||"").trim();
+    if(profCity) locs.push(profCity);
+    (countryNames||[]).slice(0,3).forEach(c => { if(!locs.includes(c)) locs.push(c); });
+    locs.slice(0,4).forEach(l => params.append("location", l));
+    const cat = deriveMuseCategory({ execFunction, profileTitle: profile && profile.title });
+    if(cat) params.append("category", cat);
     params.append("page","0");
     const url = "https://www.themuse.com/api/public/jobs?" + params.toString();
     const res = await fetch(url);
     if(!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     const now = new Date().toISOString();
-    const out = (data.results||[]).slice(0,15).map((job,i)=>{
+    const sectorKws = keywordsForSectors(sectors);
+    const raw = (data.results||[]);
+    const filtered = sectorKws.length===0 ? raw : raw.filter(job => {
+      const hay = [job.name, job.company?.name, job.contents, (job.categories||[]).map(c=>c.name).join(" ")].join(" ");
+      return matchesAnyKeyword(hay, sectorKws);
+    });
+    const out = filtered.slice(0,15).map((job,i)=>{
       const loc = job.locations?.[0]?.name || "";
       const locParts = loc.split(",").map(s=>s.trim());
       const cleanedContent = (job.contents||"").replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();
@@ -1208,7 +1313,17 @@ const fetchMuseJobs = async ({ countryNames, execFunction, module, onLog }) => {
   }
 };
 
-const fetchAdzunaJobs = async ({ countryCodes, execFunction, minSalary, module, onLog }) => {
+// Distinct level phrases used in separate Adzuna requests. Adzuna treats a
+// literal "OR" token as part of a phrase match, so sending
+// "non-executive director OR board member" as `what` silently returns zero
+// results. Fanning out with one `what_phrase` request per term is the only
+// way to actually hit all of these titles.
+const ADZUNA_LEVEL_PHRASES = {
+  board: ["non-executive director","non executive director","board member","independent director","board director","chair"],
+  exec:  ["director","vice president","head of","chief officer","managing director","president"]
+};
+
+const fetchAdzunaJobs = async ({ countryCodes, profile, execFunction, sectors, minSalary, module, onLog }) => {
   const appId = storage.get("oos-adzuna-id") || "";
   const appKey = storage.get("oos-adzuna-key") || "";
   if(!appId || !appKey) {
@@ -1221,70 +1336,98 @@ const fetchAdzunaJobs = async ({ countryCodes, execFunction, minSalary, module, 
       .filter(Boolean)
       .slice(0,3);
     if(targets.length === 0) {
-      onLog && onLog("ℹ Adzuna: none of the selected countries are supported — skipping.");
+      onLog && onLog("ℹ Adzuna: none of the selected countries are supported on the free tier — skipping.");
       return [];
     }
     onLog && onLog("📡 Querying Adzuna across " + targets.join(", ").toUpperCase() + "…");
-    const levelTerms = module === "board"
-      ? "non-executive director OR board member OR NED OR chair"
-      : "director OR VP OR head of OR chief OR president";
-    const what = [execFunction, levelTerms].filter(Boolean).join(" ");
-    const perCountry = await Promise.all(targets.map(async (cc) => {
-      const p = new URLSearchParams({
-        app_id: appId, app_key: appKey,
-        results_per_page: "10", what,
-        "content-type": "application/json"
-      });
-      if(minSalary && Number(minSalary) > 0) p.append("salary_min", String(minSalary));
-      const url = "https://api.adzuna.com/v1/api/jobs/" + cc + "/search/1?" + p.toString();
-      const res = await fetch(url);
-      if(!res.ok) throw new Error(cc + " HTTP " + res.status);
-      return { cc, data: await res.json() };
-    }));
-    const now = new Date().toISOString();
-    const out = [];
-    perCountry.forEach(({cc, data}) => {
-      (data.results||[]).forEach(job => {
-        const salMin = job.salary_min ? Math.round(job.salary_min) : 0;
-        const salMax = job.salary_max ? Math.round(job.salary_max) : salMin;
-        const salRange = salMin ? ("$" + Math.round(salMin/1000) + "K–$" + Math.round(salMax/1000) + "K") : null;
-        out.push({
-          id: "lj-adz-" + (job.id || Date.now()+"-"+out.length),
-          name: job.company?.display_name || "Unknown Company",
-          jobTitle: job.title || "",
-          probableRole: job.title || "",
-          region: cc.toUpperCase(),
-          city: (job.location?.display_name||"").split(",")[0]?.trim() || "",
-          sector: job.category?.label || "",
-          status: module === "exec" ? "WARM" : "WATCH",
-          type: module === "board" ? "board" : "exec",
-          companyDescription: (job.description||"").slice(0, 260),
-          description: (job.description||"").slice(0, 260),
-          sentiment: 65,
-          tags: [job.category?.tag].filter(Boolean),
-          salary: salRange,
-          estimatedPackage: salRange,
-          estimatedFee: salRange,
-          annualUSD: salMin || 0,
-          packageBreakdown: salMin ? ("Base " + salRange + " (source: Adzuna listing)") : null,
-          fitReasons: [
-            "Verified live posting on Adzuna with published salary data — no estimation needed.",
-            "Apply directly via the source link; no warm introduction required to get on the radar."
-          ],
-          hiringSignal: "Active public job posting with disclosed compensation",
-          whyNow: job.created ? ("Posted " + new Date(job.created).toLocaleDateString() + " — application window is open.") : "Currently live on Adzuna.",
-          sourceUrl: job.redirect_url || "",
-          applyUrl: job.redirect_url || "",
-          sourceName: "Adzuna",
-          jobBoardSource: "Adzuna",
-          dataSource: "live_posting",
-          postedDate: job.created || null,
-          scannedAt: now,
-          moduleTag: module === "board" ? "Board" : "Exec Role"
+    const phrases = ADZUNA_LEVEL_PHRASES[module==="board"?"board":"exec"];
+    // what_and = space-separated AND words, single tokens only (no phrases).
+    const andTokens = [];
+    if(execFunction) (execFunction||"").split(/\s+/).forEach(w=>{ if(w.length>2) andTokens.push(w.toLowerCase()); });
+    const whatAnd = andTokens.join(" ");
+    const sectorWords = keywordsForSectors(sectors);
+
+    const reqs = [];
+    targets.forEach(cc => {
+      phrases.forEach(phrase => {
+        const p = new URLSearchParams({
+          app_id: appId, app_key: appKey,
+          results_per_page: "15",
+          what_phrase: phrase,
+          "content-type": "application/json"
         });
+        if(whatAnd) p.append("what_and", whatAnd);
+        if(minSalary && Number(minSalary) > 0) p.append("salary_min", String(minSalary));
+        const url = "https://api.adzuna.com/v1/api/jobs/" + cc + "/search/1?" + p.toString();
+        reqs.push(
+          fetch(url)
+            .then(r => r.ok ? r.json().then(d=>({cc, data:d})) : null)
+            .catch(()=>null)
+        );
       });
     });
-    onLog && onLog("✓ Adzuna returned " + out.length + " live postings");
+    const settled = await Promise.all(reqs);
+    const now = new Date().toISOString();
+    const seen = new Set();
+    const collected = [];
+    settled.forEach(entry => {
+      if(!entry || !entry.data) return;
+      const { cc, data } = entry;
+      (data.results||[]).forEach(job => {
+        const key = String(job.id||"") + "|" + cc;
+        if(seen.has(key)) return;
+        seen.add(key);
+        collected.push({ cc, job });
+      });
+    });
+    // Post-filter by sector keywords when the user selected specific sectors.
+    const sectorFiltered = sectorWords.length===0
+      ? collected
+      : collected.filter(({job}) => matchesAnyKeyword(
+          [job.title, job.description, job.company?.display_name, job.category?.label].join(" "),
+          sectorWords
+        ));
+
+    const out = sectorFiltered.slice(0,30).map(({cc,job},outIdx)=>{
+      const salMin = job.salary_min ? Math.round(job.salary_min) : 0;
+      const salMax = job.salary_max ? Math.round(job.salary_max) : salMin;
+      const salRange = salMin ? ("$" + Math.round(salMin/1000) + "K–$" + Math.round(salMax/1000) + "K") : null;
+      return {
+        id: "lj-adz-" + (job.id || Date.now()+"-"+outIdx),
+        name: job.company?.display_name || "Unknown Company",
+        jobTitle: job.title || "",
+        probableRole: job.title || "",
+        region: cc.toUpperCase(),
+        city: (job.location?.display_name||"").split(",")[0]?.trim() || "",
+        sector: job.category?.label || "",
+        status: module === "exec" ? "WARM" : "WATCH",
+        type: module === "board" ? "board" : "exec",
+        companyDescription: (job.description||"").slice(0, 260),
+        description: (job.description||"").slice(0, 260),
+        sentiment: 65,
+        tags: [job.category?.tag].filter(Boolean),
+        salary: salRange,
+        estimatedPackage: salRange,
+        estimatedFee: salRange,
+        annualUSD: salMin || 0,
+        packageBreakdown: salMin ? ("Base " + salRange + " (source: Adzuna listing)") : null,
+        fitReasons: [
+          "Verified live posting on Adzuna with published salary data — no estimation needed.",
+          "Apply directly via the source link; no warm introduction required to get on the radar."
+        ],
+        hiringSignal: "Active public job posting with disclosed compensation",
+        whyNow: job.created ? ("Posted " + new Date(job.created).toLocaleDateString() + " — application window is open.") : "Currently live on Adzuna.",
+        sourceUrl: job.redirect_url || "",
+        applyUrl: job.redirect_url || "",
+        sourceName: "Adzuna",
+        jobBoardSource: "Adzuna",
+        dataSource: "live_posting",
+        postedDate: job.created || null,
+        scannedAt: now,
+        moduleTag: module === "board" ? "Board" : "Exec Role"
+      };
+    });
+    onLog && onLog("✓ Adzuna returned " + out.length + " live postings" + (sectorWords.length?" (sector-filtered)":""));
     return out;
   } catch(e) {
     onLog && onLog("✗ Adzuna: " + (e.message||"fetch failed"));
@@ -1292,18 +1435,103 @@ const fetchAdzunaJobs = async ({ countryCodes, execFunction, minSalary, module, 
   }
 };
 
-// Orchestrator: fan out to all enabled sources in parallel.
-const fetchLiveJobs = async ({ module, countryCodes, execFunction, minSalary, onLog }) => {
+// Orchestrator: fan out to the sources enabled for this module.
+// Board Scout → Adzuna only. The Muse has no real NED/board listings — its
+// "Director / Executive" levels are all operational roles, and surfacing them
+// under Board Scout polluted the tab with misfiled jobs.
+// Executive Search → The Muse + Adzuna.
+const fetchLiveJobs = async ({ module, countryCodes, sectors, profile, execFunction, minSalary, onLog }) => {
   const countryNames = (countryCodes||[]).map(code => {
     const found = (typeof ALL_COUNTRIES_FLAT !== "undefined")
       ? ALL_COUNTRIES_FLAT.find(x => x.code === code) : null;
     return found ? found.name : code;
   });
-  const [muse, adzuna] = await Promise.all([
-    fetchMuseJobs({ countryNames, execFunction, module, onLog }),
-    fetchAdzunaJobs({ countryCodes, execFunction, minSalary, module, onLog })
-  ]);
+  const adzunaP = fetchAdzunaJobs({ countryCodes, profile, execFunction, sectors, minSalary, module, onLog });
+  const museP = module === "exec"
+    ? fetchMuseJobs({ countryNames, profile, execFunction, sectors, module, onLog })
+    : Promise.resolve([]);
+  const [muse, adzuna] = await Promise.all([museP, adzunaP]);
   return [...muse, ...adzuna];
+};
+
+// Live-source status helper for the module config panels — shows which live
+// sources will actually run given current credentials + country selection.
+const getLiveSourceStatus = ({ module, countryCodes }) => {
+  const out = [];
+  if(module === "exec") out.push({ name:"The Muse", status:"ready", note:"no key required" });
+  const hasKeys = !!(storage.get("oos-adzuna-id") && storage.get("oos-adzuna-key"));
+  const supported = (countryCodes||[]).some(c => ADZUNA_COUNTRY_MAP[(c||"").toUpperCase()]);
+  if(!hasKeys) out.push({ name:"Adzuna", status:"missing", note:"add credentials in Settings" });
+  else if(!supported) out.push({ name:"Adzuna", status:"unsupported", note:"selected countries not on free tier" });
+  else out.push({ name:"Adzuna", status:"ready", note:"configured" });
+  return out;
+};
+
+// LLM re-rank pass. Takes merged results (AI + live) and scores each against
+// the candidate profile using a module-specific rubric (board vs exec). The
+// result is re-sorted by fit and low-fit items are demoted. Fails open — if
+// the LLM call errors, the original list is returned unchanged.
+const rerankWithLLM = async ({ results, profile, module, apiKey, provider, onLog }) => {
+  if(!apiKey || !results || results.length===0) return results;
+  try {
+    onLog && onLog("🧠 Re-ranking " + Math.min(results.length,30) + " opportunities against your profile…");
+    const capped = results.slice(0,30);
+    const compact = capped.map((r,i)=>({
+      i,
+      name: r.name,
+      role: r.probableRole || r.jobTitle || "",
+      sector: r.sector || "",
+      region: r.region || "",
+      source: r.dataSource || "ai_signal",
+      signal: r.hiringSignal || r.whyNow || "",
+      snippet: (r.companyDescription||r.description||"").slice(0,220)
+    }));
+    const profileBlob = "NAME: " + (profile.name||"User") +
+      "\nCURRENT ROLE: " + (profile.title||"") +
+      "\nLOCATION: " + (profile.location||"") +
+      "\nTARGET REGIONS: " + ((profile.regions||[]).join(", ")) +
+      "\nSUMMARY: " + ((profile.summary||"").slice(0,400)) +
+      "\nHIGHLIGHTS: " + ((profile.highlights||[]).slice(0,6).join("; ")) +
+      "\nBOARD VALUE PROP: " + ((profile.boardValue||"").slice(0,300));
+    const rubric = module==="board"
+      ? "Score each opportunity on how well it matches this candidate as a NON-EXECUTIVE BOARD or ADVISORY seat — NOT an operational role. Down-weight anything that is clearly a full-time executive job, an entry/mid-level position, or a role the candidate would already be over-qualified for. Up-weight: independent director seats, board advisory roles, chair positions, audit/risk/remuneration committee fits, roles in sectors or geographies the candidate already knows."
+      : "Score each opportunity on how well it matches this candidate as a senior EXECUTIVE hire (director, VP, C-suite). Down-weight: junior roles, individual contributor roles, roles below the candidate's current seniority, roles in irrelevant functions. Up-weight: roles matching the candidate's function, comparable or larger scope than their current remit, strong compensation signals, and recent hiring signals.";
+
+    const sys = "You are a JSON API endpoint. Return ONLY a raw JSON array. No markdown, no prose.";
+    const prompt = rubric + "\n\nCANDIDATE:\n" + profileBlob +
+      "\n\nOPPORTUNITIES (index → summary):\n" + JSON.stringify(compact) +
+      "\n\nFor each opportunity, return an object: " +
+      "{\"i\":<index>,\"score\":<0-100>,\"reason\":\"one short sentence in second person (You...) explaining the fit or mismatch\"}" +
+      "\n\nReturn ONLY a JSON array of these objects, one per opportunity. OUTPUT ONLY JSON.";
+
+    const raw = await callLLM(provider, apiKey, [{role:"user",content:prompt}], [], sys, "RERANK", ()=>{});
+    const scores = extractJSON(raw);
+    if(!Array.isArray(scores)) return results;
+    const scoreMap = new Map();
+    scores.forEach(s => { if(s && typeof s.i==="number") scoreMap.set(s.i, s); });
+    const scored = capped.map((r,i) => {
+      const s = scoreMap.get(i);
+      if(!s) return { ...r, rerankScore: 0, rerankReason: "" };
+      const score = Math.max(0, Math.min(100, Number(s.score)||0));
+      const reason = s.reason || "";
+      const fit = [reason, ...(r.fitReasons||[])].filter(Boolean).slice(0,4);
+      return {
+        ...r,
+        rerankScore: score,
+        rerankReason: reason,
+        fitReasons: fit,
+        sentiment: Math.max(r.sentiment||0, Math.min(95, Math.round(score*0.9)))
+      };
+    });
+    scored.sort((a,b)=>(b.rerankScore||0)-(a.rerankScore||0));
+    const tail = results.slice(30);
+    const dropped = scored.filter(r => (r.rerankScore||0) < 25).length;
+    onLog && onLog("✓ Re-rank complete — " + (scored.length - dropped) + " relevant / " + dropped + " low-fit");
+    return [...scored, ...tail];
+  } catch(e) {
+    onLog && onLog("⚠ Re-rank skipped: " + (e.message||"failed"));
+    return results;
+  }
 };
 
 // Merge AI-generated results with live postings. When an AI signal matches a
@@ -1748,6 +1976,28 @@ const ScanLog = ({log,onClear,t}) => (
   </div>:null
 );
 
+// ─── SHARED: LIVE SOURCE STATUS ───────────────────────────────────────────────
+// Rendered under the "Include live postings" toggle so users can see at a glance
+// which live-job sources will actually run with their current config.
+const LiveSourceStatus = ({ module, countryCodes, liveJobs, t }) => {
+  if(!liveJobs) return null;
+  const sources = getLiveSourceStatus({ module, countryCodes });
+  if(sources.length===0) return null;
+  const colorFor = st => st==="ready" ? "#6ee7b7" : st==="missing" ? "#f59e0b" : "#94a3b8";
+  return (
+    <div style={{marginTop:-4,marginBottom:10,padding:"6px 8px",background:t.input,border:"1px solid "+t.border,borderRadius:6}}>
+      <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.06em",color:t.textDim,marginBottom:3}}>LIVE SOURCES</div>
+      {sources.map((s,i)=>(
+        <div key={i} style={{display:"flex",alignItems:"center",gap:6,fontSize:11,padding:"1px 0"}}>
+          <span style={{color:colorFor(s.status),fontWeight:700,fontSize:13,lineHeight:1}}>{s.status==="ready"?"●":"○"}</span>
+          <span style={{fontWeight:600,color:t.text}}>{s.name}</span>
+          <span style={{color:t.textMuted}}>— {s.note}</span>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 // ─── MODULE: BOARD SCOUT ──────────────────────────────────────────────────────
 const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,onLogActivity,activityLog,
   boardResults,setBoardResults,consultResults,setConsultResults,
@@ -1795,7 +2045,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     const bCall=callLLM(provider,apiKey,[{role:"user",content:boardPrompt}],useSearch,sys,"BOARD",(m)=>setScanLog(p=>[...p,m])).then(extractJSON);
     const cCall=callLLM(provider,apiKey,[{role:"user",content:consultPrompt}],useSearch,sys,"CONSULTING",(m)=>setScanLog(p=>[...p,m])).then(extractJSON);
     const liveCall = liveJobs
-      ? fetchLiveJobs({ module:"board", countryCodes: countries, execFunction:"", minSalary:0, onLog:(m)=>setScanLog(p=>[...p,m]) })
+      ? fetchLiveJobs({ module:"board", countryCodes: countries, sectors: selectedSectors, profile, execFunction:"", minSalary:0, onLog:(m)=>setScanLog(p=>[...p,m]) })
       : Promise.resolve([]);
     try {
     const results=await Promise.allSettled([bCall,cCall,liveCall]);
@@ -1803,7 +2053,8 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     const liveResults = results[2].status==="fulfilled" ? results[2].value : [];
     if(results[0].status==="fulfilled"){
       const aiBr=results[0].value.map((v,i)=>({...v,id:"b-"+Date.now()+"-"+i,moduleTag:"Board",scannedAt:now,dataSource:v.dataSource||"ai_signal"}));
-      const br = mergeLiveAndAiResults(aiBr, liveResults);
+      let br = mergeLiveAndAiResults(aiBr, liveResults);
+      br = await rerankWithLLM({ results: br, profile, module:"board", apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
       setBoardResults(br);storage.set("bs-results",br);
       const liveCount = br.filter(x=>x.dataSource==="live_posting").length;
       const verifiedCount = br.filter(x=>x.dataSource==="verified").length;
@@ -1811,7 +2062,10 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     }
     else {
       setScanLog(p=>[...p,"✗ Board: "+results[0].reason?.message]);
-      if(liveResults.length>0){ setBoardResults(liveResults);storage.set("bs-results",liveResults);setScanLog(p=>[...p,"✓ Showing "+liveResults.length+" live postings only"]); }
+      if(liveResults.length>0){
+        let only = await rerankWithLLM({ results: liveResults, profile, module:"board", apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
+        setBoardResults(only);storage.set("bs-results",only);setScanLog(p=>[...p,"✓ Showing "+only.length+" live postings only"]);
+      }
     }
     if(results[1].status==="fulfilled"){const cr=results[1].value.map((v,i)=>({...v,id:"c-"+Date.now()+"-"+i,moduleTag:"Consulting",scannedAt:now,dataSource:"ai_signal"}));setConsultResults(cr);storage.set("bs-consult-results",cr);setScanLog(p=>[...p,"✓ "+cr.length+" consulting opportunities"]);}
     else setScanLog(p=>[...p,"✗ Consulting: "+results[1].reason?.message]);
@@ -1819,7 +2073,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     setScanLog(p=>[...p,"Scan complete."]);
   } catch(err){ if(err.name!=="AbortError") setScanLog(p=>[...p,"✗ Error: "+err.message]); }
   finally { setLoading(false); }
-  },[apiKey,provider,selectedCountryNames,selectedSectors,profileCtx,expertiseSummary,keySkills,liveJobs,countries]);
+  },[apiKey,provider,selectedCountryNames,selectedSectors,profileCtx,expertiseSummary,keySkills,liveJobs,countries,profile]);
 
   const saveOpp=(item)=>{
     if(saved.some(s=>s.name===item.name&&s.region===item.region)) return;
@@ -1858,6 +2112,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
               <div style={{fontSize:11,color:t.textMuted,lineHeight:1.4}}>Blend real job-board listings with AI signals</div>
             </div>
           </label>
+          <LiveSourceStatus module="board" countryCodes={countries} liveJobs={liveJobs} t={t}/>
           <button onClick={loading?cancelScan:runScan} disabled={!loading&&(!apiKey||countries.length===0)} style={{...btn0,width:"100%",padding:14,borderRadius:8,fontSize:15,fontWeight:700,color:"#fff",background:loading?"#ef4444":(!apiKey||countries.length===0)?t.textDim:"linear-gradient(135deg,"+moduleColor+",#059669)",display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"background 0.2s"}}>
             {loading?<><Ic.Loader2 size={15} style={{animation:"spin 0.8s linear infinite"}}/> Cancel</>:<><Ic.Search size={15}/> {bsLastScanned?"Rescan":"Run Scan"}</>}
           </button>
@@ -2071,7 +2326,7 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
 
     const aiCall = callLLM(provider,apiKey,[{role:"user",content:prompt}],useSearch,sys,"EXEC",(m)=>setScanLog(p=>[...p,m])).then(extractJSON);
     const liveCall = liveJobs
-      ? fetchLiveJobs({ module:"exec", countryCodes: countries, execFunction, minSalary: minPackage, onLog:(m)=>setScanLog(p=>[...p,m]) })
+      ? fetchLiveJobs({ module:"exec", countryCodes: countries, sectors: selectedSectors, profile, execFunction, minSalary: minPackage, onLog:(m)=>setScanLog(p=>[...p,m]) })
       : Promise.resolve([]);
     try {
       const [aiRes, liveRes] = await Promise.allSettled([aiCall, liveCall]);
@@ -2089,13 +2344,14 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
         setScanLog(p=>[...p,"✗ AI scan failed: "+(aiRes.reason?.message||"unknown")]);
         if(liveResults.length>0) setScanLog(p=>[...p,"✓ Showing "+liveResults.length+" live postings only"]);
       }
+      merged = await rerankWithLLM({ results: merged, profile, module:"exec", apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
       setEsResults(merged);
       storage.set("es-results",merged);
       storage.set("es-last-scanned",now);
       setEsLastScanned(now);
     } catch(e){ setScanLog(p=>[...p,"✗ "+e.message]); }
     finally { setScanLog(p=>[...p,"Scan complete."]); setLoading(false); }
-  },[apiKey,provider,selectedCountryNames,selectedSectors,execFunction,minPackage,scope,profileCtx,liveJobs,countries]);
+  },[apiKey,provider,selectedCountryNames,selectedSectors,execFunction,minPackage,scope,profileCtx,liveJobs,countries,profile]);
 
   const saveOpp=(item)=>{
     if(saved.some(s=>s.name===item.name&&s.region===item.region)) return;
@@ -2150,6 +2406,7 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
               <div style={{fontSize:11,color:t.textMuted,lineHeight:1.4}}>Blend real job-board listings with AI hiring signals</div>
             </div>
           </label>
+          <LiveSourceStatus module="exec" countryCodes={countries} liveJobs={liveJobs} t={t}/>
           <button onClick={loading?()=>{setLoading(false);setScanLog(p=>[...p,"⛔ Cancelled."]);}:runScan} disabled={!loading&&(!apiKey||countries.length===0)} style={{...btn0,width:"100%",padding:14,borderRadius:8,fontSize:15,fontWeight:700,color:"#fff",background:loading?"#ef4444":(!apiKey||countries.length===0)?t.textDim:"linear-gradient(135deg,"+moduleColor+",#9333ea)",display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"background 0.2s"}}>
             {loading?<><Ic.Loader2 size={15} style={{animation:"spin 0.8s linear infinite"}}/> Cancel</>:<><Ic.Search size={15}/> {esLastScanned?"Rescan":"Find Roles"}</>}
           </button>
