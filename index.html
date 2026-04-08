@@ -1471,7 +1471,7 @@ const getLiveSourceStatus = ({ module, countryCodes }) => {
 // the candidate profile using a module-specific rubric (board vs exec). The
 // result is re-sorted by fit and low-fit items are demoted. Fails open — if
 // the LLM call errors, the original list is returned unchanged.
-const rerankWithLLM = async ({ results, profile, module, apiKey, provider, onLog }) => {
+const rerankWithLLM = async ({ results, profile, module, execFunction, sectors, apiKey, provider, onLog }) => {
   if(!apiKey || !results || results.length===0) return results;
   try {
     onLog && onLog("🧠 Re-ranking " + Math.min(results.length,30) + " opportunities against your profile…");
@@ -1493,15 +1493,29 @@ const rerankWithLLM = async ({ results, profile, module, apiKey, provider, onLog
       "\nSUMMARY: " + ((profile.summary||"").slice(0,400)) +
       "\nHIGHLIGHTS: " + ((profile.highlights||[]).slice(0,6).join("; ")) +
       "\nBOARD VALUE PROP: " + ((profile.boardValue||"").slice(0,300));
+
+    // HARD FILTERS the user explicitly set in the module config. The reranker
+    // must treat these as pass/fail, not preferences — this is what stops
+    // healthcare roles sneaking into a "Supply Chain + Manufacturing" scan.
+    const sectorList = (sectors||[]).slice(0,20);
+    const constraintsBlob = "HARD USER FILTERS (these are NOT preferences — they are requirements the user explicitly set in the module config):\n" +
+      "- Function focus: " + (execFunction || "(none selected)") + "\n" +
+      "- Selected industry sectors: " + (sectorList.length ? sectorList.join("; ") : "(all sectors)") + "\n" +
+      "\nRULES:\n" +
+      "1. If a function focus is set, ANY opportunity that is clearly in a different function (e.g. healthcare/nursing when function = Supply Chain) MUST receive a score of 0–15. Do not be generous.\n" +
+      "2. If specific sectors are listed, ANY opportunity that is clearly in a different sector MUST receive a score of 0–15. Adjacent sectors can score up to 40. Only on-sector opportunities can score 60+.\n" +
+      "3. An opportunity only qualifies for a score of 70+ if it matches BOTH the function AND one of the selected sectors AND the seniority level.\n" +
+      "4. Be ruthless. It is better to drop a borderline match than to surface a clearly off-target role.";
+
     const rubric = module==="board"
       ? "Score each opportunity on how well it matches this candidate as a NON-EXECUTIVE BOARD or ADVISORY seat — NOT an operational role. Down-weight anything that is clearly a full-time executive job, an entry/mid-level position, or a role the candidate would already be over-qualified for. Up-weight: independent director seats, board advisory roles, chair positions, audit/risk/remuneration committee fits, roles in sectors or geographies the candidate already knows."
       : "Score each opportunity on how well it matches this candidate as a senior EXECUTIVE hire (director, VP, C-suite). Down-weight: junior roles, individual contributor roles, roles below the candidate's current seniority, roles in irrelevant functions. Up-weight: roles matching the candidate's function, comparable or larger scope than their current remit, strong compensation signals, and recent hiring signals.";
 
     const sys = "You are a JSON API endpoint. Return ONLY a raw JSON array. No markdown, no prose.";
-    const prompt = rubric + "\n\nCANDIDATE:\n" + profileBlob +
+    const prompt = rubric + "\n\n" + constraintsBlob + "\n\nCANDIDATE:\n" + profileBlob +
       "\n\nOPPORTUNITIES (index → summary):\n" + JSON.stringify(compact) +
       "\n\nFor each opportunity, return an object: " +
-      "{\"i\":<index>,\"score\":<0-100>,\"reason\":\"one short sentence in second person (You...) explaining the fit or mismatch\"}" +
+      "{\"i\":<index>,\"score\":<0-100>,\"reason\":\"one short sentence in second person (You...) explaining the fit or — if the score is below 30 — specifically naming which hard filter failed (function mismatch / sector mismatch / seniority mismatch)\"}" +
       "\n\nReturn ONLY a JSON array of these objects, one per opportunity. OUTPUT ONLY JSON.";
 
     const raw = await callLLM(provider, apiKey, [{role:"user",content:prompt}], [], sys, "RERANK", ()=>{});
@@ -1511,7 +1525,7 @@ const rerankWithLLM = async ({ results, profile, module, apiKey, provider, onLog
     scores.forEach(s => { if(s && typeof s.i==="number") scoreMap.set(s.i, s); });
     const scored = capped.map((r,i) => {
       const s = scoreMap.get(i);
-      if(!s) return { ...r, rerankScore: 0, rerankReason: "" };
+      if(!s) return { ...r, rerankScore: null, rerankReason: "" };
       const score = Math.max(0, Math.min(100, Number(s.score)||0));
       const reason = s.reason || "";
       const fit = [reason, ...(r.fitReasons||[])].filter(Boolean).slice(0,4);
@@ -1520,14 +1534,22 @@ const rerankWithLLM = async ({ results, profile, module, apiKey, provider, onLog
         rerankScore: score,
         rerankReason: reason,
         fitReasons: fit,
-        sentiment: Math.max(r.sentiment||0, Math.min(95, Math.round(score*0.9)))
+        // Use the rerank score as the authoritative relevance score — do NOT
+        // fall back to the hardcoded source sentiment, which was masking
+        // low-fit items with a 65 default from Adzuna.
+        sentiment: score
       };
     });
-    scored.sort((a,b)=>(b.rerankScore||0)-(a.rerankScore||0));
+    // HARD DROP anything below the relevance threshold. Previously we sorted
+    // low-fit items to the bottom but still surfaced them — that's what let
+    // HCA Healthcare show up in a Supply Chain scan.
+    const RELEVANCE_THRESHOLD = 30;
+    const kept = scored.filter(r => (r.rerankScore||0) >= RELEVANCE_THRESHOLD);
+    const dropped = scored.length - kept.length;
+    kept.sort((a,b)=>(b.rerankScore||0)-(a.rerankScore||0));
     const tail = results.slice(30);
-    const dropped = scored.filter(r => (r.rerankScore||0) < 25).length;
-    onLog && onLog("✓ Re-rank complete — " + (scored.length - dropped) + " relevant / " + dropped + " low-fit");
-    return [...scored, ...tail];
+    onLog && onLog("✓ Re-rank complete — " + kept.length + " relevant / " + dropped + " dropped (below " + RELEVANCE_THRESHOLD + " fit score)");
+    return [...kept, ...tail];
   } catch(e) {
     onLog && onLog("⚠ Re-rank skipped: " + (e.message||"failed"));
     return results;
@@ -2054,7 +2076,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     if(results[0].status==="fulfilled"){
       const aiBr=results[0].value.map((v,i)=>({...v,id:"b-"+Date.now()+"-"+i,moduleTag:"Board",scannedAt:now,dataSource:v.dataSource||"ai_signal"}));
       let br = mergeLiveAndAiResults(aiBr, liveResults);
-      br = await rerankWithLLM({ results: br, profile, module:"board", apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
+      br = await rerankWithLLM({ results: br, profile, module:"board", execFunction:"", sectors: allSectors ? [] : sectors, apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
       setBoardResults(br);storage.set("bs-results",br);
       const liveCount = br.filter(x=>x.dataSource==="live_posting").length;
       const verifiedCount = br.filter(x=>x.dataSource==="verified").length;
@@ -2063,7 +2085,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     else {
       setScanLog(p=>[...p,"✗ Board: "+results[0].reason?.message]);
       if(liveResults.length>0){
-        let only = await rerankWithLLM({ results: liveResults, profile, module:"board", apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
+        let only = await rerankWithLLM({ results: liveResults, profile, module:"board", execFunction:"", sectors: allSectors ? [] : sectors, apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
         setBoardResults(only);storage.set("bs-results",only);setScanLog(p=>[...p,"✓ Showing "+only.length+" live postings only"]);
       }
     }
@@ -2073,7 +2095,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     setScanLog(p=>[...p,"Scan complete."]);
   } catch(err){ if(err.name!=="AbortError") setScanLog(p=>[...p,"✗ Error: "+err.message]); }
   finally { setLoading(false); }
-  },[apiKey,provider,selectedCountryNames,selectedSectors,profileCtx,expertiseSummary,keySkills,liveJobs,countries,profile]);
+  },[apiKey,provider,selectedCountryNames,selectedSectors,profileCtx,expertiseSummary,keySkills,liveJobs,countries,profile,sectors,allSectors]);
 
   const saveOpp=(item)=>{
     if(saved.some(s=>s.name===item.name&&s.region===item.region)) return;
@@ -2344,14 +2366,14 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
         setScanLog(p=>[...p,"✗ AI scan failed: "+(aiRes.reason?.message||"unknown")]);
         if(liveResults.length>0) setScanLog(p=>[...p,"✓ Showing "+liveResults.length+" live postings only"]);
       }
-      merged = await rerankWithLLM({ results: merged, profile, module:"exec", apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
+      merged = await rerankWithLLM({ results: merged, profile, module:"exec", execFunction, sectors: allSectors ? [] : sectors, apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
       setEsResults(merged);
       storage.set("es-results",merged);
       storage.set("es-last-scanned",now);
       setEsLastScanned(now);
     } catch(e){ setScanLog(p=>[...p,"✗ "+e.message]); }
     finally { setScanLog(p=>[...p,"Scan complete."]); setLoading(false); }
-  },[apiKey,provider,selectedCountryNames,selectedSectors,execFunction,minPackage,scope,profileCtx,liveJobs,countries,profile]);
+  },[apiKey,provider,selectedCountryNames,selectedSectors,execFunction,minPackage,scope,profileCtx,liveJobs,countries,profile,sectors,allSectors]);
 
   const saveOpp=(item)=>{
     if(saved.some(s=>s.name===item.name&&s.region===item.region)) return;
