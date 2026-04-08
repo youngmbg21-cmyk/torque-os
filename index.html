@@ -1245,18 +1245,51 @@ const deriveMuseCategory = ({ execFunction, profileTitle }) => {
   return "";
 };
 
+// Post-hoc sector derivation: instead of displaying the raw API category
+// label (Adzuna's "Engineering Jobs" / Muse's "Engineering"), find the first
+// TorqueOS sector whose keywords appear in the job text. Prefer sectors the
+// user actively selected so the card sector pill matches their mental model.
+const deriveSectorFromText = (text, selectedSectors) => {
+  const t = (text||"").toLowerCase();
+  if(!t) return "";
+  const candidates = (selectedSectors && selectedSectors.length>0) ? selectedSectors : Object.keys(SECTOR_KEYWORDS);
+  for(const s of candidates) {
+    const kws = SECTOR_KEYWORDS[s];
+    if(kws && kws.some(k => t.includes(k.toLowerCase()))) return s;
+  }
+  // Fall back to a one-word hint drawn from the candidate sector labels.
+  for(const s of candidates) {
+    const first = (s||"").split(/[ &]/)[0];
+    if(first && first.length>3 && t.includes(first.toLowerCase())) return s;
+  }
+  return "";
+};
+
+// Build a contextual "why this opportunity" list for a live posting that
+// actually references the role, company, sector and salary — not the
+// generic "verified live posting" boilerplate we used to ship.
+const buildLiveFitReasons = ({ roleTitle, companyName, derivedSector, salaryRange, sourceLabel, matchedFunction }) => {
+  const reasons = [];
+  if(roleTitle && companyName) {
+    reasons.push(`${roleTitle} at ${companyName}${matchedFunction?` aligns with your ${matchedFunction} function focus`:``}${derivedSector?` in ${derivedSector}`:``}.`);
+  } else if(roleTitle) {
+    reasons.push(`${roleTitle}${derivedSector?` in ${derivedSector}`:``} — check alignment with your current scope.`);
+  }
+  if(salaryRange) reasons.push(`Published total comp: ${salaryRange}.`);
+  reasons.push(`Verified ${sourceLabel||"live"} posting — apply directly via the source link, no warm introduction needed.`);
+  return reasons;
+};
+
 const fetchMuseJobs = async ({ countryNames, profile, execFunction, sectors, module, onLog }) => {
   try {
     onLog && onLog("📡 Querying The Muse live job board…");
     const levels = ["Senior Level","Management","Director","Executive"];
     const params = new URLSearchParams();
     levels.forEach(l => params.append("level", l));
-    // Prefer city-level location from profile; fall back to country names.
-    const locs = [];
-    const profCity = (((profile&&profile.location)||"").split(",")[0]||"").trim();
-    if(profCity) locs.push(profCity);
-    (countryNames||[]).slice(0,3).forEach(c => { if(!locs.includes(c)) locs.push(c); });
-    locs.slice(0,4).forEach(l => params.append("location", l));
+    // IMPORTANT: only use the user's selected countries. Do NOT inject the
+    // candidate's profile city — that caused Stockholm-based users to see
+    // European Muse jobs leaking into an Americas-only scan.
+    (countryNames||[]).slice(0,3).forEach(c => params.append("location", c));
     const cat = deriveMuseCategory({ execFunction, profileTitle: profile && profile.title });
     if(cat) params.append("category", cat);
     params.append("page","0");
@@ -1267,7 +1300,18 @@ const fetchMuseJobs = async ({ countryNames, profile, execFunction, sectors, mod
     const now = new Date().toISOString();
     const sectorKws = keywordsForSectors(sectors);
     const raw = (data.results||[]);
-    const filtered = sectorKws.length===0 ? raw : raw.filter(job => {
+    // Muse's location filter is notoriously loose, so drop anything that is
+    // not actually in one of the user's target countries.
+    const targetCountries = new Set((countryNames||[]).map(n=>(n||"").toLowerCase()));
+    const geoFiltered = targetCountries.size===0 ? raw : raw.filter(job => {
+      const locs = (job.locations||[]).map(l => (l.name||"").toLowerCase());
+      if(locs.length===0) return false;
+      return locs.some(l => {
+        for(const tc of targetCountries) { if(l.includes(tc)) return true; }
+        return false;
+      });
+    });
+    const filtered = sectorKws.length===0 ? geoFiltered : geoFiltered.filter(job => {
       const hay = [job.name, job.company?.name, job.contents, (job.categories||[]).map(c=>c.name).join(" ")].join(" ");
       return matchesAnyKeyword(hay, sectorKws);
     });
@@ -1275,24 +1319,28 @@ const fetchMuseJobs = async ({ countryNames, profile, execFunction, sectors, mod
       const loc = job.locations?.[0]?.name || "";
       const locParts = loc.split(",").map(s=>s.trim());
       const cleanedContent = (job.contents||"").replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();
+      const roleTitle = job.name || "";
+      const companyName = job.company?.name || "Unknown Company";
+      const derivedSector = deriveSectorFromText([roleTitle, companyName, cleanedContent].join(" "), sectors);
       return {
         id: "lj-muse-" + (job.id || Date.now()+"-"+i),
-        name: job.company?.name || "Unknown Company",
-        jobTitle: job.name || "",
-        probableRole: job.name || "",
+        name: companyName,
+        jobTitle: roleTitle,
+        probableRole: roleTitle,
         region: locParts[locParts.length-1] || (countryNames?.[0]||""),
         city: locParts[0] || "",
-        sector: job.categories?.[0]?.name || "",
+        sector: derivedSector || "",
         status: module === "exec" ? "WARM" : "WATCH",
         type: module === "board" ? "board" : "exec",
         companyDescription: cleanedContent.slice(0, 260),
         description: cleanedContent.slice(0, 260),
         sentiment: 60,
-        tags: (job.categories||[]).map(c=>c.name).slice(0,3),
-        fitReasons: [
-          "Live posting on The Muse — you can apply directly without a warm introduction.",
-          "Verified active vacancy, not an AI-inferred signal, so timing is known."
-        ],
+        tags: derivedSector ? [derivedSector] : [],
+        fitReasons: buildLiveFitReasons({
+          roleTitle, companyName, derivedSector,
+          salaryRange: null, sourceLabel: "The Muse",
+          matchedFunction: execFunction || ""
+        }),
         hiringSignal: "Active public job posting",
         whyNow: job.publication_date ? ("Posted " + new Date(job.publication_date).toLocaleDateString() + " — application window is open.") : "Currently live on The Muse.",
         sourceUrl: job.refs?.landing_page || "",
@@ -1305,7 +1353,7 @@ const fetchMuseJobs = async ({ countryNames, profile, execFunction, sectors, mod
         moduleTag: module === "board" ? "Board" : "Exec Role"
       };
     });
-    onLog && onLog("✓ The Muse returned " + out.length + " live postings");
+    onLog && onLog("✓ The Muse returned " + out.length + " live postings" + (raw.length>out.length?(" ("+(raw.length-out.length)+" dropped by geo/sector filter)") : ""));
     return out;
   } catch(e) {
     onLog && onLog("✗ The Muse: " + (e.message||"fetch failed"));
@@ -1392,29 +1440,35 @@ const fetchAdzunaJobs = async ({ countryCodes, profile, execFunction, sectors, m
       const salMin = job.salary_min ? Math.round(job.salary_min) : 0;
       const salMax = job.salary_max ? Math.round(job.salary_max) : salMin;
       const salRange = salMin ? ("$" + Math.round(salMin/1000) + "K–$" + Math.round(salMax/1000) + "K") : null;
+      const roleTitle = job.title || "";
+      const companyName = job.company?.display_name || "Unknown Company";
+      const derivedSector = deriveSectorFromText([roleTitle, companyName, job.description||"", job.category?.label||""].join(" "), sectors);
       return {
         id: "lj-adz-" + (job.id || Date.now()+"-"+outIdx),
-        name: job.company?.display_name || "Unknown Company",
-        jobTitle: job.title || "",
-        probableRole: job.title || "",
+        name: companyName,
+        jobTitle: roleTitle,
+        probableRole: roleTitle,
         region: cc.toUpperCase(),
         city: (job.location?.display_name||"").split(",")[0]?.trim() || "",
-        sector: job.category?.label || "",
+        // Use the keyword-derived TorqueOS sector, NOT Adzuna's coarse
+        // taxonomy (which labels every aerospace supply chain role as
+        // "Engineering Jobs").
+        sector: derivedSector || "",
         status: module === "exec" ? "WARM" : "WATCH",
         type: module === "board" ? "board" : "exec",
         companyDescription: (job.description||"").slice(0, 260),
         description: (job.description||"").slice(0, 260),
         sentiment: 65,
-        tags: [job.category?.tag].filter(Boolean),
+        tags: derivedSector ? [derivedSector] : [],
         salary: salRange,
         estimatedPackage: salRange,
         estimatedFee: salRange,
         annualUSD: salMin || 0,
         packageBreakdown: salMin ? ("Base " + salRange + " (source: Adzuna listing)") : null,
-        fitReasons: [
-          "Verified live posting on Adzuna with published salary data — no estimation needed.",
-          "Apply directly via the source link; no warm introduction required to get on the radar."
-        ],
+        fitReasons: buildLiveFitReasons({
+          roleTitle, companyName, derivedSector, salaryRange: salRange,
+          sourceLabel: "Adzuna", matchedFunction: execFunction || ""
+        }),
         hiringSignal: "Active public job posting with disclosed compensation",
         whyNow: job.created ? ("Posted " + new Date(job.created).toLocaleDateString() + " — application window is open.") : "Currently live on Adzuna.",
         sourceUrl: job.redirect_url || "",
@@ -1471,7 +1525,7 @@ const getLiveSourceStatus = ({ module, countryCodes }) => {
 // the candidate profile using a module-specific rubric (board vs exec). The
 // result is re-sorted by fit and low-fit items are demoted. Fails open — if
 // the LLM call errors, the original list is returned unchanged.
-const rerankWithLLM = async ({ results, profile, module, execFunction, sectors, apiKey, provider, onLog }) => {
+const rerankWithLLM = async ({ results, profile, module, execFunction, sectors, countryNames, apiKey, provider, onLog }) => {
   if(!apiKey || !results || results.length===0) return results;
   try {
     onLog && onLog("🧠 Re-ranking " + Math.min(results.length,30) + " opportunities against your profile…");
@@ -1482,6 +1536,7 @@ const rerankWithLLM = async ({ results, profile, module, execFunction, sectors, 
       role: r.probableRole || r.jobTitle || "",
       sector: r.sector || "",
       region: r.region || "",
+      city: r.city || "",
       source: r.dataSource || "ai_signal",
       signal: r.hiringSignal || r.whyNow || "",
       snippet: (r.companyDescription||r.description||"").slice(0,220)
@@ -1495,17 +1550,19 @@ const rerankWithLLM = async ({ results, profile, module, execFunction, sectors, 
       "\nBOARD VALUE PROP: " + ((profile.boardValue||"").slice(0,300));
 
     // HARD FILTERS the user explicitly set in the module config. The reranker
-    // must treat these as pass/fail, not preferences — this is what stops
-    // healthcare roles sneaking into a "Supply Chain + Manufacturing" scan.
+    // must treat these as pass/fail, not preferences.
     const sectorList = (sectors||[]).slice(0,20);
+    const countryList = (countryNames||[]).slice(0,10);
     const constraintsBlob = "HARD USER FILTERS (these are NOT preferences — they are requirements the user explicitly set in the module config):\n" +
+      "- Target countries: " + (countryList.length ? countryList.join(", ") : "(any)") + "\n" +
       "- Function focus: " + (execFunction || "(none selected)") + "\n" +
       "- Selected industry sectors: " + (sectorList.length ? sectorList.join("; ") : "(all sectors)") + "\n" +
       "\nRULES:\n" +
-      "1. If a function focus is set, ANY opportunity that is clearly in a different function (e.g. healthcare/nursing when function = Supply Chain) MUST receive a score of 0–15. Do not be generous.\n" +
-      "2. If specific sectors are listed, ANY opportunity that is clearly in a different sector MUST receive a score of 0–15. Adjacent sectors can score up to 40. Only on-sector opportunities can score 60+.\n" +
-      "3. An opportunity only qualifies for a score of 70+ if it matches BOTH the function AND one of the selected sectors AND the seniority level.\n" +
-      "4. Be ruthless. It is better to drop a borderline match than to surface a clearly off-target role.";
+      "1. If a target country list is set, ANY opportunity clearly NOT located in one of those countries MUST receive a score of 0–15.\n" +
+      "2. If a function focus is set, ANY opportunity clearly in a different function (e.g. healthcare/nursing when function = Supply Chain) MUST receive a score of 0–15. Do not be generous.\n" +
+      "3. If specific sectors are listed, ANY opportunity clearly in a different sector MUST receive a score of 0–15. Adjacent sectors can score up to 40. Only on-sector opportunities can score 60+.\n" +
+      "4. An opportunity only qualifies for a score of 70+ if it matches the country AND function AND one of the selected sectors AND seniority level.\n" +
+      "5. Be ruthless. It is better to drop a borderline match than to surface a clearly off-target role.";
 
     const rubric = module==="board"
       ? "Score each opportunity on how well it matches this candidate as a NON-EXECUTIVE BOARD or ADVISORY seat — NOT an operational role. Down-weight anything that is clearly a full-time executive job, an entry/mid-level position, or a role the candidate would already be over-qualified for. Up-weight: independent director seats, board advisory roles, chair positions, audit/risk/remuneration committee fits, roles in sectors or geographies the candidate already knows."
@@ -1514,8 +1571,8 @@ const rerankWithLLM = async ({ results, profile, module, execFunction, sectors, 
     const sys = "You are a JSON API endpoint. Return ONLY a raw JSON array. No markdown, no prose.";
     const prompt = rubric + "\n\n" + constraintsBlob + "\n\nCANDIDATE:\n" + profileBlob +
       "\n\nOPPORTUNITIES (index → summary):\n" + JSON.stringify(compact) +
-      "\n\nFor each opportunity, return an object: " +
-      "{\"i\":<index>,\"score\":<0-100>,\"reason\":\"one short sentence in second person (You...) explaining the fit or — if the score is below 30 — specifically naming which hard filter failed (function mismatch / sector mismatch / seniority mismatch)\"}" +
+      "\n\nFor each opportunity, return an object with all three fields (reason MUST NOT be empty): " +
+      "{\"i\":<index>,\"score\":<0-100>,\"reason\":\"one concrete sentence in second person (You...) naming the role, the matched (or mismatched) function/sector, and — for scores below 30 — which hard filter failed (country / function / sector / seniority)\"}" +
       "\n\nReturn ONLY a JSON array of these objects, one per opportunity. OUTPUT ONLY JSON.";
 
     const raw = await callLLM(provider, apiKey, [{role:"user",content:prompt}], [], sys, "RERANK", ()=>{});
@@ -1523,12 +1580,39 @@ const rerankWithLLM = async ({ results, profile, module, execFunction, sectors, 
     if(!Array.isArray(scores)) return results;
     const scoreMap = new Map();
     scores.forEach(s => { if(s && typeof s.i==="number") scoreMap.set(s.i, s); });
+
+    // Deterministic fallback used when the LLM returns an empty reason —
+    // better than showing generic "verified live posting" boilerplate.
+    const fallbackReason = (r, score) => {
+      const role = r.probableRole || r.jobTitle || "This role";
+      const where = [r.city, r.region].filter(Boolean).join(", ");
+      const verdict = score >= 70 ? "is a strong fit for your target function and sectors"
+                    : score >= 50 ? "is a partial match — check the scope before investing time"
+                    : score >= 30 ? "overlaps loosely with your filters"
+                    : "falls outside your current function/sector filters";
+      return "You could look at " + role + (where?(" in "+where):"") + " — it " + verdict + ".";
+    };
+
     const scored = capped.map((r,i) => {
       const s = scoreMap.get(i);
       if(!s) return { ...r, rerankScore: null, rerankReason: "" };
       const score = Math.max(0, Math.min(100, Number(s.score)||0));
-      const reason = s.reason || "";
-      const fit = [reason, ...(r.fitReasons||[])].filter(Boolean).slice(0,4);
+      let reason = (s.reason || "").trim();
+      if(!reason) reason = fallbackReason(r, score);
+      // For live postings, the original boilerplate ("Verified live posting…"
+      // / "Apply directly…") was the primary content. Replace it: put the
+      // rerank reason first, then a single contextual note about the source.
+      const isLive = r.dataSource === "live_posting" || r.dataSource === "verified";
+      let fit;
+      if(isLive) {
+        const salaryNote = r.salary ? ("Published comp: " + r.salary + ".") : null;
+        const sourceNote = r.jobBoardSource
+          ? ("Verified " + r.jobBoardSource + " posting — apply directly, no warm intro needed.")
+          : null;
+        fit = [reason, salaryNote, sourceNote].filter(Boolean).slice(0,4);
+      } else {
+        fit = [reason, ...(r.fitReasons||[])].filter(Boolean).slice(0,4);
+      }
       return {
         ...r,
         rerankScore: score,
@@ -1540,9 +1624,6 @@ const rerankWithLLM = async ({ results, profile, module, execFunction, sectors, 
         sentiment: score
       };
     });
-    // HARD DROP anything below the relevance threshold. Previously we sorted
-    // low-fit items to the bottom but still surfaced them — that's what let
-    // HCA Healthcare show up in a Supply Chain scan.
     const RELEVANCE_THRESHOLD = 30;
     const kept = scored.filter(r => (r.rerankScore||0) >= RELEVANCE_THRESHOLD);
     const dropped = scored.length - kept.length;
@@ -2076,7 +2157,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     if(results[0].status==="fulfilled"){
       const aiBr=results[0].value.map((v,i)=>({...v,id:"b-"+Date.now()+"-"+i,moduleTag:"Board",scannedAt:now,dataSource:v.dataSource||"ai_signal"}));
       let br = mergeLiveAndAiResults(aiBr, liveResults);
-      br = await rerankWithLLM({ results: br, profile, module:"board", execFunction:"", sectors: allSectors ? [] : sectors, apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
+      br = await rerankWithLLM({ results: br, profile, module:"board", execFunction:"", sectors: allSectors ? [] : sectors, countryNames: selectedCountryNames, apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
       setBoardResults(br);storage.set("bs-results",br);
       const liveCount = br.filter(x=>x.dataSource==="live_posting").length;
       const verifiedCount = br.filter(x=>x.dataSource==="verified").length;
@@ -2085,7 +2166,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     else {
       setScanLog(p=>[...p,"✗ Board: "+results[0].reason?.message]);
       if(liveResults.length>0){
-        let only = await rerankWithLLM({ results: liveResults, profile, module:"board", execFunction:"", sectors: allSectors ? [] : sectors, apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
+        let only = await rerankWithLLM({ results: liveResults, profile, module:"board", execFunction:"", sectors: allSectors ? [] : sectors, countryNames: selectedCountryNames, apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
         setBoardResults(only);storage.set("bs-results",only);setScanLog(p=>[...p,"✓ Showing "+only.length+" live postings only"]);
       }
     }
@@ -2366,7 +2447,7 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
         setScanLog(p=>[...p,"✗ AI scan failed: "+(aiRes.reason?.message||"unknown")]);
         if(liveResults.length>0) setScanLog(p=>[...p,"✓ Showing "+liveResults.length+" live postings only"]);
       }
-      merged = await rerankWithLLM({ results: merged, profile, module:"exec", execFunction, sectors: allSectors ? [] : sectors, apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
+      merged = await rerankWithLLM({ results: merged, profile, module:"exec", execFunction, sectors: allSectors ? [] : sectors, countryNames: selectedCountryNames, apiKey, provider, onLog:(m)=>setScanLog(p=>[...p,m]) });
       setEsResults(merged);
       storage.set("es-results",merged);
       storage.set("es-last-scanned",now);
