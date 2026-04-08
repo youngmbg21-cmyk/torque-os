@@ -1133,6 +1133,205 @@ const extractJSON = (blocks) => {
   throw new Error("No JSON found — the AI returned a prose response instead of data. Try rescanning.");
 };
 
+// ─── LIVE JOB BOARD INTEGRATIONS ──────────────────────────────────────────────
+// Fetches real job postings from public job-board APIs and normalises them to
+// the TorqueOS opportunity schema so Board Scout and Executive Search can
+// blend verified live postings with AI-inferred signals.
+//
+// Two sources currently supported:
+//   • The Muse — free, no API key, CORS enabled. Good for mid-to-senior roles.
+//   • Adzuna    — free tier (requires app_id + app_key from Settings). Good
+//                 global coverage with real salary data. Strong for exec roles.
+//
+// All sources return objects shaped like existing Board/Exec results so they
+// flow through OpportunityCard, scoring, pipeline save, and docs generation
+// without any additional branching logic downstream.
+const ADZUNA_COUNTRY_MAP = {
+  GB:"gb", US:"us", AU:"au", BR:"br", CA:"ca", DE:"de", FR:"fr", IN:"in",
+  IT:"it", MX:"mx", NL:"nl", NZ:"nz", PL:"pl", SG:"sg", ZA:"za", AT:"at",
+  BE:"be", CH:"ch", ES:"es"
+};
+
+const fetchMuseJobs = async ({ countryNames, execFunction, module, onLog }) => {
+  try {
+    onLog && onLog("📡 Querying The Muse live job board…");
+    const levels = ["Senior Level","Management","Director","Executive"];
+    const params = new URLSearchParams();
+    levels.forEach(l => params.append("level", l));
+    (countryNames||[]).slice(0,3).forEach(c => params.append("location", c));
+    if(execFunction) params.append("category", execFunction);
+    params.append("page","0");
+    const url = "https://www.themuse.com/api/public/jobs?" + params.toString();
+    const res = await fetch(url);
+    if(!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const now = new Date().toISOString();
+    const out = (data.results||[]).slice(0,15).map((job,i)=>{
+      const loc = job.locations?.[0]?.name || "";
+      const locParts = loc.split(",").map(s=>s.trim());
+      const cleanedContent = (job.contents||"").replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();
+      return {
+        id: "lj-muse-" + (job.id || Date.now()+"-"+i),
+        name: job.company?.name || "Unknown Company",
+        jobTitle: job.name || "",
+        probableRole: job.name || "",
+        region: locParts[locParts.length-1] || (countryNames?.[0]||""),
+        city: locParts[0] || "",
+        sector: job.categories?.[0]?.name || "",
+        status: module === "exec" ? "WARM" : "WATCH",
+        type: module === "board" ? "board" : "exec",
+        companyDescription: cleanedContent.slice(0, 260),
+        description: cleanedContent.slice(0, 260),
+        sentiment: 60,
+        tags: (job.categories||[]).map(c=>c.name).slice(0,3),
+        fitReasons: [
+          "Live posting on The Muse — you can apply directly without a warm introduction.",
+          "Verified active vacancy, not an AI-inferred signal, so timing is known."
+        ],
+        hiringSignal: "Active public job posting",
+        whyNow: job.publication_date ? ("Posted " + new Date(job.publication_date).toLocaleDateString() + " — application window is open.") : "Currently live on The Muse.",
+        sourceUrl: job.refs?.landing_page || "",
+        applyUrl: job.refs?.landing_page || "",
+        sourceName: "The Muse",
+        jobBoardSource: "The Muse",
+        dataSource: "live_posting",
+        postedDate: job.publication_date || null,
+        scannedAt: now,
+        moduleTag: module === "board" ? "Board" : "Exec Role"
+      };
+    });
+    onLog && onLog("✓ The Muse returned " + out.length + " live postings");
+    return out;
+  } catch(e) {
+    onLog && onLog("✗ The Muse: " + (e.message||"fetch failed"));
+    return [];
+  }
+};
+
+const fetchAdzunaJobs = async ({ countryCodes, execFunction, minSalary, module, onLog }) => {
+  const appId = storage.get("oos-adzuna-id") || "";
+  const appKey = storage.get("oos-adzuna-key") || "";
+  if(!appId || !appKey) {
+    onLog && onLog("ℹ Adzuna credentials not set — skipping (configure in Settings to enable).");
+    return [];
+  }
+  try {
+    const targets = (countryCodes||[])
+      .map(c => ADZUNA_COUNTRY_MAP[(c||"").toUpperCase()])
+      .filter(Boolean)
+      .slice(0,3);
+    if(targets.length === 0) {
+      onLog && onLog("ℹ Adzuna: none of the selected countries are supported — skipping.");
+      return [];
+    }
+    onLog && onLog("📡 Querying Adzuna across " + targets.join(", ").toUpperCase() + "…");
+    const levelTerms = module === "board"
+      ? "non-executive director OR board member OR NED OR chair"
+      : "director OR VP OR head of OR chief OR president";
+    const what = [execFunction, levelTerms].filter(Boolean).join(" ");
+    const perCountry = await Promise.all(targets.map(async (cc) => {
+      const p = new URLSearchParams({
+        app_id: appId, app_key: appKey,
+        results_per_page: "10", what,
+        "content-type": "application/json"
+      });
+      if(minSalary && Number(minSalary) > 0) p.append("salary_min", String(minSalary));
+      const url = "https://api.adzuna.com/v1/api/jobs/" + cc + "/search/1?" + p.toString();
+      const res = await fetch(url);
+      if(!res.ok) throw new Error(cc + " HTTP " + res.status);
+      return { cc, data: await res.json() };
+    }));
+    const now = new Date().toISOString();
+    const out = [];
+    perCountry.forEach(({cc, data}) => {
+      (data.results||[]).forEach(job => {
+        const salMin = job.salary_min ? Math.round(job.salary_min) : 0;
+        const salMax = job.salary_max ? Math.round(job.salary_max) : salMin;
+        const salRange = salMin ? ("$" + Math.round(salMin/1000) + "K–$" + Math.round(salMax/1000) + "K") : null;
+        out.push({
+          id: "lj-adz-" + (job.id || Date.now()+"-"+out.length),
+          name: job.company?.display_name || "Unknown Company",
+          jobTitle: job.title || "",
+          probableRole: job.title || "",
+          region: cc.toUpperCase(),
+          city: (job.location?.display_name||"").split(",")[0]?.trim() || "",
+          sector: job.category?.label || "",
+          status: module === "exec" ? "WARM" : "WATCH",
+          type: module === "board" ? "board" : "exec",
+          companyDescription: (job.description||"").slice(0, 260),
+          description: (job.description||"").slice(0, 260),
+          sentiment: 65,
+          tags: [job.category?.tag].filter(Boolean),
+          salary: salRange,
+          estimatedPackage: salRange,
+          estimatedFee: salRange,
+          annualUSD: salMin || 0,
+          packageBreakdown: salMin ? ("Base " + salRange + " (source: Adzuna listing)") : null,
+          fitReasons: [
+            "Verified live posting on Adzuna with published salary data — no estimation needed.",
+            "Apply directly via the source link; no warm introduction required to get on the radar."
+          ],
+          hiringSignal: "Active public job posting with disclosed compensation",
+          whyNow: job.created ? ("Posted " + new Date(job.created).toLocaleDateString() + " — application window is open.") : "Currently live on Adzuna.",
+          sourceUrl: job.redirect_url || "",
+          applyUrl: job.redirect_url || "",
+          sourceName: "Adzuna",
+          jobBoardSource: "Adzuna",
+          dataSource: "live_posting",
+          postedDate: job.created || null,
+          scannedAt: now,
+          moduleTag: module === "board" ? "Board" : "Exec Role"
+        });
+      });
+    });
+    onLog && onLog("✓ Adzuna returned " + out.length + " live postings");
+    return out;
+  } catch(e) {
+    onLog && onLog("✗ Adzuna: " + (e.message||"fetch failed"));
+    return [];
+  }
+};
+
+// Orchestrator: fan out to all enabled sources in parallel.
+const fetchLiveJobs = async ({ module, countryCodes, execFunction, minSalary, onLog }) => {
+  const countryNames = (countryCodes||[]).map(code => {
+    const found = (typeof ALL_COUNTRIES_FLAT !== "undefined")
+      ? ALL_COUNTRIES_FLAT.find(x => x.code === code) : null;
+    return found ? found.name : code;
+  });
+  const [muse, adzuna] = await Promise.all([
+    fetchMuseJobs({ countryNames, execFunction, module, onLog }),
+    fetchAdzunaJobs({ countryCodes, execFunction, minSalary, module, onLog })
+  ]);
+  return [...muse, ...adzuna];
+};
+
+// Merge AI-generated results with live postings. When an AI signal matches a
+// live posting by company name, we upgrade the AI card to "verified" and
+// enrich it with the real apply link, salary, and posted date. Otherwise the
+// live posting is appended as its own card.
+const mergeLiveAndAiResults = (aiResults, liveResults) => {
+  const normName = s => (s||"").toLowerCase().replace(/[^a-z0-9]+/g," ").trim();
+  const out = (aiResults||[]).map(r => ({...r, dataSource: r.dataSource || "ai_signal"}));
+  const usedLive = new Set();
+  out.forEach(ai => {
+    const aiKey = normName(ai.name);
+    if(!aiKey) return;
+    const match = liveResults.find((lr,idx) => !usedLive.has(idx) && normName(lr.name) === aiKey);
+    if(match) {
+      usedLive.add(liveResults.indexOf(match));
+      ai.applyUrl = match.applyUrl || ai.applyUrl;
+      ai.postedDate = match.postedDate || ai.postedDate;
+      ai.jobBoardSource = match.jobBoardSource;
+      ai.dataSource = "verified";
+      if(!ai.sourceUrl) ai.sourceUrl = match.sourceUrl;
+      if(match.salary && !ai.salary) ai.salary = match.salary;
+    }
+  });
+  liveResults.forEach((lr,idx) => { if(!usedLive.has(idx)) out.push(lr); });
+  return out;
+};
+
 // ─── SHARED: STREAMING CHATBOT ────────────────────────────────────────────────
 const StreamingChatbot = ({apiKey, provider, systemPrompt, systemPromptBuilder, title, subtitle, icon, contextPills=[], onClose, t, isMobile, openingBrief, persistedMessages, onMessagesChange}) => {
   const [msgs, setMsgs] = useState(persistedMessages&&persistedMessages.length>0 ? persistedMessages : [{role:"assistant",content:openingBrief||"Hi! I'm your AI Advisor. Ask me anything about your opportunities, pipeline, strategy, or how to use the app.",id:"w1"}]);
@@ -1352,6 +1551,9 @@ const OpportunityCard = ({item,t,onSave,isSaved,onRemove,onStatusChange,onNoteCh
             <span onClick={savedMode&&onNavigateToSource?e=>{e.stopPropagation();onNavigateToSource(item);}:undefined} style={{fontWeight:700,color:savedMode&&onNavigateToSource?moduleC:t.text,fontSize:mob?13:14,cursor:savedMode&&onNavigateToSource?"pointer":"default",textDecoration:savedMode&&onNavigateToSource?"underline":"none",textDecorationColor:moduleC+"60"}}>{item.name}</span>
             {item.status&&<span style={{fontSize:12,fontWeight:700,letterSpacing:"0.08em",padding:"2px 7px",borderRadius:4,background:statusColor+"20",color:statusColor}}>{item.status}</span>}
             {item.moduleTag&&<span style={{fontSize:12,fontWeight:700,letterSpacing:"0.08em",padding:"2px 7px",borderRadius:4,background:moduleC+"15",color:moduleC}}>{item.moduleTag}</span>}
+            {item.dataSource==="live_posting"&&<span title={"Live posting on "+(item.jobBoardSource||"job board")} style={{fontSize:11,fontWeight:800,letterSpacing:"0.08em",padding:"2px 7px",borderRadius:4,background:"#10b98120",color:"#10b981",border:"1px solid #10b98140",display:"inline-flex",alignItems:"center",gap:3}}>● LIVE{item.jobBoardSource?" · "+item.jobBoardSource:""}</span>}
+            {item.dataSource==="verified"&&<span title={"AI signal confirmed by live posting on "+(item.jobBoardSource||"job board")} style={{fontSize:11,fontWeight:800,letterSpacing:"0.08em",padding:"2px 7px",borderRadius:4,background:"#6366f120",color:"#818cf8",border:"1px solid #6366f140",display:"inline-flex",alignItems:"center",gap:3}}>✓ VERIFIED</span>}
+            {item.dataSource==="ai_signal"&&<span title="AI-inferred hiring signal — verify before outreach" style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",padding:"2px 7px",borderRadius:4,background:t.border,color:t.textDim}}>AI SIGNAL</span>}
             {profile&&<ScoreBadge item={item} profile={profile} t={t}/>}
           </div>
           <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4,fontSize:mob?10:11,color:t.textMuted,flexWrap:"wrap"}}>
@@ -1414,10 +1616,16 @@ const OpportunityCard = ({item,t,onSave,isSaved,onRemove,onStatusChange,onNoteCh
           </div>
         </div>}
 
-        {/* Source */}
-        {item.sourceUrl&&<a href={item.sourceUrl} target="_blank" rel="noopener noreferrer" style={{display:"inline-flex",alignItems:"center",gap:5,fontSize:15,color:moduleC,textDecoration:"none",padding:"5px 10px",background:moduleC+"15",borderRadius:6,fontWeight:600,marginBottom:10}}>
-          <Ic.ExternalLink size={10}/>{item.sourceName||"Source"}
-        </a>}
+        {/* Source + Apply (for live postings) */}
+        <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",marginBottom:10}}>
+          {item.applyUrl&&(item.dataSource==="live_posting"||item.dataSource==="verified")&&<a href={item.applyUrl} target="_blank" rel="noopener noreferrer" style={{display:"inline-flex",alignItems:"center",gap:5,fontSize:14,color:"#fff",textDecoration:"none",padding:"7px 13px",background:"linear-gradient(135deg,#10b981,#059669)",borderRadius:6,fontWeight:700,boxShadow:"0 1px 3px rgba(16,185,129,0.3)"}}>
+            <Ic.ExternalLink size={11}/> Apply on {item.jobBoardSource||"Source"}
+          </a>}
+          {item.sourceUrl&&!(item.applyUrl&&item.applyUrl===item.sourceUrl)&&<a href={item.sourceUrl} target="_blank" rel="noopener noreferrer" style={{display:"inline-flex",alignItems:"center",gap:5,fontSize:15,color:moduleC,textDecoration:"none",padding:"5px 10px",background:moduleC+"15",borderRadius:6,fontWeight:600}}>
+            <Ic.ExternalLink size={10}/>{item.sourceName||"Source"}
+          </a>}
+          {item.postedDate&&<span style={{fontSize:12,color:t.textMuted,fontStyle:"italic"}}>Posted {new Date(item.postedDate).toLocaleDateString()}</span>}
+        </div>
 
         {/* Score breakdown */}
         {profile&&<ScoreBadge item={item} profile={profile} t={t} size="lg"/>}
@@ -1548,6 +1756,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
   const [countries,setCountries]=useState(()=>storage.get("bs-countries")||(profile.regions||[]).map(n=>ALL_COUNTRIES_FLAT.find(c=>c.name===n)?.code).filter(Boolean)||[]);
   const [sectors,setSectors]=useState(()=>storage.get("bs-sectors")||profile.defaultSectors||[]);
   const [allSectors,setAllSectors]=useState(()=>storage.get("bs-allsectors")!==false);
+  const [liveJobs,setLiveJobs]=useState(()=>storage.get("bs-live-jobs")!==false);
   const [statusFilter,setStatusFilter]=useState("ALL");
   const [configOpen,setConfigOpen]=useState(!isMobile);
   const loading=bsLoading; const setLoading=setBsLoading;
@@ -1560,6 +1769,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
   useEffect(()=>{ storage.set("bs-tab",tab); },[tab]);
   useEffect(()=>{ storage.set("bs-sectors",sectors); },[sectors]);
   useEffect(()=>{ storage.set("bs-allsectors",allSectors); },[allSectors]);
+  useEffect(()=>{ storage.set("bs-live-jobs",liveJobs); },[liveJobs]);
 
   const selectedCountryNames=countries.map(c=>getCountryByCode(c).name).filter(Boolean);
   const selectedSectors=allSectors?ALL_SECTORS_FLAT:sectors;
@@ -1584,18 +1794,32 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
 
     const bCall=callLLM(provider,apiKey,[{role:"user",content:boardPrompt}],useSearch,sys,"BOARD",(m)=>setScanLog(p=>[...p,m])).then(extractJSON);
     const cCall=callLLM(provider,apiKey,[{role:"user",content:consultPrompt}],useSearch,sys,"CONSULTING",(m)=>setScanLog(p=>[...p,m])).then(extractJSON);
+    const liveCall = liveJobs
+      ? fetchLiveJobs({ module:"board", countryCodes: countries, execFunction:"", minSalary:0, onLog:(m)=>setScanLog(p=>[...p,m]) })
+      : Promise.resolve([]);
     try {
-    const results=await Promise.allSettled([bCall,cCall]);
+    const results=await Promise.allSettled([bCall,cCall,liveCall]);
     const now=new Date().toISOString();
-    if(results[0].status==="fulfilled"){const br=results[0].value.map((v,i)=>({...v,id:"b-"+Date.now()+"-"+i,moduleTag:"Board",scannedAt:now}));setBoardResults(br);storage.set("bs-results",br);setScanLog(p=>[...p,"✓ "+br.length+" board opportunities"]);}
-    else setScanLog(p=>[...p,"✗ Board: "+results[0].reason?.message]);
-    if(results[1].status==="fulfilled"){const cr=results[1].value.map((v,i)=>({...v,id:"c-"+Date.now()+"-"+i,moduleTag:"Consulting",scannedAt:now}));setConsultResults(cr);storage.set("bs-consult-results",cr);setScanLog(p=>[...p,"✓ "+cr.length+" consulting opportunities"]);}
+    const liveResults = results[2].status==="fulfilled" ? results[2].value : [];
+    if(results[0].status==="fulfilled"){
+      const aiBr=results[0].value.map((v,i)=>({...v,id:"b-"+Date.now()+"-"+i,moduleTag:"Board",scannedAt:now,dataSource:v.dataSource||"ai_signal"}));
+      const br = mergeLiveAndAiResults(aiBr, liveResults);
+      setBoardResults(br);storage.set("bs-results",br);
+      const liveCount = br.filter(x=>x.dataSource==="live_posting").length;
+      const verifiedCount = br.filter(x=>x.dataSource==="verified").length;
+      setScanLog(p=>[...p,"✓ "+br.length+" board opportunities ("+aiBr.length+" AI, "+liveCount+" live, "+verifiedCount+" verified)"]);
+    }
+    else {
+      setScanLog(p=>[...p,"✗ Board: "+results[0].reason?.message]);
+      if(liveResults.length>0){ setBoardResults(liveResults);storage.set("bs-results",liveResults);setScanLog(p=>[...p,"✓ Showing "+liveResults.length+" live postings only"]); }
+    }
+    if(results[1].status==="fulfilled"){const cr=results[1].value.map((v,i)=>({...v,id:"c-"+Date.now()+"-"+i,moduleTag:"Consulting",scannedAt:now,dataSource:"ai_signal"}));setConsultResults(cr);storage.set("bs-consult-results",cr);setScanLog(p=>[...p,"✓ "+cr.length+" consulting opportunities"]);}
     else setScanLog(p=>[...p,"✗ Consulting: "+results[1].reason?.message]);
     storage.set("bs-last-scanned",now);setBsLastScanned(now);
     setScanLog(p=>[...p,"Scan complete."]);
   } catch(err){ if(err.name!=="AbortError") setScanLog(p=>[...p,"✗ Error: "+err.message]); }
   finally { setLoading(false); }
-  },[apiKey,provider,selectedCountryNames,selectedSectors,profileCtx,expertiseSummary,keySkills]);
+  },[apiKey,provider,selectedCountryNames,selectedSectors,profileCtx,expertiseSummary,keySkills,liveJobs,countries]);
 
   const saveOpp=(item)=>{
     if(saved.some(s=>s.name===item.name&&s.region===item.region)) return;
@@ -1627,6 +1851,13 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
           <div style={{marginTop:8}}>
           <CategorySectorPicker selected={sectors} onChange={setSectors} max={5} color={moduleColor} storageKey="bs" t={t} allMode={allSectors} onToggleAll={()=>{setAllSectors(!allSectors);setSectors([]);}}/>
           </div>
+          <label style={{display:"flex",alignItems:"center",gap:8,marginTop:10,marginBottom:10,padding:"8px 10px",background:t.input,border:"1px solid "+t.border,borderRadius:7,cursor:"pointer"}}>
+            <input type="checkbox" checked={liveJobs} onChange={e=>setLiveJobs(e.target.checked)} style={{accentColor:moduleColor,width:14,height:14}}/>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:13,fontWeight:700,color:t.text}}>Include live postings</div>
+              <div style={{fontSize:11,color:t.textMuted,lineHeight:1.4}}>Blend real job-board listings with AI signals</div>
+            </div>
+          </label>
           <button onClick={loading?cancelScan:runScan} disabled={!loading&&(!apiKey||countries.length===0)} style={{...btn0,width:"100%",padding:14,borderRadius:8,fontSize:15,fontWeight:700,color:"#fff",background:loading?"#ef4444":(!apiKey||countries.length===0)?t.textDim:"linear-gradient(135deg,"+moduleColor+",#059669)",display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"background 0.2s"}}>
             {loading?<><Ic.Loader2 size={15} style={{animation:"spin 0.8s linear infinite"}}/> Cancel</>:<><Ic.Search size={15}/> {bsLastScanned?"Rescan":"Run Scan"}</>}
           </button>
@@ -1806,6 +2037,7 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
   const [execFunction,setExecFunction]=useState(()=>storage.get("es-function")||"");
   const [minPackage,setMinPackage]=useState(()=>storage.get("es-min-package")||150000);
   const [scope,setScope]=useState(()=>storage.get("es-scope")||"regional");
+  const [liveJobs,setLiveJobs]=useState(()=>storage.get("es-live-jobs")!==false);
   const [statusFilter,setStatusFilter]=useState("ALL");
   const [configOpen,setConfigOpen]=useState(!isMobile);
   const loading=esLoading; const setLoading=setEsLoading;
@@ -1819,6 +2051,7 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
   useEffect(()=>{ storage.set("es-function",execFunction); },[execFunction]);
   useEffect(()=>{ storage.set("es-min-package",minPackage); },[minPackage]);
   useEffect(()=>{ storage.set("es-scope",scope); },[scope]);
+  useEffect(()=>{ storage.set("es-live-jobs",liveJobs); },[liveJobs]);
 
   const selectedCountryNames=countries.map(c=>getCountryByCode(c).name).filter(Boolean);
   const selectedSectors=allSectors?ALL_SECTORS_FLAT:sectors;
@@ -1836,15 +2069,33 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     const funcStr=execFunction?`Function focus: ${execFunction}.`:"";
     const prompt=`${profileCtx}\n\nYou are an executive search consultant. Identify companies likely to need a ${scopeLabel} director-level or above hire in the next 6-12 months. ${funcStr}\n\nSearch for companies in ${cStr} across sectors: ${sStr||"all sectors"} that show HIRING SIGNALS such as:\n- Recent expansion into new geographies or markets\n- Leadership departures, restructuring or transformation programmes\n- Funded scale-ups that have outgrown current leadership\n- Companies entering new sectors or undergoing digital transformation\n- Post-M&A integration needs\n- Rapid growth requiring senior operational leadership\n\nMINIMUM TOTAL PACKAGE: $${minPackage.toLocaleString()}/year. Only surface roles that would realistically command at least this compensation.\n\nTARGET PROFILE MATCH: The candidate has ${profile.title||"senior director"} background. Match on DEPTH OF RESPONSIBILITY not just title — look for roles requiring multi-country remit, P&L ownership, large team leadership, or strategic transformation scope.\n\nFor each opportunity return realistic total package estimates using these benchmarks: Country Director $120K-$200K, Regional Director $160K-$280K, VP/SVP $200K-$350K, C-suite $250K-$500K+. Adjust for market (US +30%, Nordics baseline, Africa -40%, Middle East +20%).\n\nReturn ONLY a JSON array:\n[{"name":"Company name","probableRole":"Specific role title e.g. Regional Supply Chain Director","hiringSignal":"Why this company likely needs this hire right now — specific signal","region":"Country/Region","city":"City","sector":"Sector","estimatedPackage":"$180,000–$220,000 total package","annualUSD":200000,"packageBreakdown":"Base ~$160K + 20% bonus","daysPerYear":220,"effortRating":"HIGH","status":"HOT","description":"What this company does and why this role exists","fitReasons":["Specific reason this candidate fits — written in second person as You...","second fit reason"],"whyNow":"The specific hiring signal — what changed recently","sourceUrl":"https://url","sourceName":"Source name","sentiment":75,"tags":["transformation","supply-chain"]}]\nStatus: HOT (strong signal), WARM (emerging signal), COLD (speculative). Write fitReasons in second person. Be specific and realistic. OUTPUT ONLY JSON.`;
 
+    const aiCall = callLLM(provider,apiKey,[{role:"user",content:prompt}],useSearch,sys,"EXEC",(m)=>setScanLog(p=>[...p,m])).then(extractJSON);
+    const liveCall = liveJobs
+      ? fetchLiveJobs({ module:"exec", countryCodes: countries, execFunction, minSalary: minPackage, onLog:(m)=>setScanLog(p=>[...p,m]) })
+      : Promise.resolve([]);
     try {
-      const blocks=await callLLM(provider,apiKey,[{role:"user",content:prompt}],useSearch,sys,"EXEC",(m)=>setScanLog(p=>[...p,m]));
-      const results=extractJSON(blocks);
-      const hr=results.map((v,i)=>({...v,id:"es-"+Date.now()+"-"+i,moduleTag:v.probableRole||"Exec Role"}));
-      setEsResults(hr);storage.set("es-results",hr);storage.set("es-last-scanned",now);setEsLastScanned(now);
-      setScanLog(p=>[...p,"✓ "+hr.length+" opportunities found"]);
+      const [aiRes, liveRes] = await Promise.allSettled([aiCall, liveCall]);
+      const now = new Date().toISOString();
+      const liveResults = liveRes.status==="fulfilled" ? liveRes.value : [];
+      let merged = [];
+      if(aiRes.status==="fulfilled") {
+        const aiHr = aiRes.value.map((v,i)=>({...v,id:"es-"+Date.now()+"-"+i,moduleTag:v.probableRole||"Exec Role",dataSource:v.dataSource||"ai_signal",scannedAt:now}));
+        merged = mergeLiveAndAiResults(aiHr, liveResults);
+        const liveCount = merged.filter(x=>x.dataSource==="live_posting").length;
+        const verifiedCount = merged.filter(x=>x.dataSource==="verified").length;
+        setScanLog(p=>[...p,"✓ "+merged.length+" opportunities ("+aiHr.length+" AI, "+liveCount+" live, "+verifiedCount+" verified)"]);
+      } else {
+        merged = liveResults;
+        setScanLog(p=>[...p,"✗ AI scan failed: "+(aiRes.reason?.message||"unknown")]);
+        if(liveResults.length>0) setScanLog(p=>[...p,"✓ Showing "+liveResults.length+" live postings only"]);
+      }
+      setEsResults(merged);
+      storage.set("es-results",merged);
+      storage.set("es-last-scanned",now);
+      setEsLastScanned(now);
     } catch(e){ setScanLog(p=>[...p,"✗ "+e.message]); }
     finally { setScanLog(p=>[...p,"Scan complete."]); setLoading(false); }
-  },[apiKey,provider,selectedCountryNames,selectedSectors,execFunction,minPackage,scope,profileCtx]);
+  },[apiKey,provider,selectedCountryNames,selectedSectors,execFunction,minPackage,scope,profileCtx,liveJobs,countries]);
 
   const saveOpp=(item)=>{
     if(saved.some(s=>s.name===item.name&&s.region===item.region)) return;
@@ -1892,6 +2143,13 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
             <div style={{marginTop:4,fontSize:12,color:t.textMuted}}>Base + bonus + equity combined</div>
           </div>
           <div style={{marginTop:8}}><CategorySectorPicker selected={sectors} onChange={setSectors} max={5} color={moduleColor} t={t} allMode={allSectors} onToggleAll={()=>{setAllSectors(!allSectors);setSectors([])}}/></div>
+          <label style={{display:"flex",alignItems:"center",gap:8,marginTop:10,marginBottom:10,padding:"8px 10px",background:t.input,border:"1px solid "+t.border,borderRadius:7,cursor:"pointer"}}>
+            <input type="checkbox" checked={liveJobs} onChange={e=>setLiveJobs(e.target.checked)} style={{accentColor:moduleColor,width:14,height:14}}/>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:13,fontWeight:700,color:t.text}}>Include live postings</div>
+              <div style={{fontSize:11,color:t.textMuted,lineHeight:1.4}}>Blend real job-board listings with AI hiring signals</div>
+            </div>
+          </label>
           <button onClick={loading?()=>{setLoading(false);setScanLog(p=>[...p,"⛔ Cancelled."]);}:runScan} disabled={!loading&&(!apiKey||countries.length===0)} style={{...btn0,width:"100%",padding:14,borderRadius:8,fontSize:15,fontWeight:700,color:"#fff",background:loading?"#ef4444":(!apiKey||countries.length===0)?t.textDim:"linear-gradient(135deg,"+moduleColor+",#9333ea)",display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"background 0.2s"}}>
             {loading?<><Ic.Loader2 size={15} style={{animation:"spin 0.8s linear infinite"}}/> Cancel</>:<><Ic.Search size={15}/> {esLastScanned?"Rescan":"Find Roles"}</>}
           </button>
@@ -4416,6 +4674,59 @@ const CountryDropdown = ({value, onChange, t}) => {
 };
 
 // ─── MODULE: SETTINGS ─────────────────────────────────────────────────────────
+// Live Job Boards config — Adzuna credentials are optional; The Muse works
+// without any key. When Adzuna keys are present, scans in Board Scout and
+// Executive Search will also query Adzuna in parallel with AI scans and The Muse.
+const LiveJobBoardSettings = ({t,inputS,isMobile}) => {
+  const [adzId,setAdzId]=useState(()=>storage.get("oos-adzuna-id")||"");
+  const [adzKey,setAdzKey]=useState(()=>storage.get("oos-adzuna-key")||"");
+  const [show,setShow]=useState(false);
+  const [savedFlash,setSavedFlash]=useState(false);
+  const save=()=>{
+    storage.set("oos-adzuna-id",adzId.trim());
+    storage.set("oos-adzuna-key",adzKey.trim());
+    setSavedFlash(true); setTimeout(()=>setSavedFlash(false),1500);
+  };
+  const clear=()=>{
+    setAdzId(""); setAdzKey("");
+    storage.del("oos-adzuna-id"); storage.del("oos-adzuna-key");
+  };
+  const configured = !!(adzId && adzKey);
+  return (
+    <div style={{background:t.card,border:"1px solid "+t.border,boxShadow:t.cardShadow,borderRadius:10,padding:"12px 14px",marginBottom:10}}>
+      <div style={{fontSize:15,fontWeight:700,color:t.text,marginBottom:3,display:"flex",alignItems:"center",gap:6}}>
+        <Ic.Briefcase size={13} color="#10b981"/>Live Job Boards
+        <span style={{fontSize:11,fontWeight:700,padding:"2px 6px",borderRadius:4,background:"#10b98120",color:"#10b981",marginLeft:"auto"}}>OPTIONAL</span>
+      </div>
+      <div style={{fontSize:14,color:t.textMuted,marginBottom:10,lineHeight:1.55}}>
+        When enabled in Board Scout or Executive Search, scans will blend real job postings with AI-inferred hiring signals. <strong style={{color:t.text}}>The Muse</strong> works without any credentials. <strong style={{color:t.text}}>Adzuna</strong> adds broader global coverage with published salary data — create a free developer account at <a href="https://developer.adzuna.com" target="_blank" rel="noopener noreferrer" style={{color:"#10b981",fontWeight:600}}>developer.adzuna.com</a> to get an app_id and app_key.
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:7,marginBottom:8}}>
+        <div>
+          <label style={{fontSize:12,fontWeight:700,letterSpacing:"0.08em",color:t.textDim,display:"block",marginBottom:3}}>ADZUNA APP ID</label>
+          <input type={show?"text":"password"} value={adzId} onChange={e=>setAdzId(e.target.value)} placeholder="e.g. a1b2c3d4" style={{...inputS,fontFamily:"'DM Mono',monospace"}}/>
+        </div>
+        <div>
+          <label style={{fontSize:12,fontWeight:700,letterSpacing:"0.08em",color:t.textDim,display:"block",marginBottom:3}}>ADZUNA APP KEY</label>
+          <input type={show?"text":"password"} value={adzKey} onChange={e=>setAdzKey(e.target.value)} placeholder="32-character key" style={{...inputS,fontFamily:"'DM Mono',monospace"}}/>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+        <button onClick={save} disabled={!adzId||!adzKey} style={{...btn0,padding:"7px 14px",borderRadius:7,background:(!adzId||!adzKey)?t.input:"linear-gradient(135deg,#10b981,#059669)",color:"#fff",fontSize:14,fontWeight:700,border:"none",opacity:(!adzId||!adzKey)?0.5:1}}>
+          {savedFlash?"✓ Saved":"Save credentials"}
+        </button>
+        <button onClick={()=>setShow(!show)} style={{...btn0,padding:"7px 12px",borderRadius:7,background:t.input,border:"1px solid "+t.border,color:t.textMuted,fontSize:14,fontWeight:600}}>
+          {show?"Hide":"Show"}
+        </button>
+        {configured&&<button onClick={clear} style={{...btn0,padding:"7px 12px",borderRadius:7,background:t.coralDim,border:"1px solid "+t.coral+"30",color:t.coral,fontSize:14,fontWeight:600}}>Forget</button>}
+        <span style={{fontSize:13,color:configured?"#10b981":t.textDim,marginLeft:"auto"}}>
+          {configured?"✓ Adzuna configured":"The Muse only (no key required)"}
+        </span>
+      </div>
+    </div>
+  );
+};
+
 const SettingsModule = ({t,profile,setProfile,apiKey,setApiKey,provider,setProvider,isMobile,isNewUser}) => {
   const [showKey,setShowKey]=useState(false);
   const [localProfile,setLocalProfile]=useState(profile);
@@ -4555,6 +4866,9 @@ Return ONLY JSON, no markdown, no backticks.`;
         {!apiKey&&<div style={{marginTop:8,fontSize:15,color:"#f59e0b"}}>⚠ API key required to run scans and use the AI chatbot.</div>}
         {apiKey&&<div style={{marginTop:8,fontSize:15,color:t.accent}}>✓ API key configured for {prov.name}</div>}
       </div>
+
+      {/* Live Job Boards — optional, augments Board Scout & Exec Search with real postings */}
+      <LiveJobBoardSettings t={t} inputS={inputS} isMobile={isMobile}/>
 
       {/* CV Upload */}
       <div style={{background:t.card,border:"1px solid "+t.border,boxShadow:t.cardShadow,borderRadius:10,padding:"12px 14px",marginBottom:10}}>
@@ -5427,6 +5741,32 @@ const CalendarModule = ({t, isMobile, events, onSaveEvents, saved, onScheduleIte
 };
 
 // ─── LOGIN SCREEN ─────────────────────────────────────────────────────────────
+// Friendly error messages for Firebase Auth error codes. Returning "" means
+// "silently ignore" (e.g. user cancelled a popup). Falls back to showing the
+// raw code + message so we never swallow a real failure.
+const mapAuthError = (e) => {
+  const code = e?.code || "";
+  const msg  = e?.message || "Unknown error";
+  const map = {
+    "auth/email-already-in-use":   "An account with this email already exists. Switch to Sign In to log in.",
+    "auth/invalid-email":          "That email address doesn't look valid.",
+    "auth/weak-password":          "Password is too weak — use at least 6 characters.",
+    "auth/wrong-password":         "Incorrect password. Try again or use 'Forgot password?'.",
+    "auth/user-not-found":         "No account found for that email.",
+    "auth/invalid-credential":     "Incorrect email or password.",
+    "auth/user-disabled":          "This account has been disabled.",
+    "auth/too-many-requests":      "Too many attempts. Please wait a few minutes and try again.",
+    "auth/network-request-failed": "Network error — check your internet connection and try again.",
+    "auth/operation-not-allowed":  "Email/password sign-in is disabled for this Firebase project. Enable it in Firebase Console → Authentication → Sign-in method.",
+    "auth/unauthorized-domain":    "This domain isn't authorized for Firebase sign-in. Add it in Firebase Console → Authentication → Settings → Authorized domains.",
+    "auth/popup-blocked":          "Your browser blocked the popup. Allow popups for this site and try again.",
+    "auth/popup-closed-by-user":   "",
+    "auth/cancelled-popup-request":"",
+  };
+  if(code && code in map) return map[code];
+  return "Sign-in failed" + (code ? " ("+code+")" : "") + ": " + msg;
+};
+
 const LoginScreen = ({t, onLogin}) => {
   const [mode, setMode] = useState("login"); // login | register | forgot
   const [email, setEmail] = useState("");
@@ -5454,6 +5794,9 @@ const LoginScreen = ({t, onLogin}) => {
   const googleLogin = async () => {
     setError(""); setLoading(true);
     try {
+      if(!window.TorqueFirebase || !window.TorqueFirebase.signInWithGoogle) {
+        throw new Error("Firebase isn't loaded yet — reload the page and try again.");
+      }
       const user = await window.TorqueFirebase.signInWithGoogle();
       const email = user.email.toLowerCase();
       // Sync local session
@@ -5464,9 +5807,10 @@ const LoginScreen = ({t, onLogin}) => {
       storage.gset("oos-session", {email, ts:Date.now()});
       onLogin(isNew);
     } catch(e) {
-      if(e.code !== "auth/popup-closed-by-user" && e.code !== "auth/cancelled-popup-request") {
-        setError("Google sign-in failed. Please try again.");
-      }
+      console.error("Google sign-in error:", e?.code, e?.message, e);
+      const friendly = mapAuthError(e);
+      // mapAuthError returns "" for user-cancelled popups — suppress those.
+      if(friendly) setError(friendly);
     }
     setLoading(false);
   };
@@ -5491,9 +5835,20 @@ const LoginScreen = ({t, onLogin}) => {
           setLoading(false);
           onLogin(false);
           return;
-        } catch(e) {}
+        } catch(e) {
+          console.error("Firebase signIn error:", e?.code, e?.message, e);
+          // For concrete auth failures (wrong password, unknown user, etc.)
+          // show the real error instead of falling through to localStorage.
+          // Only fall through on transient network failures so offline users
+          // can still sign in with a previously-cached local account.
+          if(e && e.code && e.code !== "auth/network-request-failed") {
+            setError(mapAuthError(e));
+            setLoading(false);
+            return;
+          }
+        }
       }
-      if(!users[email.toLowerCase()]){setError("No account found. Create one below.");setLoading(false);return;}
+      if(!users[email.toLowerCase()]){setError("No account found for this email. Either create an account, or check your network connection and try again.");setLoading(false);return;}
       const isValid = await verifyPassword(password, users[email.toLowerCase()].hash);
       if(!isValid){setError("Incorrect password.");setLoading(false);return;}
       if(!users[email.toLowerCase()].hash.includes(":")){
@@ -5503,15 +5858,25 @@ const LoginScreen = ({t, onLogin}) => {
       storage.gset("oos-session",{email:email.toLowerCase(), ts:Date.now()});
       onLogin(false);
     } else {
-      let firebaseOk = false;
+      // REGISTER
+      let fbErr = null;
       if(window.TorqueFirebase) {
-        try { await window.TorqueFirebase.signUp(email.toLowerCase(), password); firebaseOk = true; } catch(e) {
-          try { await window.TorqueFirebase.signIn(email.toLowerCase(), password); firebaseOk = true; } catch(e2) {
-            setError("Could not create account — please check your internet connection and try again.");
-            setLoading(false);
-            return;
-          }
+        try {
+          await window.TorqueFirebase.signUp(email.toLowerCase(), password);
+        } catch(e) {
+          console.error("Firebase signUp error:", e?.code, e?.message, e);
+          fbErr = e;
         }
+      } else {
+        console.warn("TorqueFirebase not ready — creating local-only account.");
+      }
+      // Only block registration on a concrete Firebase error that isn't a
+      // transient network failure. auth/network-request-failed falls through
+      // to the local-only path so the user isn't locked out offline.
+      if(fbErr && fbErr.code && fbErr.code !== "auth/network-request-failed") {
+        setError(mapAuthError(fbErr));
+        setLoading(false);
+        return;
       }
       const hash = await hashPassword(password);
       users[email.toLowerCase()]={hash, createdAt:new Date().toISOString()};
