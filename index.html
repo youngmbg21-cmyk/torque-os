@@ -5741,6 +5741,32 @@ const CalendarModule = ({t, isMobile, events, onSaveEvents, saved, onScheduleIte
 };
 
 // ─── LOGIN SCREEN ─────────────────────────────────────────────────────────────
+// Friendly error messages for Firebase Auth error codes. Returning "" means
+// "silently ignore" (e.g. user cancelled a popup). Falls back to showing the
+// raw code + message so we never swallow a real failure.
+const mapAuthError = (e) => {
+  const code = e?.code || "";
+  const msg  = e?.message || "Unknown error";
+  const map = {
+    "auth/email-already-in-use":   "An account with this email already exists. Switch to Sign In to log in.",
+    "auth/invalid-email":          "That email address doesn't look valid.",
+    "auth/weak-password":          "Password is too weak — use at least 6 characters.",
+    "auth/wrong-password":         "Incorrect password. Try again or use 'Forgot password?'.",
+    "auth/user-not-found":         "No account found for that email.",
+    "auth/invalid-credential":     "Incorrect email or password.",
+    "auth/user-disabled":          "This account has been disabled.",
+    "auth/too-many-requests":      "Too many attempts. Please wait a few minutes and try again.",
+    "auth/network-request-failed": "Network error — check your internet connection and try again.",
+    "auth/operation-not-allowed":  "Email/password sign-in is disabled for this Firebase project. Enable it in Firebase Console → Authentication → Sign-in method.",
+    "auth/unauthorized-domain":    "This domain isn't authorized for Firebase sign-in. Add it in Firebase Console → Authentication → Settings → Authorized domains.",
+    "auth/popup-blocked":          "Your browser blocked the popup. Allow popups for this site and try again.",
+    "auth/popup-closed-by-user":   "",
+    "auth/cancelled-popup-request":"",
+  };
+  if(code && code in map) return map[code];
+  return "Sign-in failed" + (code ? " ("+code+")" : "") + ": " + msg;
+};
+
 const LoginScreen = ({t, onLogin}) => {
   const [mode, setMode] = useState("login"); // login | register | forgot
   const [email, setEmail] = useState("");
@@ -5768,6 +5794,9 @@ const LoginScreen = ({t, onLogin}) => {
   const googleLogin = async () => {
     setError(""); setLoading(true);
     try {
+      if(!window.TorqueFirebase || !window.TorqueFirebase.signInWithGoogle) {
+        throw new Error("Firebase isn't loaded yet — reload the page and try again.");
+      }
       const user = await window.TorqueFirebase.signInWithGoogle();
       const email = user.email.toLowerCase();
       // Sync local session
@@ -5778,9 +5807,10 @@ const LoginScreen = ({t, onLogin}) => {
       storage.gset("oos-session", {email, ts:Date.now()});
       onLogin(isNew);
     } catch(e) {
-      if(e.code !== "auth/popup-closed-by-user" && e.code !== "auth/cancelled-popup-request") {
-        setError("Google sign-in failed. Please try again.");
-      }
+      console.error("Google sign-in error:", e?.code, e?.message, e);
+      const friendly = mapAuthError(e);
+      // mapAuthError returns "" for user-cancelled popups — suppress those.
+      if(friendly) setError(friendly);
     }
     setLoading(false);
   };
@@ -5805,9 +5835,20 @@ const LoginScreen = ({t, onLogin}) => {
           setLoading(false);
           onLogin(false);
           return;
-        } catch(e) {}
+        } catch(e) {
+          console.error("Firebase signIn error:", e?.code, e?.message, e);
+          // For concrete auth failures (wrong password, unknown user, etc.)
+          // show the real error instead of falling through to localStorage.
+          // Only fall through on transient network failures so offline users
+          // can still sign in with a previously-cached local account.
+          if(e && e.code && e.code !== "auth/network-request-failed") {
+            setError(mapAuthError(e));
+            setLoading(false);
+            return;
+          }
+        }
       }
-      if(!users[email.toLowerCase()]){setError("No account found. Create one below.");setLoading(false);return;}
+      if(!users[email.toLowerCase()]){setError("No account found for this email. Either create an account, or check your network connection and try again.");setLoading(false);return;}
       const isValid = await verifyPassword(password, users[email.toLowerCase()].hash);
       if(!isValid){setError("Incorrect password.");setLoading(false);return;}
       if(!users[email.toLowerCase()].hash.includes(":")){
@@ -5817,15 +5858,25 @@ const LoginScreen = ({t, onLogin}) => {
       storage.gset("oos-session",{email:email.toLowerCase(), ts:Date.now()});
       onLogin(false);
     } else {
-      let firebaseOk = false;
+      // REGISTER
+      let fbErr = null;
       if(window.TorqueFirebase) {
-        try { await window.TorqueFirebase.signUp(email.toLowerCase(), password); firebaseOk = true; } catch(e) {
-          try { await window.TorqueFirebase.signIn(email.toLowerCase(), password); firebaseOk = true; } catch(e2) {
-            setError("Could not create account — please check your internet connection and try again.");
-            setLoading(false);
-            return;
-          }
+        try {
+          await window.TorqueFirebase.signUp(email.toLowerCase(), password);
+        } catch(e) {
+          console.error("Firebase signUp error:", e?.code, e?.message, e);
+          fbErr = e;
         }
+      } else {
+        console.warn("TorqueFirebase not ready — creating local-only account.");
+      }
+      // Only block registration on a concrete Firebase error that isn't a
+      // transient network failure. auth/network-request-failed falls through
+      // to the local-only path so the user isn't locked out offline.
+      if(fbErr && fbErr.code && fbErr.code !== "auth/network-request-failed") {
+        setError(mapAuthError(fbErr));
+        setLoading(false);
+        return;
       }
       const hash = await hashPassword(password);
       users[email.toLowerCase()]={hash, createdAt:new Date().toISOString()};
