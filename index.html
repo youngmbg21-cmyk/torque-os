@@ -1592,7 +1592,7 @@ const OpportunityCard = ({item,t,onSave,isSaved,onRemove,onStatusChange,onNoteCh
         {/* Status Change */}
         {onStatusChange&&<div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:12,marginBottom:10}}>
           {["PURSUE","WATCH","PASS","ACTIVE","RESEARCHING","DECLINED","BUILD","RESEARCH","SKIP"].filter((s,i,arr)=>{
-            const relevant=item.type==="board"||item.type==="consulting"?["PURSUE","WATCH","PASS","ACTIVE","RESEARCHING","DECLINED"]:["PURSUE","WATCH","PASS","BUILD","RESEARCH","SKIP"];
+            const relevant=item.type==="board"?["PURSUE","WATCH","PASS","ACTIVE","RESEARCHING","DECLINED"]:["PURSUE","WATCH","PASS","BUILD","RESEARCH","SKIP"];
             return relevant.includes(s);
           }).slice(0,6).map(s=>(
             <button key={s} onClick={()=>onStatusChange(item,s)} style={{...btn0,fontSize:15,fontWeight:700,padding:"4px 10px",borderRadius:4,border:"1px solid "+(item.status===s?(STATUS_COLORS[s]||"#888")+"60":t.border),background:item.status===s?(STATUS_COLORS[s]||"#888")+"18":"transparent",color:item.status===s?STATUS_COLORS[s]||"#888":t.textMuted}}>{s}</button>
@@ -1750,9 +1750,9 @@ const ScanLog = ({log,onClear,t}) => (
 
 // ─── MODULE: BOARD SCOUT ──────────────────────────────────────────────────────
 const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,onLogActivity,activityLog,
-  boardResults,setBoardResults,consultResults,setConsultResults,
+  boardResults,setBoardResults,
   bsLoading,setBsLoading,bsScanLog,setBsScanLog,bsLastScanned,setBsLastScanned}) => {
-  const [tab,setTab]=useState(()=>{ const t=storage.get("bs-tab"); return t||"board"; });
+  const [tab,setTab]=useState(()=>{ const t=storage.get("bs-tab"); return (t==="board"||t==="saved")?t:"board"; });
   const [countries,setCountries]=useState(()=>storage.get("bs-countries")||(profile.regions||[]).map(n=>ALL_COUNTRIES_FLAT.find(c=>c.name===n)?.code).filter(Boolean)||[]);
   const [sectors,setSectors]=useState(()=>storage.get("bs-sectors")||profile.defaultSectors||[]);
   const [allSectors,setAllSectors]=useState(()=>storage.get("bs-allsectors")!==false);
@@ -1783,24 +1783,21 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
   const runScan=useCallback(async()=>{
     if(!apiKey){setScanLog(["No API key set — configure in Settings"]);return;}
     bsAbortRef.current=new AbortController();
-    setLoading(true);setBoardResults([]);setConsultResults([]);setScanLog(["Starting board & consulting scan..."]);
+    setLoading(true);setBoardResults([]);setScanLog(["Starting board scan..."]);
     const cStr=selectedCountryNames.join(", "), sStr=selectedSectors.join(", ");
     const useSearch=provider==="claude"?[{type:"web_search_20250305",name:"web_search",max_uses:5}]:[];
     const sys="You are a JSON API endpoint. Search the web for real company data and return ONLY raw JSON arrays. No explanations or markdown. Return at least 1 result.";
 
     const boardPrompt=`${profileCtx}\n\nSearch for board seat opportunities in ${cStr} in sectors: ${sStr}. Find companies actively seeking non-executive directors or board advisors whose background matches this candidate: ${expertiseSummary}. Key expertise to match: ${keySkills}.\n\nReturn ONLY a JSON array:\n[{"name":"Company","region":"Country","city":"City","sector":"Sector","status":"PURSUE","type":"board","companyDescription":"2-3 sentences","sentiment":75,"tags":["tag1"],"fitReasons":["specific reason this candidate fits","reason2","reason3"],"estimatedFee":"$2K-$5K/month retainer","engagementType":"Independent Non-Executive Director","contactInfo":"contact@company.com","sourceUrl":"https://url","sourceName":"Source","sourceTitle":"Title"}]\nStatus: PURSUE, WATCH, PASS. Make fitReasons specific to this candidate's actual background — write them in second person addressed to the candidate, e.g. "Your experience in X makes you well positioned..." not "The candidate has experience in X". OUTPUT ONLY JSON.`;
 
-    const consultPrompt=`${profileCtx}\n\nSearch for consulting and advisory mandates in ${cStr} in sectors: ${sStr}. Find organisations that need external expertise matching this candidate's background: ${expertiseSummary}. Key skills to match: ${keySkills}. Look for organisations facing challenges or transformations where this specific expertise would be valuable.\n\nReturn ONLY a JSON array:\n[{"name":"Company","region":"Country","city":"City","sector":"Sector","status":"ACTIVE","type":"consulting","companyDescription":"2-3 sentences","sentiment":72,"tags":["tag1"],"fitReasons":["specific reason this candidate fits","reason2"],"needReasons":["specific challenge this organisation faces that matches the candidate"],"estimatedFee":"$3K-$5K/day","engagementType":"6-month advisory","contactInfo":"contact","sourceUrl":"https://url","sourceName":"Source","sourceTitle":"Title"}]\nStatus: ACTIVE, RESEARCHING, DECLINED. Make fitReasons specific to this candidate's actual expertise — write them in second person addressed to the candidate, e.g. "Your background in X positions you well to help with..." not "The candidate has experience in X". Make needReasons describe the organisation's challenge in third person. OUTPUT ONLY JSON.`;
-
     const bCall=callLLM(provider,apiKey,[{role:"user",content:boardPrompt}],useSearch,sys,"BOARD",(m)=>setScanLog(p=>[...p,m])).then(extractJSON);
-    const cCall=callLLM(provider,apiKey,[{role:"user",content:consultPrompt}],useSearch,sys,"CONSULTING",(m)=>setScanLog(p=>[...p,m])).then(extractJSON);
     const liveCall = liveJobs
       ? fetchLiveJobs({ module:"board", countryCodes: countries, execFunction:"", minSalary:0, onLog:(m)=>setScanLog(p=>[...p,m]) })
       : Promise.resolve([]);
     try {
-    const results=await Promise.allSettled([bCall,cCall,liveCall]);
+    const results=await Promise.allSettled([bCall,liveCall]);
     const now=new Date().toISOString();
-    const liveResults = results[2].status==="fulfilled" ? results[2].value : [];
+    const liveResults = results[1].status==="fulfilled" ? results[1].value : [];
     if(results[0].status==="fulfilled"){
       const aiBr=results[0].value.map((v,i)=>({...v,id:"b-"+Date.now()+"-"+i,moduleTag:"Board",scannedAt:now,dataSource:v.dataSource||"ai_signal"}));
       const br = mergeLiveAndAiResults(aiBr, liveResults);
@@ -1813,8 +1810,6 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
       setScanLog(p=>[...p,"✗ Board: "+results[0].reason?.message]);
       if(liveResults.length>0){ setBoardResults(liveResults);storage.set("bs-results",liveResults);setScanLog(p=>[...p,"✓ Showing "+liveResults.length+" live postings only"]); }
     }
-    if(results[1].status==="fulfilled"){const cr=results[1].value.map((v,i)=>({...v,id:"c-"+Date.now()+"-"+i,moduleTag:"Consulting",scannedAt:now,dataSource:"ai_signal"}));setConsultResults(cr);storage.set("bs-consult-results",cr);setScanLog(p=>[...p,"✓ "+cr.length+" consulting opportunities"]);}
-    else setScanLog(p=>[...p,"✗ Consulting: "+results[1].reason?.message]);
     storage.set("bs-last-scanned",now);setBsLastScanned(now);
     setScanLog(p=>[...p,"Scan complete."]);
   } catch(err){ if(err.name!=="AbortError") setScanLog(p=>[...p,"✗ Error: "+err.message]); }
@@ -1825,18 +1820,16 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     if(saved.some(s=>s.name===item.name&&s.region===item.region)) return;
     setSaved(p=>[...p,{...item,savedAt:new Date().toISOString(),notes:"",source:"board"}]);
     setBoardResults(p=>{const r=p.filter(s=>s.id!==item.id);storage.set("bs-results",r);return r;});
-    setConsultResults(p=>{const r=p.filter(s=>s.id!==item.id);storage.set("bs-consult-results",r);return r;});
   };
   const removeOpp=(id)=>setSaved(p=>p.filter(s=>s.id!==id));
   const removeResult=(id)=>{
     setBoardResults(p=>{const r=p.filter(s=>s.id!==id);storage.set("bs-results",r);return r;});
-    setConsultResults(p=>{const r=p.filter(s=>s.id!==id);storage.set("bs-consult-results",r);return r;});
   };
   const updateNote=(id,notes)=>setSaved(p=>p.map(s=>s.id===id?{...s,notes}:s));
-  const changeStatus=(item,status)=>{ if(tab==="saved") setSaved(p=>p.map(s=>s.id===item.id?{...s,status}:s)); else if(tab==="board") setBoardResults(p=>p.map(v=>v.id===item.id?{...v,status}:v)); else setConsultResults(p=>p.map(v=>v.id===item.id?{...v,status}:v)); };
+  const changeStatus=(item,status)=>{ if(tab==="saved") setSaved(p=>p.map(s=>s.id===item.id?{...s,status}:s)); else setBoardResults(p=>p.map(v=>v.id===item.id?{...v,status}:v)); };
 
   const bsSaved=saved.filter(s=>s.source==="board");
-  const currentItems=tab==="board"?boardResults.filter(i=>statusFilter==="ALL"||i.status===statusFilter):tab==="consulting"?consultResults.filter(i=>statusFilter==="ALL"||i.status===statusFilter):bsSaved.filter(i=>statusFilter==="ALL"||i.status===statusFilter);
+  const currentItems=tab==="board"?boardResults.filter(i=>statusFilter==="ALL"||i.status===statusFilter):bsSaved.filter(i=>statusFilter==="ALL"||i.status===statusFilter);
 
   return (
     <div style={{display:"flex",flexDirection:isMobile?"column":"row",gap:8,flex:1,overflow:"hidden"}}>
@@ -1870,21 +1863,21 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
       <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",overflow:"hidden",maxHeight:"calc(100vh - 58px)",minHeight:0}}>
         <ProfileNudge profile={profile} t={t}/>
         <div style={{flexShrink:0,display:"flex",marginBottom:8,background:t.surface,borderRadius:8,padding:3,border:"1px solid "+t.border}}>
-          {[{key:"board",label:"Board",count:boardResults.length},{key:"consulting",label:"Consulting",count:consultResults.length},{key:"saved",label:"Saved",count:bsSaved.length}].map(({key,label,count})=>(
+          {[{key:"board",label:"Board",count:boardResults.length},{key:"saved",label:"Saved",count:bsSaved.length}].map(({key,label,count})=>(
             <button key={key} onClick={()=>{setTab(key);setStatusFilter("ALL");}} style={{...btn0,flex:1,padding:isMobile?"12px 6px":"9px 8px",borderRadius:6,fontSize:15,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:5,background:tab===key?moduleColor+"15":"transparent",color:tab===key?moduleColor:t.textMuted}}>
               {label}{count>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:8,background:tab===key?moduleColor+"25":t.border,color:tab===key?moduleColor:t.textDim}}>{count}</span>}
             </button>
           ))}
         </div>
         <div style={{flexShrink:0,display:"flex",gap:5,marginBottom:8,flexWrap:"wrap"}}>
-          {["ALL","PURSUE","WATCH","PASS","ACTIVE","RESEARCHING"].map(s=>(
+          {["ALL","PURSUE","WATCH","PASS"].map(s=>(
             <button key={s} onClick={()=>setStatusFilter(s)} style={{...btn0,fontSize:15,fontWeight:700,padding:"4px 10px",borderRadius:4,border:"1px solid "+(statusFilter===s?(STATUS_COLORS[s]||moduleColor)+"60":t.border),background:statusFilter===s?(STATUS_COLORS[s]||moduleColor)+"15":"transparent",color:statusFilter===s?STATUS_COLORS[s]||moduleColor:t.textMuted}}>{s}</button>
           ))}
         </div>
         <div style={{flex:1,overflowY:"auto",minHeight:0}}>
           {currentItems.length===0&&!loading&&<div style={{textAlign:"center",padding:48,color:t.textDim}}>
             <div style={{fontSize:36,marginBottom:10}}>🔍</div>
-            <div style={{fontSize:15,fontWeight:500}}>{tab==="saved"?"No saved board opportunities yet.":"Run a scan to discover board & consulting opportunities."}</div>
+            <div style={{fontSize:15,fontWeight:500}}>{tab==="saved"?"No saved board opportunities yet.":"Run a scan to discover board opportunities."}</div>
           </div>}
           {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule} onLogActivity={onLogActivity} activityLog={activityLog}/>)}
         </div>
@@ -2218,7 +2211,7 @@ const SideHustleModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     const useSearch=provider==="claude"?[{type:"web_search_20250305",name:"web_search",max_uses:5}]:[];
     const sys="You are a JSON API endpoint. Return ONLY raw JSON arrays. No markdown.";
 
-    const prompt=`${profileCtx}\n\nFind paid side hustle opportunities that match this candidate's specific background. Look for: fractional roles, advisory seats, keynote speaking, paid workshops, short project contracts, expert witness or review work, board observer roles — anything where this person's expertise (${professionLabel}) can be monetised on a part-time or project basis in ${cStr}, sectors: ${sStr}.\n\nMINIMUM ANNUAL VALUE: ${minAnnualStr} USD. Only surface opportunities that could realistically generate at least this amount annually based on market rates, engagement frequency, and the candidate's seniority. Use these fee anchors: Board NED (listed) $40K-$120K/year retainer; Board NED (private) $15K-$50K/year; Fractional Director $1,500-$6,000/day × realistic days; Advisory retainer $2K-$8K/month; Keynote $3K-$15K/event; Consulting project fees based on scope. Adjust upward for senior profiles in high-value markets.\n\nFor each opportunity, estimate the realistic annual USD value and include it as annualUSD. Also estimate daysPerYear commitment and calculate usdPerDay. Rate effort as LOW (under 20 days/year), MEDIUM (20-60 days), or HIGH (over 60 days).\n\nReturn ONLY a JSON array:\n[{"name":"Opportunity/Company","region":"Country","city":"City","sector":"Sector","status":"HOT","type":"fractional","description":"what the role is and why it fits this candidate specifically","estimatedFee":"market rate description","annualUSD":120000,"daysPerYear":24,"usdPerDay":5000,"effortRating":"LOW","feeBasis":"3 board meetings/year + $90K retainer","timeCommitment":"2 days/month","sentiment":80,"tags":["tag1"],"fitReasons":["specific reason this candidate fits based on their background","skill match"],"engagementType":"${exampleRole}","sourceUrl":"https://url","sourceName":"Source","whyNow":"why timing is right for this specific person"}\nStatus: HOT, WARM, COLD. Types: fractional, advisory, speaking, workshop, contract, board-observer, expert-witness. Make all results specific to this candidate's actual profession and expertise. Write fitReasons in second person. Be realistic with fee estimates — do not inflate. OUTPUT ONLY JSON.`;
+    const prompt=`${profileCtx}\n\nFind paid side hustle opportunities that match this candidate's specific background. Look for: fractional roles, advisory seats, consulting and advisory mandates, keynote speaking, paid workshops, short project contracts, expert witness or review work, board observer roles — anything where this person's expertise (${professionLabel}) can be monetised on a part-time or project basis in ${cStr}, sectors: ${sStr}.\n\nMINIMUM ANNUAL VALUE: ${minAnnualStr} USD. Only surface opportunities that could realistically generate at least this amount annually based on market rates, engagement frequency, and the candidate's seniority. Use these fee anchors: Board NED (listed) $40K-$120K/year retainer; Board NED (private) $15K-$50K/year; Fractional Director $1,500-$6,000/day × realistic days; Advisory retainer $2K-$8K/month; Keynote $3K-$15K/event; Consulting mandates $3K-$5K/day × engagement length. Adjust upward for senior profiles in high-value markets.\n\nFor each opportunity, estimate the realistic annual USD value and include it as annualUSD. Also estimate daysPerYear commitment and calculate usdPerDay. Rate effort as LOW (under 20 days/year), MEDIUM (20-60 days), or HIGH (over 60 days). For consulting/advisory mandates, derive annualUSD from day rate × realistic project days.\n\nReturn ONLY a JSON array:\n[{"name":"Opportunity/Company","region":"Country","city":"City","sector":"Sector","status":"HOT","type":"fractional","description":"what the role is and why it fits this candidate specifically","estimatedFee":"market rate description","annualUSD":120000,"daysPerYear":24,"usdPerDay":5000,"effortRating":"LOW","feeBasis":"3 board meetings/year + $90K retainer","timeCommitment":"2 days/month","sentiment":80,"tags":["tag1"],"fitReasons":["specific reason this candidate fits based on their background","skill match"],"needReasons":["specific challenge this organisation faces — only for consulting/advisory types"],"engagementType":"${exampleRole}","sourceUrl":"https://url","sourceName":"Source","whyNow":"why timing is right for this specific person"}\nStatus: HOT, WARM, COLD. Types: fractional, advisory, consulting, speaking, workshop, contract, board-observer, expert-witness. Make all results specific to this candidate's actual profession and expertise. Write fitReasons in second person ("Your background in X..."). For consulting/advisory types, ALSO include needReasons describing the organisation's challenge in third person. For other types, omit needReasons. Be realistic with fee estimates — do not inflate. OUTPUT ONLY JSON.`;
 
     try {
       const blocks=await callLLM(provider,apiKey,[{role:"user",content:prompt}],useSearch,sys,"HUSTLES",(m)=>setScanLog(p=>[...p,m]));
@@ -2580,8 +2573,8 @@ Use "you have", "your pipeline", "you should" — never "Young has" or "the user
   };
 
   const modules=[
-    {key:"board",label:"Board Scout",desc:"Board seats & consulting mandates",color:"#6ee7b7",icon:"🏛"},
-    {key:"hustle",label:"Side Hustle Lab",desc:"Fractional roles & paid advisory",color:"#fb923c",icon:"⚡"},
+    {key:"board",label:"Board Scout",desc:"Board seats & NED roles",color:"#6ee7b7",icon:"🏛"},
+    {key:"hustle",label:"Side Hustle Lab",desc:"Fractional, advisory & consulting mandates",color:"#fb923c",icon:"⚡"},
     {key:"exec",label:"Executive Search",desc:"Director & C-suite opportunities",color:"#c084fc",icon:"👔"},
     {key:"venture",label:"Venture Scout",desc:"Startup deals & business ideas",color:"#818cf8",icon:"🚀"},
     {key:"deal",label:"Investment Thesis",desc:"Your thesis-driven deal flow",color:"#f6c90e",icon:"🎯"},
@@ -6323,15 +6316,14 @@ ${profileCtx}
 User request: "${userMsg}"
 
 MODULE DEFINITIONS — read carefully:
-- "board" → ONLY for: board seats, NED roles, board director, board advisor, consulting mandates, governance roles
-- "hustle" → ONLY for: side hustle, consulting jobs, fractional roles, advisory gigs, day rates, part-time income, $X/month from work, paid gigs, freelance
+- "board" → ONLY for: board seats, NED roles, board director, board advisor, governance roles
+- "hustle" → ONLY for: side hustle, consulting, advisory, fractional roles, consulting mandates, advisory gigs, day rates, part-time income, $X/month from work, paid gigs, freelance, expert witness
 - "venture" → ONLY for: startup investment, venture deals, co-founder, equity stakes, angel investing, startup ideas
 - "deal" → ONLY for: investment deals, deal flow, private equity, capital deployment, co-investing in companies
 
 STRICT MODULE SELECTION RULES:
-- If user says "side hustle", "consulting jobs", "freelance", "gig", "part-time income" → use ONLY "hustle"
+- If user says "consulting", "advisory", "consulting mandate", "side hustle", "freelance", "gig", "fractional", "part-time income" → use ONLY "hustle"
 - If user says "board seat", "NED", "board director" → use ONLY "board"
-- If user says "consulting" AND "side hustle" in the same request → use ONLY "hustle" (side hustle takes priority)
 - If user says "startup", "invest in", "angel" → use ONLY "venture"
 - If user says "deal", "co-invest", "deploy capital" → use ONLY "deal"
 - Use 2 modules ONLY if the request genuinely spans two distinct categories
@@ -6766,22 +6758,22 @@ Be direct, specific, and personal. Reference the candidate's actual profile. Max
     const incomeMatch = m.match(/\$([\d,]+)\s*(?:k|usd|per month|\/month)?/i);
     const constraint = incomeMatch ? incomeMatch[0]+" income target" : "";
 
-    // STRICT priority — hustle takes over "consulting" when "side hustle" or income target present
+    // Consulting/advisory always routes to hustle (post-merge)
     const wantsHustle = m.includes("side hustle")||m.includes("hustle")||m.includes("gig")||
                         m.includes("freelance")||m.includes("fractional")||m.includes("part-time")||
-                        m.includes("per month")||m.includes("/month")||m.includes("monthly income");
-    const wantsBoard = m.includes("board")||m.includes("director")||m.includes("mandate")||
-                       (m.includes("consulting")&&!wantsHustle);
+                        m.includes("per month")||m.includes("/month")||m.includes("monthly income")||
+                        m.includes("consulting")||m.includes("advisory")||m.includes("mandate")||
+                        m.includes("expert witness");
+    const wantsBoard = m.includes("board")||m.includes("ned")||m.includes("non-executive")||
+                       m.includes("governance")||(m.includes("director")&&!wantsHustle);
     const wantsVenture = m.includes("venture")||m.includes("startup")||m.includes("angel")||
                          (m.includes("invest")&&!m.includes("investment thesis")&&!wantsHustle);
     const wantsDeal = m.includes("deal flow")||m.includes("co-invest")||(m.includes("deal")&&!wantsHustle);
-    // "consulting" alone with income target = hustle, not board
-    const wantsConsultingIncome = m.includes("consulting")&&(wantsHustle||!!incomeMatch);
 
-    if (wantsHustle||wantsConsultingIncome)
-      steps.push({module:"hustle", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Side hustle/income intent detected"});
-    if (wantsBoard&&!wantsConsultingIncome)
-      steps.push({module:"board", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Board/consulting mandate intent detected"});
+    if (wantsHustle)
+      steps.push({module:"hustle", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Side hustle/consulting/income intent detected"});
+    if (wantsBoard)
+      steps.push({module:"board", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Board/NED intent detected"});
     if (wantsVenture)
       steps.push({module:"venture", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Venture/startup intent detected"});
     if (wantsDeal)
@@ -7089,8 +7081,46 @@ class ErrorBoundary extends React.Component {
   }
 }
 
+// ─── MIGRATION: Consulting tab merged into Side Hustle Lab (one-time) ────────
+function migrateConsultingToHustlesIfNeeded(){
+  try {
+    if (storage.get("oos-mig-consulting-merged-v1")) return;
+    const STATUS_MAP = {ACTIVE:"HOT", RESEARCHING:"WARM", DECLINED:"COLD"};
+    const remap = (item) => ({
+      ...item,
+      status: STATUS_MAP[item.status] || item.status || "WARM",
+      moduleTag: item.moduleTag || "Consulting",
+      effortRating: item.effortRating || "MEDIUM",
+    });
+    const oldConsult = storage.get("bs-consult-results") || [];
+    if (oldConsult.length > 0) {
+      const existingHustles = storage.get("sh-results") || [];
+      const seen = new Set(existingHustles.map(h => (h.name||"")+"|"+(h.region||"")));
+      const merged = [...existingHustles];
+      for (const c of oldConsult) {
+        const key = (c.name||"")+"|"+(c.region||"");
+        if (!seen.has(key)) { merged.push(remap(c)); seen.add(key); }
+      }
+      storage.set("sh-results", merged);
+    }
+    storage.del("bs-consult-results");
+    const savedItems = storage.get("oos-saved") || [];
+    let mutated = false;
+    const updatedSaved = savedItems.map(s => {
+      if (s.source === "board" && s.type === "consulting") {
+        mutated = true;
+        return {...s, source:"hustle", status: STATUS_MAP[s.status] || s.status, effortRating: s.effortRating || "MEDIUM"};
+      }
+      return s;
+    });
+    if (mutated) storage.set("oos-saved", updatedSaved);
+    storage.set("oos-mig-consulting-merged-v1", true);
+  } catch(e) { /* migration is best-effort */ }
+}
+
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 function TorqueOS({initialProfile, onLogout, startOnSettings}) {
+  migrateConsultingToHustlesIfNeeded();
   const [theme,setTheme]=useState(()=>storage.get("oos-theme")||"dark");
   const t=THEMES[theme];
   const [activeModule,setActiveModule]=useState(startOnSettings?"settings":"home");
@@ -7150,7 +7180,6 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
 
   // ── Lifted scan state — persists across navigation and page reloads ──
   const [boardResults,setBoardResults]=useState(()=>(storage.get("bs-results")||[]).filter(r=>!(storage.get("oos-saved")||[]).some(s=>s.name===r.name&&s.region===r.region)));
-  const [consultResults,setConsultResults]=useState(()=>(storage.get("bs-consult-results")||[]).filter(r=>!(storage.get("oos-saved")||[]).some(s=>s.name===r.name&&s.region===r.region)));
   const [bsLoading,setBsLoading]=useState(false);
   const [bsScanLog,setBsScanLog]=useState([]);
   const [bsLastScanned,setBsLastScanned]=useState(()=>storage.get("bs-last-scanned")||null);
@@ -7476,8 +7505,8 @@ ${profileCtx}
 USER REQUEST: "${userMsg}"
 
 MODULE RULES:
-- "board" → board seats, NED, director, governance, consulting mandates
-- "hustle" → side hustle, consulting gigs, fractional, advisory, day rates, part-time income
+- "board" → board seats, NED, director, governance
+- "hustle" → side hustle, consulting, advisory, consulting mandates, fractional, day rates, part-time income
 - "venture" → startup investment, co-founder, angel, equity
 - "deal" → deal flow, co-invest, private equity, capital deployment
 
@@ -7494,9 +7523,9 @@ Use 1 module unless user explicitly asks for 2. Default geography: user's profil
     } catch(e) {
       // Fallback plan
       const geo = profile.location || "Global";
-      const modules = /board|director|NED|governance/i.test(userMsg) ? ["board"] :
+      const modules = /hustle|consulting|advisory|gig|fractional|income|mandate/i.test(userMsg) ? ["hustle"] :
+        /board|NED|non-executive|governance/i.test(userMsg) ? ["board"] :
         /exec|executive|job|role|hiring|C-suite|VP|director.*search/i.test(userMsg) ? ["exec"] :
-                      /hustle|consulting|gig|fractional|income/i.test(userMsg) ? ["hustle"] :
                       /venture|startup|angel|equity/i.test(userMsg) ? ["venture"] :
                       /deal|invest|capital/i.test(userMsg) ? ["deal"] : ["board","hustle"];
       plan = {intent: userMsg, steps: modules.map(m=>({module:m, geography:geo, sectors:(profile.defaultSectors||[]).slice(0,2), constraint:""}))};
@@ -7518,7 +7547,7 @@ Geography: ${step.geography}
 Sectors: ${sectorStr}
 Constraint: ${step.constraint||"none"}
 
-Search for real ${step.module==="board"?"board director / NED / consulting mandate":step.module==="hustle"?"consulting gig / fractional / advisory":step.module==="venture"?"startup investment":step.module==="deal"?"investment deal":step.module} opportunities in ${step.geography} in ${sectorStr}.
+Search for real ${step.module==="board"?"board director / NED / governance role":step.module==="hustle"?"consulting mandate / fractional / advisory":step.module==="venture"?"startup investment":step.module==="deal"?"investment deal":step.module} opportunities in ${step.geography} in ${sectorStr}.
 
 Return JSON array of exactly ${requestedCount} items:
 [{"name":"Company Name","region":"Country","city":"City","sector":"Sector","type":"${step.module}","companyDescription":"2-3 sentence description","sentiment":72,"tags":["tag1"],"fitReasons":["Reason referencing candidate background"],"estimatedFee":"$4K-$6K/month","engagementType":"Independent NED","timeCommitment":"1-2 days/month","sourceUrl":"https://url","sourceName":"Source","moduleTag":"${step.module.charAt(0).toUpperCase()+step.module.slice(1)}"}]`;
@@ -7644,7 +7673,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
               {m.key==="deal"&&dmLoading&&<span style={{width:6,height:6,borderRadius:"50%",background:"#f6c90e",animation:"pulse 1s ease-in-out infinite",flexShrink:0}}/>}
               {m.key==="network"&&niLoading&&<span style={{width:6,height:6,borderRadius:"50%",background:"#818cf8",animation:"pulse 1s ease-in-out infinite",flexShrink:0}}/>}
               {m.key==="vibe"&&vaLoading&&<span style={{width:6,height:6,borderRadius:"50%",background:"#a78bfa",animation:"pulse 1s ease-in-out infinite",flexShrink:0}}/>}
-              {m.key==="board"&&!bsLoading&&boardResults.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#6ee7b7"+"20",color:"#6ee7b7"}}>{boardResults.length+consultResults.length}</span>}
+              {m.key==="board"&&!bsLoading&&boardResults.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#6ee7b7"+"20",color:"#6ee7b7"}}>{boardResults.length}</span>}
               {m.key==="venture"&&!vsLoading&&ventures.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#818cf8"+"20",color:"#818cf8"}}>{ventures.length+ideas.length}</span>}
               {m.key==="hustle"&&!shLoading&&hustles.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#fb923c"+"20",color:"#fb923c"}}>{hustles.length}</span>}
               {m.key==="exec"&&!esLoading&&esResults.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#c084fc20",color:"#c084fc"}}>{esResults.length}</span>}
@@ -7715,9 +7744,9 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
               <div style={{fontSize:15,color:t.textDim}}>
                 {activeModule==="home"&&"Your morning intelligence brief"}
                 {activeModule==="tower"&&"Live view of all your opportunities in motion"}
-                {activeModule==="board"&&"Board seats & consulting mandates"}
+                {activeModule==="board"&&"Board seats & NED roles"}
                 {activeModule==="venture"&&"Startup deals & business ideas"}
-                {activeModule==="hustle"&&"Fractional roles, advisory & paid gigs"}
+                {activeModule==="hustle"&&"Fractional, advisory, consulting & paid gigs"}
                 {activeModule==="exec"&&"Director & C-suite opportunities based on hiring signals"}
                 {activeModule==="deal"&&"Configure your investment thesis and scan for matching deals"}
                 {activeModule==="pipeline"&&saved.length+" opportunities saved across all modules"}
@@ -7752,7 +7781,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
             </div>
           }
           {/* Two-column pages manage their own scroll per panel */}
-          {activeModule==="board"&&<BoardScoutModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} boardResults={boardResults} setBoardResults={setBoardResults} consultResults={consultResults} setConsultResults={setConsultResults} bsLoading={bsLoading} setBsLoading={setBsLoading} bsScanLog={bsScanLog} setBsScanLog={setBsScanLog} bsLastScanned={bsLastScanned} setBsLastScanned={setBsLastScanned}/>}
+          {activeModule==="board"&&<BoardScoutModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} boardResults={boardResults} setBoardResults={setBoardResults} bsLoading={bsLoading} setBsLoading={setBsLoading} bsScanLog={bsScanLog} setBsScanLog={setBsScanLog} bsLastScanned={bsLastScanned} setBsLastScanned={setBsLastScanned}/>}
           {activeModule==="venture"&&<VentureScoutModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} ventures={ventures} setVentures={setVentures} ideas={ideas} setIdeas={setIdeas} vsLoading={vsLoading} setVsLoading={setVsLoading} vsScanLog={vsScanLog} setVsScanLog={setVsScanLog} vsLastScanned={vsLastScanned} setVsLastScanned={setVsLastScanned}/>}
           {activeModule==="hustle"&&<SideHustleModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} hustles={hustles} setHustles={setHustles} shLoading={shLoading} setShLoading={setShLoading} shScanLog={shScanLog} setShScanLog={setShScanLog} shLastScanned={shLastScanned} setShLastScanned={setShLastScanned}/>}
           {activeModule==="exec"&&<ExecSearchModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} esResults={esResults} setEsResults={setEsResults} esLoading={esLoading} setEsLoading={setEsLoading} esScanLog={esScanLog} setEsScanLog={setEsScanLog} esLastScanned={esLastScanned} setEsLastScanned={setEsLastScanned}/>}
