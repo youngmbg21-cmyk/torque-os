@@ -1134,78 +1134,20 @@ const extractJSON = (blocks) => {
 };
 
 // ─── LIVE JOB BOARD INTEGRATIONS ──────────────────────────────────────────────
-// Fetches real job postings from public job-board APIs and normalises them to
-// the TorqueOS opportunity schema so Board Scout and Executive Search can
-// blend verified live postings with AI-inferred signals.
+// Fetches real job postings from Adzuna and normalises them to the TorqueOS
+// opportunity schema so Board Scout and Executive Search can blend verified
+// live postings with AI-inferred signals.
 //
-// Two sources currently supported:
-//   • The Muse — free, no API key, CORS enabled. Good for mid-to-senior roles.
-//   • Adzuna    — free tier (requires app_id + app_key from Settings). Good
-//                 global coverage with real salary data. Strong for exec roles.
+// Source: Adzuna — free tier (requires app_id + app_key from Settings). Good
+// global coverage with real salary data. Strong for exec roles.
 //
-// All sources return objects shaped like existing Board/Exec results so they
-// flow through OpportunityCard, scoring, pipeline save, and docs generation
-// without any additional branching logic downstream.
+// Returned objects are shaped like existing Board/Exec results so they flow
+// through OpportunityCard, scoring, pipeline save, and docs generation without
+// any additional branching logic downstream.
 const ADZUNA_COUNTRY_MAP = {
   GB:"gb", US:"us", AU:"au", BR:"br", CA:"ca", DE:"de", FR:"fr", IN:"in",
   IT:"it", MX:"mx", NL:"nl", NZ:"nz", PL:"pl", SG:"sg", ZA:"za", AT:"at",
   BE:"be", CH:"ch", ES:"es"
-};
-
-const fetchMuseJobs = async ({ countryNames, execFunction, module, onLog }) => {
-  try {
-    onLog && onLog("📡 Querying The Muse live job board…");
-    const levels = ["Senior Level","Management","Director","Executive"];
-    const params = new URLSearchParams();
-    levels.forEach(l => params.append("level", l));
-    (countryNames||[]).slice(0,3).forEach(c => params.append("location", c));
-    if(execFunction) params.append("category", execFunction);
-    params.append("page","0");
-    const url = "https://www.themuse.com/api/public/jobs?" + params.toString();
-    const res = await fetch(url);
-    if(!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
-    const now = new Date().toISOString();
-    const out = (data.results||[]).slice(0,15).map((job,i)=>{
-      const loc = job.locations?.[0]?.name || "";
-      const locParts = loc.split(",").map(s=>s.trim());
-      const cleanedContent = (job.contents||"").replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();
-      return {
-        id: "lj-muse-" + (job.id || Date.now()+"-"+i),
-        name: job.company?.name || "Unknown Company",
-        jobTitle: job.name || "",
-        probableRole: job.name || "",
-        region: locParts[locParts.length-1] || (countryNames?.[0]||""),
-        city: locParts[0] || "",
-        sector: job.categories?.[0]?.name || "",
-        status: module === "exec" ? "WARM" : "WATCH",
-        type: module === "board" ? "board" : "exec",
-        companyDescription: cleanedContent.slice(0, 260),
-        description: cleanedContent.slice(0, 260),
-        sentiment: 60,
-        tags: (job.categories||[]).map(c=>c.name).slice(0,3),
-        fitReasons: [
-          "Live posting on The Muse — you can apply directly without a warm introduction.",
-          "Verified active vacancy, not an AI-inferred signal, so timing is known."
-        ],
-        hiringSignal: "Active public job posting",
-        whyNow: job.publication_date ? ("Posted " + new Date(job.publication_date).toLocaleDateString() + " — application window is open.") : "Currently live on The Muse.",
-        sourceUrl: job.refs?.landing_page || "",
-        applyUrl: job.refs?.landing_page || "",
-        sourceName: "The Muse",
-        jobBoardSource: "The Muse",
-        dataSource: "live_posting",
-        postedDate: job.publication_date || null,
-        scannedAt: now,
-        moduleTag: module === "board" ? "Board" : "Exec Role"
-      };
-    });
-    onLog && onLog("✓ The Muse returned " + out.length + " live postings");
-    return out;
-  } catch(e) {
-    onLog && onLog("✗ The Muse: " + (e.message||"fetch failed"));
-    return [];
-  }
 };
 
 const fetchAdzunaJobs = async ({ countryCodes, execFunction, minSalary, module, onLog }) => {
@@ -1294,16 +1236,7 @@ const fetchAdzunaJobs = async ({ countryCodes, execFunction, minSalary, module, 
 
 // Orchestrator: fan out to all enabled sources in parallel.
 const fetchLiveJobs = async ({ module, countryCodes, execFunction, minSalary, onLog }) => {
-  const countryNames = (countryCodes||[]).map(code => {
-    const found = (typeof ALL_COUNTRIES_FLAT !== "undefined")
-      ? ALL_COUNTRIES_FLAT.find(x => x.code === code) : null;
-    return found ? found.name : code;
-  });
-  const [muse, adzuna] = await Promise.all([
-    fetchMuseJobs({ countryNames, execFunction, module, onLog }),
-    fetchAdzunaJobs({ countryCodes, execFunction, minSalary, module, onLog })
-  ]);
-  return [...muse, ...adzuna];
+  return await fetchAdzunaJobs({ countryCodes, execFunction, minSalary, module, onLog });
 };
 
 // Merge AI-generated results with live postings. When an AI signal matches a
@@ -4667,9 +4600,9 @@ const CountryDropdown = ({value, onChange, t}) => {
 };
 
 // ─── MODULE: SETTINGS ─────────────────────────────────────────────────────────
-// Live Job Boards config — Adzuna credentials are optional; The Muse works
-// without any key. When Adzuna keys are present, scans in Board Scout and
-// Executive Search will also query Adzuna in parallel with AI scans and The Muse.
+// Live Job Boards config — Adzuna credentials are required to enable live
+// postings. When configured, scans in Board Scout and Executive Search will
+// blend real Adzuna postings with AI-inferred hiring signals.
 const LiveJobBoardSettings = ({t,inputS,isMobile}) => {
   const [adzId,setAdzId]=useState(()=>storage.get("oos-adzuna-id")||"");
   const [adzKey,setAdzKey]=useState(()=>storage.get("oos-adzuna-key")||"");
@@ -4692,7 +4625,7 @@ const LiveJobBoardSettings = ({t,inputS,isMobile}) => {
         <span style={{fontSize:11,fontWeight:700,padding:"2px 6px",borderRadius:4,background:"#10b98120",color:"#10b981",marginLeft:"auto"}}>OPTIONAL</span>
       </div>
       <div style={{fontSize:14,color:t.textMuted,marginBottom:10,lineHeight:1.55}}>
-        When enabled in Board Scout or Executive Search, scans will blend real job postings with AI-inferred hiring signals. <strong style={{color:t.text}}>The Muse</strong> works without any credentials. <strong style={{color:t.text}}>Adzuna</strong> adds broader global coverage with published salary data — create a free developer account at <a href="https://developer.adzuna.com" target="_blank" rel="noopener noreferrer" style={{color:"#10b981",fontWeight:600}}>developer.adzuna.com</a> to get an app_id and app_key.
+        When enabled in Board Scout or Executive Search, scans will blend real job postings with AI-inferred hiring signals. <strong style={{color:t.text}}>Adzuna</strong> provides global coverage with published salary data — create a free developer account at <a href="https://developer.adzuna.com" target="_blank" rel="noopener noreferrer" style={{color:"#10b981",fontWeight:600}}>developer.adzuna.com</a> to get an app_id and app_key. Without these credentials, the live postings toggle will return no results.
       </div>
       <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:7,marginBottom:8}}>
         <div>
@@ -4713,7 +4646,7 @@ const LiveJobBoardSettings = ({t,inputS,isMobile}) => {
         </button>
         {configured&&<button onClick={clear} style={{...btn0,padding:"7px 12px",borderRadius:7,background:t.coralDim,border:"1px solid "+t.coral+"30",color:t.coral,fontSize:14,fontWeight:600}}>Forget</button>}
         <span style={{fontSize:13,color:configured?"#10b981":t.textDim,marginLeft:"auto"}}>
-          {configured?"✓ Adzuna configured":"The Muse only (no key required)"}
+          {configured?"✓ Adzuna configured":"Not configured — live postings disabled"}
         </span>
       </div>
     </div>
