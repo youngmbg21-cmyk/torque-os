@@ -2182,14 +2182,16 @@ const DealMonitorModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,on
 };
 
 // ─── MODULE: COMMAND CENTER ────────────────────────────────────────────────────
-const CommandCenter = ({t,profile,saved,isMobile,setActiveModule,apiKey,provider,profileComplete,gatedModules,activityLog,contacts,saveToVault}) => {
+const CommandCenter = ({t,profile,saved,isMobile,setActiveModule,apiKey,provider,profileComplete,gatedModules,activityLog,contacts,saveToVault,hiddenModules}) => {
   const now=new Date();
   const hr=now.getHours();
   const greeting=hr<12?"Good morning":hr<17?"Good afternoon":"Good evening";
   const name=profile.name?profile.name.split(" ")[0]:"";
-  const total=saved.length;
-  const bySource={board:saved.filter(s=>s.source==="board").length,venture:saved.filter(s=>s.source==="venture").length,hustle:saved.filter(s=>s.source==="hustle").length,deal:saved.filter(s=>s.source==="deal").length};
-  const topPursue=saved.filter(s=>s.status==="PURSUE"||s.status==="BUILD"||s.status==="HOT").slice(0,3);
+  const hidden=hiddenModules||[];
+  const visibleSaved=saved.filter(s=>!hidden.includes(s.source));
+  const total=visibleSaved.length;
+  const bySource={board:visibleSaved.filter(s=>s.source==="board").length,venture:visibleSaved.filter(s=>s.source==="venture").length,hustle:visibleSaved.filter(s=>s.source==="hustle").length,deal:visibleSaved.filter(s=>s.source==="deal").length,exec:visibleSaved.filter(s=>s.source==="exec").length};
+  const topPursue=visibleSaved.filter(s=>s.status==="PURSUE"||s.status==="BUILD"||s.status==="HOT").slice(0,3);
   const [morningBrief,setMorningBrief]=useState(null);
   const [briefLoading,setBriefLoading]=useState(false);
   const [weeklyDigest,setWeeklyDigest]=useState(null);
@@ -2328,7 +2330,7 @@ Use "you have", "your pipeline", "you should" — never "Young has" or "the user
     {key:"exec",label:"Executive Search",desc:"Director & C-suite opportunities",color:"#c084fc",icon:"👔"},
     {key:"venture",label:"Venture Scout",desc:"Startup deals & business ideas",color:"#818cf8",icon:"🚀"},
     {key:"deal",label:"Investment Thesis",desc:"Your thesis-driven deal flow",color:"#f6c90e",icon:"🎯"},
-  ];
+  ].filter(m=>!hidden.includes(m.key));
 
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%",minHeight:0}}>
@@ -2376,12 +2378,16 @@ Use "you have", "your pipeline", "you should" — never "Young has" or "the user
 
       {/* Pipeline summary */}
       <div style={{display:"grid",gridTemplateColumns:isMobile?"repeat(2,1fr)":"repeat(4,1fr)",gap:8,marginBottom:16,position:"sticky",top:0,zIndex:3,background:t.bg,paddingTop:4,paddingBottom:4}}>
-        {[
-          {label:"Total Saved",value:total,color:t.accent},
-          {label:"Board & Advisory",value:bySource.board+bySource.hustle,color:"#6ee7b7"},
-          {label:"Ventures & Deals",value:bySource.venture+bySource.deal,color:"#818cf8"},
-          {label:"Top Prospects",value:topPursue.length,color:"#f6c90e"},
-        ].map((stat,i)=>(
+        {(() => {
+          const advisoryShown=!hidden.includes("board")||!hidden.includes("hustle");
+          const advisoryLabel=hidden.includes("board")?"Advisory":hidden.includes("hustle")?"Board":"Board & Advisory";
+          return [
+            {label:"Total Saved",value:total,color:t.accent},
+            advisoryShown?{label:advisoryLabel,value:(bySource.board||0)+(bySource.hustle||0),color:"#6ee7b7"}:null,
+            {label:"Ventures & Deals",value:bySource.venture+bySource.deal,color:"#818cf8"},
+            {label:"Top Prospects",value:topPursue.length,color:"#f6c90e"},
+          ].filter(Boolean);
+        })().map((stat,i)=>(
           <div key={i} style={{background:t.card,border:"1px solid "+stat.color+"25",borderRadius:8,padding:"10px 12px"}}>
             <div style={{fontSize:isMobile?20:22,fontWeight:800,color:stat.color,fontFamily:"'DM Mono',monospace"}}>{stat.value}</div>
             <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.06em",color:t.textDim,marginTop:3}}>{stat.label.toUpperCase()}</div>
@@ -2553,9 +2559,12 @@ const sourceLabel = (src) => {
   return map[src] || (src ? src.charAt(0).toUpperCase()+src.slice(1) : "Unknown");
 };
 
-const PipelineModule = ({t,saved,setSaved,isMobile,onOpenChat,profile,apiKey,provider,onOpenTax,onOpenNetwork,onOpenDocs,onNavigateToSource,onSchedule,onLogActivity,activityLog}) => {
+const PipelineModule = ({t,saved:savedAll,setSaved,isMobile,onOpenChat,profile,apiKey,provider,onOpenTax,onOpenNetwork,onOpenDocs,onNavigateToSource,onSchedule,onLogActivity,activityLog,hiddenModules}) => {
+  const hidden=hiddenModules||[];
+  const saved=React.useMemo(()=>(savedAll||[]).filter(s=>!hidden.includes(s.source)),[savedAll,hidden]);
   const [view,setView]=useState(()=>storage.get("pipeline-view")||"kanban");
   const [sourceFilter,setSourceFilter]=useState("ALL");
+  useEffect(()=>{ if(sourceFilter!=="ALL"&&hidden.includes(sourceFilter)) setSourceFilter("ALL"); },[hidden,sourceFilter]);
   const [listStatusFilter,setListStatusFilter]=useState("ALL");
   const [valueSortBy,setValueSortBy]=useState("annualUSD");
   const [valueAnalysing,setValueAnalysing]=useState(false);
@@ -2671,7 +2680,7 @@ Be conservative and realistic. OUTPUT ONLY JSON.`;
 
       {/* Frozen source filter */}
       <div style={{flexShrink:0,display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>
-        {["ALL","board","venture","hustle","exec","deal"].map(s=>(
+        {["ALL","board","venture","hustle","exec","deal"].filter(s=>s==="ALL"||!hidden.includes(s)).map(s=>(
           <button key={s} onClick={()=>setSourceFilter(s)} style={{...btn0,fontSize:15,fontWeight:700,padding:"4px 10px",borderRadius:4,border:"1px solid "+(sourceFilter===s?(moduleColors[s]||t.accent)+"60":t.border),background:sourceFilter===s?(moduleColors[s]||t.accent)+"15":"transparent",color:sourceFilter===s?moduleColors[s]||t.accent:t.textMuted}}>{s==="ALL"?"All":sourceLabel(s)}</button>
         ))}
       </div>
@@ -3687,7 +3696,9 @@ ${htmlLines}
 };
 
 // ─── MODULE: CONTROL TOWER ────────────────────────────────────────────────────
-const ControlTowerModule = ({t, isMobile, saved, activityLog, contacts, calendarEvents, setActiveModule}) => {
+const ControlTowerModule = ({t, isMobile, saved:savedAll, activityLog, contacts, calendarEvents, setActiveModule, hiddenModules}) => {
+  const hidden=hiddenModules||[];
+  const saved=React.useMemo(()=>(savedAll||[]).filter(s=>!hidden.includes(s.source)),[savedAll,hidden]);
   const TC = {board:"#6ee7b7", exec:"#c084fc", hustle:"#fb923c", venture:"#818cf8", deal:"#f6c90e"};
   const [selectedOpp, setSelectedOpp] = useState(null);
 
@@ -3777,7 +3788,7 @@ const ControlTowerModule = ({t, isMobile, saved, activityLog, contacts, calendar
       <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
         <span style={{fontSize:13,color:t.textMuted}}>{saved.length} opportunities</span>
         <span style={{color:t.textDim}}>·</span>
-        {Object.entries({board:"#6ee7b7",exec:"#c084fc",hustle:"#fb923c",venture:"#818cf8",deal:"#f6c90e"}).map(([src,col])=>{
+        {Object.entries({board:"#6ee7b7",exec:"#c084fc",hustle:"#fb923c",venture:"#818cf8",deal:"#f6c90e"}).filter(([src])=>!hidden.includes(src)).map(([src,col])=>{
           const cnt = saved.filter(s=>s.source===src).length;
           if(!cnt) return null;
           return <span key={src} style={{fontSize:11,fontWeight:700,padding:"2px 9px",borderRadius:20,border:"1px solid "+col+"40",color:col,background:col+"12"}}>{cnt} {src}</span>;
@@ -4417,7 +4428,7 @@ const CountryDropdown = ({value, onChange, t}) => {
 };
 
 // ─── MODULE: SETTINGS ─────────────────────────────────────────────────────────
-const SettingsModule = ({t,profile,setProfile,apiKey,setApiKey,provider,setProvider,isMobile,isNewUser}) => {
+const SettingsModule = ({t,profile,setProfile,apiKey,setApiKey,provider,setProvider,isMobile,isNewUser,hiddenModules,setHiddenModules}) => {
   const [showKey,setShowKey]=useState(false);
   const [localProfile,setLocalProfile]=useState(profile);
   const [saved,setSaved]=useState(false);
@@ -4556,6 +4567,43 @@ Return ONLY JSON, no markdown, no backticks.`;
         {!apiKey&&<div style={{marginTop:8,fontSize:15,color:"#f59e0b"}}>⚠ API key required to run scans and use the AI chatbot.</div>}
         {apiKey&&<div style={{marginTop:8,fontSize:15,color:t.accent}}>✓ API key configured for {prov.name}</div>}
       </div>
+
+      {/* Module Visibility */}
+      {(() => {
+        const opps=[
+          {key:"board",label:"Board Scout",desc:"Board seats & NED roles",color:"#6ee7b7",icon:"🏛"},
+          {key:"hustle",label:"Side Hustle Lab",desc:"Fractional, advisory & consulting",color:"#fb923c",icon:"⚡"},
+          {key:"exec",label:"Executive Search",desc:"Director & C-suite roles",color:"#c084fc",icon:"👔"},
+        ];
+        const visibleCount=opps.filter(o=>!hiddenModules.includes(o.key)).length;
+        const toggle=(k)=>{
+          const next=hiddenModules.includes(k)?hiddenModules.filter(x=>x!==k):[...hiddenModules,k];
+          setHiddenModules(next);
+        };
+        return (
+          <div style={{background:t.card,border:"1px solid "+t.border,boxShadow:t.cardShadow,borderRadius:10,padding:"12px 14px",marginBottom:10}}>
+            <div style={{fontSize:15,fontWeight:700,color:t.text,marginBottom:3,display:"flex",alignItems:"center",gap:6}}><Ic.Eye size={13} color={t.accent}/>Visible modules</div>
+            <div style={{fontSize:14,color:t.textMuted,marginBottom:10,lineHeight:1.55}}>Choose which opportunity modules to show. Hidden modules disappear from the sidebar, dashboard, pipeline, and chat suggestions. Saved items from a hidden module are filtered out of view but not deleted.</div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {opps.map(o=>{
+                const visible=!hiddenModules.includes(o.key);
+                const isLast=visible&&visibleCount===1;
+                return (
+                  <label key={o.key} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",background:t.input,border:"1px solid "+(visible?o.color+"40":t.border),borderRadius:8,cursor:isLast?"not-allowed":"pointer",opacity:isLast?0.85:1}}>
+                    <input type="checkbox" checked={visible} disabled={isLast} onChange={()=>!isLast&&toggle(o.key)} style={{accentColor:o.color,width:14,height:14}}/>
+                    <span style={{fontSize:18}}>{o.icon}</span>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:14,fontWeight:700,color:t.text}}>{o.label}</div>
+                      <div style={{fontSize:12,color:t.textMuted,lineHeight:1.4}}>{o.desc}</div>
+                    </div>
+                    {isLast&&<span style={{fontSize:11,fontWeight:700,color:t.textDim,letterSpacing:"0.06em"}}>REQUIRED</span>}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* CV Upload */}
       <div style={{background:t.card,border:"1px solid "+t.border,boxShadow:t.cardShadow,borderRadius:10,padding:"12px 14px",marginBottom:10}}>
@@ -5918,7 +5966,7 @@ Return ONLY JSON, no markdown.`;
 
 
 // ─── MODULE: VIBE AGENT ───────────────────────────────────────────────────
-const VibeAgentModule = ({t, apiKey, provider, profile, isMobile, saved, setSaved, onOpenChat, onOpenTax, onOpenNetwork, onOpenDocs, vaMessages, setVaMessages, vaScanLog, setVaScanLog, vaInput, setVaInput, vaLoading, setVaLoading, setActiveModule}) => {
+const VibeAgentModule = ({t, apiKey, provider, profile, isMobile, saved, setSaved, onOpenChat, onOpenTax, onOpenNetwork, onOpenDocs, vaMessages, setVaMessages, vaScanLog, setVaScanLog, vaInput, setVaInput, vaLoading, setVaLoading, setActiveModule, hiddenModules}) => {
   const moduleColor = "#a78bfa";
   // State lifted to TorqueOS parent so it persists across tab navigation
   const messages = vaMessages;
@@ -6003,23 +6051,34 @@ Goal: ${profile.goalLabel||""} ${profile.goalYear?"by "+profile.goalYear:""}`;
     return geo;
   };
 
-  const buildPlanPrompt = (userMsg) => `You are the planning brain for TorqueOS. Your ONLY job is to read the user's request literally and pick the RIGHT module(s).
+  const buildPlanPrompt = (userMsg) => {
+    const hidden=hiddenModules||[];
+    const moduleDefs={
+      board:'- "board" → ONLY for: board seats, NED roles, board director, board advisor, governance roles',
+      hustle:'- "hustle" → ONLY for: side hustle, consulting, advisory, fractional roles, consulting mandates, advisory gigs, day rates, part-time income, $X/month from work, paid gigs, freelance, expert witness',
+      venture:'- "venture" → ONLY for: startup investment, venture deals, co-founder, equity stakes, angel investing, startup ideas',
+      deal:'- "deal" → ONLY for: investment deals, deal flow, private equity, capital deployment, co-investing in companies',
+    };
+    const strictRules={
+      hustle:'- If user says "consulting", "advisory", "consulting mandate", "side hustle", "freelance", "gig", "fractional", "part-time income" → use ONLY "hustle"',
+      board:'- If user says "board seat", "NED", "board director" → use ONLY "board"',
+      venture:'- If user says "startup", "invest in", "angel" → use ONLY "venture"',
+      deal:'- If user says "deal", "co-invest", "deploy capital" → use ONLY "deal"',
+    };
+    const visible=["board","hustle","venture","deal"].filter(k=>!hidden.includes(k));
+    const defs=visible.map(k=>moduleDefs[k]).join("\n");
+    const rules=visible.map(k=>strictRules[k]).join("\n");
+    return `You are the planning brain for TorqueOS. Your ONLY job is to read the user's request literally and pick the RIGHT module(s).
 
 ${profileCtx}
 
 User request: "${userMsg}"
 
 MODULE DEFINITIONS — read carefully:
-- "board" → ONLY for: board seats, NED roles, board director, board advisor, governance roles
-- "hustle" → ONLY for: side hustle, consulting, advisory, fractional roles, consulting mandates, advisory gigs, day rates, part-time income, $X/month from work, paid gigs, freelance, expert witness
-- "venture" → ONLY for: startup investment, venture deals, co-founder, equity stakes, angel investing, startup ideas
-- "deal" → ONLY for: investment deals, deal flow, private equity, capital deployment, co-investing in companies
+${defs}
 
 STRICT MODULE SELECTION RULES:
-- If user says "consulting", "advisory", "consulting mandate", "side hustle", "freelance", "gig", "fractional", "part-time income" → use ONLY "hustle"
-- If user says "board seat", "NED", "board director" → use ONLY "board"
-- If user says "startup", "invest in", "angel" → use ONLY "venture"
-- If user says "deal", "co-invest", "deploy capital" → use ONLY "deal"
+${rules}
 - Use 2 modules ONLY if the request genuinely spans two distinct categories
 - NEVER default to 3 modules. Only add a module if the user explicitly asked for it.
 - When in doubt, use 1 module — the most literal match to the user's words
@@ -6040,10 +6099,11 @@ Return ONLY raw JSON, no markdown:
 
 EXAMPLE MAPPINGS:
 - "find consulting jobs as a side hustle for $5K/month" → 1 step: hustle only
-- "find board seats in fintech" → 1 step: board only  
+- "find board seats in fintech" → 1 step: board only
 - "find startup deals and board seats" → 2 steps: venture + board
 - "what opportunities match my profile" → 2 steps: board + hustle (most common profile needs)
 `;
+  };
 
   const buildScanPrompt = (step, userMsg, requestedCount) => {
     // Always use web search for Claude - max uses increased for better results
@@ -6464,9 +6524,10 @@ Be direct, specific, and personal. Reference the candidate's actual profile. Max
                          (m.includes("invest")&&!m.includes("investment thesis")&&!wantsHustle);
     const wantsDeal = m.includes("deal flow")||m.includes("co-invest")||(m.includes("deal")&&!wantsHustle);
 
-    if (wantsHustle)
+    const hidden=hiddenModules||[];
+    if (wantsHustle && !hidden.includes("hustle"))
       steps.push({module:"hustle", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Side hustle/consulting/income intent detected"});
-    if (wantsBoard)
+    if (wantsBoard && !hidden.includes("board"))
       steps.push({module:"board", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Board/NED intent detected"});
     if (wantsVenture)
       steps.push({module:"venture", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Venture/startup intent detected"});
@@ -6474,11 +6535,14 @@ Be direct, specific, and personal. Reference the candidate's actual profile. Max
       steps.push({module:"deal", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Deal flow intent detected"});
 
     // General scan fallback — only if nothing matched
-    if (steps.length===0)
-      steps.push(
-        {module:"board", geography:profileGeo, sectors:profileSectors, constraint:"", rationale:"General scan"},
-        {module:"hustle", geography:profileGeo, sectors:profileSectors, constraint:"", rationale:"General scan"}
-      );
+    if (steps.length===0) {
+      const fallback=[
+        !hidden.includes("board")?{module:"board", geography:profileGeo, sectors:profileSectors, constraint:"", rationale:"General scan"}:null,
+        !hidden.includes("hustle")?{module:"hustle", geography:profileGeo, sectors:profileSectors, constraint:"", rationale:"General scan"}:null,
+      ].filter(Boolean);
+      if(fallback.length===0) fallback.push({module:"venture", geography:profileGeo, sectors:profileSectors, constraint:"", rationale:"General scan"});
+      steps.push(...fallback);
+    }
     return {intent: msg.substring(0,100), steps};
   };
 
@@ -6497,13 +6561,17 @@ Be direct, specific, and personal. Reference the candidate's actual profile. Max
   const moduleColors = {board:"#6ee7b7",venture:"#818cf8",hustle:"#fb923c",deal:"#f6c90e"};
   const moduleIcons = {board:"🏛",venture:"🚀",hustle:"💡",deal:"🎯"};
 
-  const starters = [
-    "Find me board seats matching my profile",
-    "What fractional roles fit my background?",
-    "Scan for venture deals in my target regions",
-    "What opportunities should I pursue this month?",
-    "Find consulting mandates in my sectors",
-  ];
+  const starters = (() => {
+    const hidden=hiddenModules||[];
+    const all=[
+      {text:"Find me board seats matching my profile",mod:"board"},
+      {text:"What fractional roles fit my background?",mod:"hustle"},
+      {text:"Scan for venture deals in my target regions",mod:null},
+      {text:"What opportunities should I pursue this month?",mod:null},
+      {text:"Find consulting mandates in my sectors",mod:"hustle"},
+    ];
+    return all.filter(s=>!s.mod||!hidden.includes(s.mod)).map(s=>s.text);
+  })();
 
   // ── RENDER HELPERS ──────────────────────────────────────────────────────────
   const renderThinking = (msg) => (
@@ -6831,6 +6899,23 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
   const [theme,setTheme]=useState(()=>storage.get("oos-theme")||"dark");
   const t=THEMES[theme];
   const [activeModule,setActiveModule]=useState(startOnSettings?"settings":"home");
+  const [hiddenModules,setHiddenModulesRaw]=useState(()=>{
+    const stored=storage.get("oos-hidden-modules");
+    return Array.isArray(stored)?stored.filter(k=>["board","hustle","exec"].includes(k)):[];
+  });
+  const setHiddenModules=React.useCallback((next)=>{
+    const arr=Array.isArray(next)?next:[];
+    // Always keep at least one of the three opportunity modules visible
+    const all=["board","hustle","exec"];
+    const visible=all.filter(k=>!arr.includes(k));
+    const safe=visible.length===0?all.slice(1):arr;
+    setHiddenModulesRaw(safe);
+    storage.set("oos-hidden-modules",safe);
+  },[]);
+  // Bounce off a hidden module if the user lands on one via stale state
+  useEffect(()=>{
+    if(hiddenModules.includes(activeModule)) setActiveModule("home");
+  },[hiddenModules,activeModule]);
   const [provider,setProvider]=useState(()=>storage.get("oos-provider")||"claude");
   const [apiKey,setApiKey]=useState(()=>storage.get("oos-key")||"");
   const [profile,setProfile]=useState(()=>storage.get("oos-profile")||initialProfile||DEFAULT_PROFILE);
@@ -7204,6 +7289,14 @@ Target sectors: ${(profile.defaultSectors||[]).join(", ")||"Not set"}`;
     onStatus("🧠 Understanding your request…");
 
     // Step 1: Plan via Claude
+    const hidden=hiddenModules||[];
+    const ruleMap={
+      board:'- "board" → board seats, NED, director, governance',
+      hustle:'- "hustle" → side hustle, consulting, advisory, consulting mandates, fractional, day rates, part-time income',
+      venture:'- "venture" → startup investment, co-founder, angel, equity',
+      deal:'- "deal" → deal flow, co-invest, private equity, capital deployment',
+    };
+    const visibleRules=["board","hustle","venture","deal"].filter(k=>!hidden.includes(k)).map(k=>ruleMap[k]).join("\n");
     const planPrompt = `You are a scan planner for TorqueOS. Read the user's request and return a JSON scan plan.
 
 USER PROFILE:
@@ -7212,10 +7305,7 @@ ${profileCtx}
 USER REQUEST: "${userMsg}"
 
 MODULE RULES:
-- "board" → board seats, NED, director, governance
-- "hustle" → side hustle, consulting, advisory, consulting mandates, fractional, day rates, part-time income
-- "venture" → startup investment, co-founder, angel, equity
-- "deal" → deal flow, co-invest, private equity, capital deployment
+${visibleRules}
 
 Return ONLY raw JSON:
 {"intent":"one sentence","steps":[{"module":"board","geography":"[user profile regions]","sectors":["FMCG"],"constraint":"","rationale":"why"}]}
@@ -7227,14 +7317,22 @@ Use 1 module unless user explicitly asks for 2. Default geography: user's profil
       const planBlocks = await callLLM(provider, apiKey, [{role:"user",content:planPrompt}], [], "You are a JSON API. Return ONLY raw JSON, no markdown.", "PLAN", null);
       const raw = planBlocks.map(b=>b.text||"").join("").replace(/```json[\s\S]*?/g,"").replace(/```/g,"").trim();
       plan = JSON.parse(raw);
+      // Drop any steps for hidden modules (defensive)
+      if(plan&&Array.isArray(plan.steps)) plan.steps=plan.steps.filter(s=>!hidden.includes(s.module));
     } catch(e) {
       // Fallback plan
       const geo = profile.location || "Global";
-      const modules = /hustle|consulting|advisory|gig|fractional|income|mandate/i.test(userMsg) ? ["hustle"] :
-        /board|NED|non-executive|governance/i.test(userMsg) ? ["board"] :
-        /exec|executive|job|role|hiring|C-suite|VP|director.*search/i.test(userMsg) ? ["exec"] :
-                      /venture|startup|angel|equity/i.test(userMsg) ? ["venture"] :
-                      /deal|invest|capital/i.test(userMsg) ? ["deal"] : ["board","hustle"];
+      const tests=[
+        {re:/hustle|consulting|advisory|gig|fractional|income|mandate/i,mod:"hustle"},
+        {re:/board|NED|non-executive|governance/i,mod:"board"},
+        {re:/exec|executive|job|role|hiring|C-suite|VP|director.*search/i,mod:"exec"},
+        {re:/venture|startup|angel|equity/i,mod:"venture"},
+        {re:/deal|invest|capital/i,mod:"deal"},
+      ];
+      let modules=[];
+      for(const t of tests){ if(t.re.test(userMsg)&&!hidden.includes(t.mod)){ modules=[t.mod]; break; } }
+      if(modules.length===0) modules=["board","hustle"].filter(m=>!hidden.includes(m));
+      if(modules.length===0) modules=["venture"];
       plan = {intent: userMsg, steps: modules.map(m=>({module:m, geography:geo, sectors:(profile.defaultSectors||[]).slice(0,2), constraint:""}))};
     }
 
@@ -7313,10 +7411,10 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
     {key:"vault",label:"Document Vault",icon:"📄",color:"#38bdf8"},
     {key:"contacts",label:"Contacts",icon:"👥",color:"#2dd4bf"},
     {key:"settings",label:"Settings",icon:"⚙",color:t.textMuted},
-  ];
+  ].filter(m=>!hiddenModules.includes(m.key));
 
   // ── Profile completeness gate ──
-  const gatedModules = ["board","venture","hustle","deal","network","vibe"];
+  const gatedModules = ["board","venture","hustle","deal","network","vibe"].filter(m=>!hiddenModules.includes(m));
   const profileGate = {
     apiKey:        {ok: !!apiKey,                                                          label:"API key"},
     title:         {ok: !!(profile.title||"").trim(),                                      label:"Professional title"},
@@ -7478,11 +7576,11 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
           {/* Single-column pages get their own scroll context */}
           {(activeModule==="home"||activeModule==="tower"||activeModule==="settings"||activeModule==="pipeline"||activeModule==="calendar"||activeModule==="vault"||activeModule==="contacts")&&
             <div style={{flex:1,overflowY:"auto",minHeight:0}}>
-              {activeModule==="home"&&<CommandCenter t={t} profile={profile} saved={saved} isMobile={isMobile} setActiveModule={setActiveModule} apiKey={apiKey} provider={provider} profileComplete={profileComplete} gatedModules={gatedModules} activityLog={activityLog} contacts={contacts} saveToVault={saveToVault}/>}
-              {activeModule==="tower"&&<ControlTowerModule t={t} isMobile={isMobile} saved={saved} activityLog={activityLog} contacts={contacts} calendarEvents={calendarEvents} setActiveModule={setActiveModule}/>}
-              {activeModule==="pipeline"&&<PipelineModule t={t} saved={saved} setSaved={setSaved} isMobile={isMobile} onOpenChat={(item)=>openChat(item)} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} onNavigateToSource={(item)=>{const tabMap={board:"saved",venture:"saved",hustle:"saved",deal:"saved",exec:"saved"};const modMap={board:"board",venture:"venture",hustle:"hustle",deal:"deal",exec:"exec"};const prefMap={board:"bs",venture:"vs",hustle:"sh",deal:"dm",exec:"es"};storage.set((prefMap[item.source]||"bs")+"-tab",tabMap[item.source]||"saved");setActiveModule(modMap[item.source]||"board");}}/>}
+              {activeModule==="home"&&<CommandCenter t={t} profile={profile} saved={saved} isMobile={isMobile} setActiveModule={setActiveModule} apiKey={apiKey} provider={provider} profileComplete={profileComplete} gatedModules={gatedModules} activityLog={activityLog} contacts={contacts} saveToVault={saveToVault} hiddenModules={hiddenModules}/>}
+              {activeModule==="tower"&&<ControlTowerModule t={t} isMobile={isMobile} saved={saved} activityLog={activityLog} contacts={contacts} calendarEvents={calendarEvents} setActiveModule={setActiveModule} hiddenModules={hiddenModules}/>}
+              {activeModule==="pipeline"&&<PipelineModule t={t} saved={saved} setSaved={setSaved} isMobile={isMobile} onOpenChat={(item)=>openChat(item)} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} hiddenModules={hiddenModules} onNavigateToSource={(item)=>{const tabMap={board:"saved",venture:"saved",hustle:"saved",deal:"saved",exec:"saved"};const modMap={board:"board",venture:"venture",hustle:"hustle",deal:"deal",exec:"exec"};const prefMap={board:"bs",venture:"vs",hustle:"sh",deal:"dm",exec:"es"};storage.set((prefMap[item.source]||"bs")+"-tab",tabMap[item.source]||"saved");setActiveModule(modMap[item.source]||"board");}}/>}
               {activeModule==="calendar"&&<CalendarModule t={t} isMobile={isMobile} events={calendarEvents} onSaveEvents={saveCalendarEvents} saved={saved} onScheduleItem={setScheduleModalItem} onNavigate={setActiveModule}/>}
-              {activeModule==="settings"&&<SettingsModule t={t} profile={profile} setProfile={p=>{setProfile(p);storage.set("oos-profile",p);}} apiKey={apiKey} setApiKey={setApiKey} provider={provider} setProvider={setProvider} isMobile={isMobile} isNewUser={startOnSettings}/>}
+              {activeModule==="settings"&&<SettingsModule t={t} profile={profile} setProfile={p=>{setProfile(p);storage.set("oos-profile",p);}} apiKey={apiKey} setApiKey={setApiKey} provider={provider} setProvider={setProvider} isMobile={isMobile} isNewUser={startOnSettings} hiddenModules={hiddenModules} setHiddenModules={setHiddenModules}/>}
               {activeModule==="vault"&&<DocumentVaultModule t={t} isMobile={isMobile} vault={vault} setVault={setVault} onRegenerate={(sourceItem)=>{setDocGenItem(sourceItem);}}/>}
               {activeModule==="contacts"&&<ContactsModule t={t} isMobile={isMobile} contacts={contacts} setContacts={setContacts} activityLog={activityLog} saved={saved} onNavigateToNetwork={(company)=>{setNiFreeSearch(company);setActiveModule("network");}}/>}
             </div>
@@ -7494,7 +7592,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
           {activeModule==="exec"&&<ExecSearchModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} esResults={esResults} setEsResults={setEsResults} esLoading={esLoading} setEsLoading={setEsLoading} esScanLog={esScanLog} setEsScanLog={setEsScanLog} esLastScanned={esLastScanned} setEsLastScanned={setEsLastScanned}/>}
           {activeModule==="deal"&&<DealMonitorModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} deals={deals} setDeals={setDeals} dmLoading={dmLoading} setDmLoading={setDmLoading} dmScanLog={dmScanLog} setDmScanLog={setDmScanLog} dmLastScanned={dmLastScanned} setDmLastScanned={setDmLastScanned}/>}
           {/* Vibe Agent tab — full page agent */}
-          {activeModule==="vibe"&&<VibeAgentModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} vaMessages={vaMessages} setVaMessages={setVaMessages} vaScanLog={vaScanLog} setVaScanLog={setVaScanLog} vaInput={vaInput} setVaInput={setVaInput} vaLoading={vaLoading} setVaLoading={setVaLoading} setActiveModule={setActiveModule}/>}
+          {activeModule==="vibe"&&<VibeAgentModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} vaMessages={vaMessages} setVaMessages={setVaMessages} vaScanLog={vaScanLog} setVaScanLog={setVaScanLog} vaInput={vaInput} setVaInput={setVaInput} vaLoading={vaLoading} setVaLoading={setVaLoading} setActiveModule={setActiveModule} hiddenModules={hiddenModules}/>}
           {activeModule==="network"&&<NetworkModulePage t={t} profile={profile} apiKey={apiKey} provider={provider} isMobile={isMobile} saved={saved} onOpenChat={openChat} niLoading={niLoading} setNiLoading={setNiLoading} niAnalysis={niAnalysis} setNiAnalysis={setNiAnalysis} niError={niError} setNiError={setNiError} niTarget={niTarget} setNiTarget={setNiTarget} niFreeSearch={niFreeSearch} setNiFreeSearch={setNiFreeSearch} onSaveToVault={saveToVault} onSaveContact={saveContact}/>}
           </div>
         </div>
