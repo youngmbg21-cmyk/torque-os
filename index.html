@@ -3336,8 +3336,15 @@ const DocumentGenerator = ({item,profile,apiKey,provider,t,onClose,onSaveToVault
   const [copied,setCopied]=useState(false);
   const [savedToVault,setSavedToVault]=useState(false);
   const [showAll,setShowAll]=useState(false);
+  // ── Outreach-email specific state ──
+  const looksLikeEmail = (s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((s||"").trim());
+  const [emailTo,setEmailTo]=useState(()=>looksLikeEmail(item.contactInfo)?item.contactInfo.trim():"");
+  const [emailCc,setEmailCc]=useState("");
+  const [emailSubject,setEmailSubject]=useState("");
+  const [emailBody,setEmailBody]=useState("");
 
   const DOC_TYPES=[
+    {key:"outreach_email",label:"Outreach Email",icon:"✉",desc:"Personalised email to a contact at this company"},
     {key:"board_application",label:"Board Application",icon:"🏛",desc:"Cover letter for a board seat"},
     {key:"capability",label:"Capability Statement",icon:"📋",desc:"Consulting one-pager"},
     {key:"due_diligence",label:"Due Diligence Memo",icon:"🔍",desc:"Investment analysis memo"},
@@ -3355,12 +3362,12 @@ const DocumentGenerator = ({item,profile,apiKey,provider,t,onClose,onSaveToVault
 
     // Board source
     if(src==="board"){
-      if(type==="board"||type==="board scout"||type==="") 
-        return ["board_application","executive_bio","outreach_sequence"];
+      if(type==="board"||type==="board scout"||type==="")
+        return ["outreach_email","board_application","executive_bio","outreach_sequence"];
       if(type==="consulting"||type==="advisory"||type==="consulting mandate")
-        return ["capability","fee_negotiation","outreach_sequence","executive_bio"];
+        return ["outreach_email","capability","fee_negotiation","outreach_sequence","executive_bio"];
       // default for board source
-      return ["board_application","executive_bio","outreach_sequence"];
+      return ["outreach_email","board_application","executive_bio","outreach_sequence"];
     }
 
     // Venture source
@@ -3368,23 +3375,27 @@ const DocumentGenerator = ({item,profile,apiKey,provider,t,onClose,onSaveToVault
       if(type==="idea"||type==="build"||type==="research"||type==="skip")
         return ["investment_thesis","capability"];
       // ventures, deals, anything else from venture scout
-      return ["due_diligence","investment_thesis","outreach_sequence"];
+      return ["outreach_email","due_diligence","investment_thesis","outreach_sequence"];
     }
 
     // Hustle source
     if(src==="hustle")
-      return ["capability","fee_negotiation","outreach_sequence","executive_bio"];
+      return ["outreach_email","capability","fee_negotiation","outreach_sequence","executive_bio"];
+
+    // Exec source
+    if(src==="exec")
+      return ["outreach_email","executive_bio","outreach_sequence","fee_negotiation"];
 
     // Deal / Investment Thesis source
     if(src==="deal")
-      return ["due_diligence","investment_thesis","outreach_sequence"];
+      return ["outreach_email","due_diligence","investment_thesis","outreach_sequence"];
 
     // Fallback: try to infer from type alone (e.g. items opened from Pipeline)
-    if(type==="board") return ["board_application","executive_bio","outreach_sequence"];
-    if(type==="consulting"||type==="advisory") return ["capability","fee_negotiation","outreach_sequence","executive_bio"];
+    if(type==="board") return ["outreach_email","board_application","executive_bio","outreach_sequence"];
+    if(type==="consulting"||type==="advisory") return ["outreach_email","capability","fee_negotiation","outreach_sequence","executive_bio"];
     if(type==="fractional"||type==="speaking"||type==="workshop"||type==="contract"||type==="board-observer"||type==="expert-witness")
-      return ["capability","fee_negotiation","outreach_sequence","executive_bio"];
-    if(type==="venture"||type==="idea"||type==="build") return ["due_diligence","investment_thesis","outreach_sequence"];
+      return ["outreach_email","capability","fee_negotiation","outreach_sequence","executive_bio"];
+    if(type==="venture"||type==="idea"||type==="build") return ["outreach_email","due_diligence","investment_thesis","outreach_sequence"];
 
     // True fallback — show all
     return DOC_TYPES.map(d=>d.key);
@@ -3409,7 +3420,31 @@ DESCRIPTION: ${item.companyDescription||item.description||""}
 FEE: ${item.estimatedFee||item.entryCost||item.equity||"Not specified"}
 FIT: ${(item.fitReasons||[]).join("; ")||"Not specified"}`;
 
+    const needCtx = (item.needReasons||[]).length>0 ? `THEIR NEEDS / CHALLENGES:\n${(item.needReasons||[]).map(r=>"- "+r).join("\n")}` : "";
     const prompts={
+      outreach_email:`${profCtx}
+
+${oppCtx}
+${needCtx}
+
+Write a professional outreach email FROM ME to a senior contact at ${item.name||"the target organisation"}. I am the sender introducing myself and proposing a conversation. The goal is to make them want to take a 20-minute call.
+
+Tone: senior peer to senior peer. Confident, specific, warm. No flattery, no buzzwords, no padding. Plain prose, not a sales pitch.
+
+Output format — plain text only, ABSOLUTELY no markdown, no asterisks, no hashtags, no bold, no bullet points unless they're written as full sentences:
+
+Line 1: Subject: [a specific subject line referencing what I bring or what they need — under 70 characters]
+Line 2: [blank]
+Line 3+: The email body, structured as:
+- A salutation ("Dear team at ${item.name||"[Company]"}," or "Hello,")
+- One short opening paragraph that names a specific reason I'm reaching out (referencing something concrete about their company, sector, or situation${(item.needReasons||[]).length>0?" — anchor this on the challenges they're facing":""})
+- One paragraph introducing myself: my current role, my most relevant 1-2 career highlights for THIS opportunity, and the angle of value I'd bring
+- One paragraph proposing a specific next step (a 20-minute call to explore whether there's a fit) and offering 2-3 concrete time options the following week
+- A professional sign-off with my name (${profile.name||""}) and title (${profile.title||""})
+
+Total length: 180-260 words for the body. Every sentence must earn its place. Reference ${item.name||"the company"} by name at least once. If their needs are listed above, weave at least one of them into the opening paragraph naturally — do not list them, integrate them.
+
+CRITICAL: Output the literal word "Subject:" followed by the subject on the first line. Then a blank line. Then the body. No other formatting. No preamble explaining what the email is.`,
       board_application:`${profCtx}
 
 ${oppCtx}
@@ -3565,9 +3600,40 @@ Max 400 words. Analytical, honest about risks.`
 
     try {
       const blocks=await callLLM(provider,apiKey,[{role:"user",content:prompts[effectiveDocType]}],[],"You are a professional ghostwriter specialising in executive communications. Write sharp, specific documents that sound genuinely human. No generic phrases. CRITICAL FORMATTING RULES: Never use markdown. No ## headers, no ** bold, no * italic, no --- dividers, no bullet points with *. Use PLAIN TEXT ONLY. For section headers write them in ALL CAPS on their own line. For emphasis, use plain words. For lists use a dash followed by a space. Write as a professional human document, not a markdown file.","DOC",null);
-      setResult(stripCiteTags(blocks.map(b=>b.text).join("").trim()));
+      let raw = stripCiteTags(blocks.map(b=>b.text).join("").trim());
+      // Defensive: scrub any stray markdown the model may have emitted
+      raw = raw.replace(/\*\*/g,"").replace(/(^|\n)#{1,6}\s*/g,"$1").replace(/(^|\s)\*(?=\S)/g,"$1");
+      setResult(raw);
+      if(effectiveDocType==="outreach_email"){
+        // Parse "Subject: ..." from the first non-blank line, body is the rest
+        const lines = raw.split(/\r?\n/);
+        let subjLine = "";
+        let bodyStart = 0;
+        for(let i=0;i<lines.length;i++){
+          const l=lines[i].trim();
+          if(!l) continue;
+          const m=l.match(/^subject\s*:\s*(.+)$/i);
+          if(m){ subjLine=m[1].trim(); bodyStart=i+1; }
+          break;
+        }
+        const body = lines.slice(bodyStart).join("\n").replace(/^\s*\n+/,"").trim();
+        setEmailSubject(subjLine||("Outreach — "+(item.name||"")));
+        setEmailBody(body||raw);
+      }
     } catch(e){setResult("Generation failed: "+e.message);}
     setLoading(false);
+  };
+
+  // Build mailto: link from current email-state
+  const sendEmail = () => {
+    const to = (emailTo||"").trim();
+    if(!looksLikeEmail(to)) return;
+    const params = [];
+    if(emailSubject) params.push("subject="+encodeURIComponent(emailSubject));
+    if(emailCc && looksLikeEmail(emailCc.trim())) params.push("cc="+encodeURIComponent(emailCc.trim()));
+    if(emailBody) params.push("body="+encodeURIComponent(emailBody));
+    const href = "mailto:"+encodeURIComponent(to)+(params.length?"?"+params.join("&"):"");
+    window.location.href = href;
   };
 
   const copy=()=>{
@@ -3626,7 +3692,7 @@ ${htmlLines}
           <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
             <div style={{width:36,height:36,borderRadius:10,background:t.goldDim,border:"1px solid "+t.gold+"40",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>📄</div>
             <div style={{flex:1,minWidth:0}}><div style={{fontSize:18,fontWeight:700,color:t.text,letterSpacing:"-0.01em"}}>Document Generator</div><div style={{fontSize:15,color:t.textMuted}}>{item.name} · {item.region}</div></div>
-            {result&&!loading&&<button onClick={handlePrint} style={{...btn0,display:"flex",alignItems:"center",gap:5,padding:"7px 12px",borderRadius:7,fontSize:15,fontWeight:700,background:t.indigoDim,border:"1px solid "+t.indigo+"40",color:t.indigo,flexShrink:0}}>
+            {result&&!loading&&effectiveDocType!=="outreach_email"&&<button onClick={handlePrint} style={{...btn0,display:"flex",alignItems:"center",gap:5,padding:"7px 12px",borderRadius:7,fontSize:15,fontWeight:700,background:t.indigoDim,border:"1px solid "+t.indigo+"40",color:t.indigo,flexShrink:0}}>
               🖨 Print
             </button>}
             <button onClick={onClose} style={{...btn0,width:30,height:30,borderRadius:7,background:t.input,border:"1px solid "+t.border,color:t.textMuted,fontSize:18,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>×</button>
@@ -3660,7 +3726,58 @@ ${htmlLines}
             {loading?<><Ic.Loader2 size={15} color={t.textMuted}/> Generating {activeDoc.label}…</>:<><Ic.Edit size={14}/> Generate {activeDoc.label}</>}
           </button>
 
-          {result&&<>
+          {result&&effectiveDocType==="outreach_email"&&<>
+            {/* Email composer — editable To/Cc/Subject/Body with Send */}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <span style={{fontSize:12,fontWeight:700,letterSpacing:"0.06em",color:t.gold}}>OUTREACH EMAIL</span>
+              <div style={{display:"flex",gap:6}}>
+                <button onClick={()=>{const txt="Subject: "+emailSubject+"\n\n"+emailBody;navigator.clipboard.writeText(txt).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2000);}).catch(()=>{});}} style={{...btn0,fontSize:15,fontWeight:600,padding:"4px 10px",borderRadius:5,background:copied?t.accentDim:"transparent",border:"1px solid "+(copied?t.accent+"40":t.border),color:copied?t.accent:t.textMuted,display:"flex",alignItems:"center",gap:4}}>
+                  <Ic.Copy size={10}/>{copied?"Copied!":"Copy"}
+                </button>
+                <button onClick={generate} style={{...btn0,fontSize:15,fontWeight:600,padding:"4px 10px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted,display:"flex",alignItems:"center",gap:4}}>
+                  <Ic.Loader2 size={10}/> Regen
+                </button>
+                {onSaveToVault&&<button onClick={()=>{
+                  onSaveToVault({
+                    title: activeDoc.label+" — "+(item.name||""),
+                    docTypeLabel: activeDoc.label,
+                    content: "Subject: "+emailSubject+"\n\nTo: "+emailTo+(emailCc?"\nCc: "+emailCc:"")+"\n\n"+emailBody,
+                    sourceOpportunity: item.name||"",
+                    sourceItem: item,
+                  });
+                  setSavedToVault(true);
+                  setTimeout(()=>setSavedToVault(false), 2500);
+                }} style={{...btn0,fontSize:15,fontWeight:600,padding:"4px 10px",borderRadius:5,background:savedToVault?"#38bdf820":"transparent",border:"1px solid "+(savedToVault?"#38bdf850":t.border),color:savedToVault?"#38bdf8":t.textMuted,display:"flex",alignItems:"center",gap:4}}>
+                  <Ic.Archive size={10}/>{savedToVault?"Saved!":"Save to Vault"}
+                </button>}
+              </div>
+            </div>
+            <div style={{background:t.input,border:"1px solid "+t.border,borderRadius:8,padding:"14px 16px",display:"flex",flexDirection:"column",gap:9}}>
+              <div>
+                <label style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,display:"block",marginBottom:3}}>TO</label>
+                <input type="email" value={emailTo} onChange={e=>setEmailTo(e.target.value)} placeholder="recipient@company.com" style={{width:"100%",padding:"8px 10px",background:t.surface,border:"1px solid "+(emailTo&&!looksLikeEmail(emailTo)?t.coral+"60":t.border),borderRadius:7,color:t.text,fontSize:14,fontFamily:"'DM Mono',monospace",boxSizing:"border-box"}}/>
+                {emailTo&&!looksLikeEmail(emailTo)&&<div style={{fontSize:12,color:t.coral,marginTop:3}}>Not a valid email address.</div>}
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,display:"block",marginBottom:3}}>CC <span style={{fontWeight:500,color:t.textDim,letterSpacing:0,textTransform:"none"}}>(optional)</span></label>
+                <input type="email" value={emailCc} onChange={e=>setEmailCc(e.target.value)} placeholder="cc@company.com" style={{width:"100%",padding:"8px 10px",background:t.surface,border:"1px solid "+(emailCc&&!looksLikeEmail(emailCc)?t.coral+"60":t.border),borderRadius:7,color:t.text,fontSize:14,fontFamily:"'DM Mono',monospace",boxSizing:"border-box"}}/>
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,display:"block",marginBottom:3}}>SUBJECT</label>
+                <input type="text" value={emailSubject} onChange={e=>setEmailSubject(e.target.value)} style={{width:"100%",padding:"8px 10px",background:t.surface,border:"1px solid "+t.border,borderRadius:7,color:t.text,fontSize:14,boxSizing:"border-box"}}/>
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,display:"block",marginBottom:3}}>MESSAGE</label>
+                <textarea value={emailBody} onChange={e=>setEmailBody(e.target.value)} rows={14} style={{width:"100%",padding:"10px 12px",background:t.surface,border:"1px solid "+t.border,borderRadius:7,color:t.text,fontSize:14,fontFamily:"inherit",lineHeight:1.65,resize:"vertical",boxSizing:"border-box",whiteSpace:"pre-wrap"}}/>
+              </div>
+              <button onClick={sendEmail} disabled={!looksLikeEmail(emailTo)} style={{...btn0,width:"100%",padding:"11px",borderRadius:8,fontSize:15,fontWeight:700,color:"#fff",background:looksLikeEmail(emailTo)?"linear-gradient(135deg,#10b981,#059669)":t.input,border:"1px solid "+(looksLikeEmail(emailTo)?"transparent":t.border),display:"flex",alignItems:"center",justifyContent:"center",gap:6,opacity:looksLikeEmail(emailTo)?1:0.6,cursor:looksLikeEmail(emailTo)?"pointer":"not-allowed"}}>
+                <Ic.ExternalLink size={13}/> Send via your email client
+              </button>
+              <div style={{fontSize:12,color:t.textMuted,lineHeight:1.5}}>Opens your default mail app (Gmail, Apple Mail, Outlook…) with the recipient, subject, and message pre-filled. You confirm and send from there.</div>
+            </div>
+          </>}
+
+          {result&&effectiveDocType!=="outreach_email"&&<>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
               <span style={{fontSize:12,fontWeight:700,letterSpacing:"0.06em",color:t.gold}}>{activeDoc.label.toUpperCase()}</span>
               <div style={{display:"flex",gap:6}}>
