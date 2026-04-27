@@ -3420,7 +3420,7 @@ DESCRIPTION: ${item.companyDescription||item.description||""}
 FEE: ${item.estimatedFee||item.entryCost||item.equity||"Not specified"}
 FIT: ${(item.fitReasons||[]).join("; ")||"Not specified"}`;
 
-    const needCtx = (item.needReasons||[]).length>0 ? `THEIR NEEDS / CHALLENGES:\n${(item.needReasons||[]).map(r=>"- "+r).join("\n")}` : "";
+    const needCtx = (item.needReasons||[]).length>0 ? `RELEVANCE SIGNALS (hypothetical — do NOT state these as confirmed facts about the company):\n${(item.needReasons||[]).map(r=>"- "+r).join("\n")}` : "";
     const prompts={
       outreach_email:`${profCtx}
 
@@ -3437,12 +3437,14 @@ Line 1: Subject: [a specific subject line referencing what I bring or what they 
 Line 2: [blank]
 Line 3+: The email body, structured as:
 - A salutation ("Dear team at ${item.name||"[Company]"}," or "Hello,")
-- One short opening paragraph that names a specific reason I'm reaching out (referencing something concrete about their company, sector, or situation${(item.needReasons||[]).length>0?" — anchor this on the challenges they're facing":""})
+- One short opening paragraph that names a specific reason I'm reaching out — anchor it on my genuine interest in the company, sector, or their publicly known work. Do NOT assume the company is running any specific project, implementing any technology, or facing any challenge just because I have experience with it
 - One paragraph introducing myself: my current role, my most relevant 1-2 career highlights for THIS opportunity, and the angle of value I'd bring
 - One paragraph proposing a specific next step (a 20-minute call to explore whether there's a fit) and offering 2-3 concrete time options the following week
 - A professional sign-off with my name (${profile.name||""}) and title (${profile.title||""})
 
-Total length: 180-260 words for the body. Every sentence must earn its place. Reference ${item.name||"the company"} by name at least once. If their needs are listed above, weave at least one of them into the opening paragraph naturally — do not list them, integrate them.
+Total length: 180-260 words for the body. Every sentence must earn its place. Reference ${item.name||"the company"} by name at least once.
+
+CRITICAL: My career experience (specific tools, systems, initiatives) is MY credential — it is what I bring to any engagement. Do NOT project it onto the company. Do NOT assume or imply they are implementing SAP, any ERP, any specific technology, or running any initiative simply because I have done so. Frame everything as the value I bring, not as a mirror of their assumed situation. If relevance signals are listed above, use them only as background context to understand why this opportunity is interesting — never state them as facts about the company.
 
 CRITICAL: Output the literal word "Subject:" followed by the subject on the first line. Then a blank line. Then the body. No other formatting. No preamble explaining what the email is.`,
       board_application:`${profCtx}
