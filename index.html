@@ -1133,205 +1133,6 @@ const extractJSON = (blocks) => {
   throw new Error("No JSON found — the AI returned a prose response instead of data. Try rescanning.");
 };
 
-// ─── LIVE JOB BOARD INTEGRATIONS ──────────────────────────────────────────────
-// Fetches real job postings from public job-board APIs and normalises them to
-// the TorqueOS opportunity schema so Board Scout and Executive Search can
-// blend verified live postings with AI-inferred signals.
-//
-// Two sources currently supported:
-//   • The Muse — free, no API key, CORS enabled. Good for mid-to-senior roles.
-//   • Adzuna    — free tier (requires app_id + app_key from Settings). Good
-//                 global coverage with real salary data. Strong for exec roles.
-//
-// All sources return objects shaped like existing Board/Exec results so they
-// flow through OpportunityCard, scoring, pipeline save, and docs generation
-// without any additional branching logic downstream.
-const ADZUNA_COUNTRY_MAP = {
-  GB:"gb", US:"us", AU:"au", BR:"br", CA:"ca", DE:"de", FR:"fr", IN:"in",
-  IT:"it", MX:"mx", NL:"nl", NZ:"nz", PL:"pl", SG:"sg", ZA:"za", AT:"at",
-  BE:"be", CH:"ch", ES:"es"
-};
-
-const fetchMuseJobs = async ({ countryNames, execFunction, module, onLog }) => {
-  try {
-    onLog && onLog("📡 Querying The Muse live job board…");
-    const levels = ["Senior Level","Management","Director","Executive"];
-    const params = new URLSearchParams();
-    levels.forEach(l => params.append("level", l));
-    (countryNames||[]).slice(0,3).forEach(c => params.append("location", c));
-    if(execFunction) params.append("category", execFunction);
-    params.append("page","0");
-    const url = "https://www.themuse.com/api/public/jobs?" + params.toString();
-    const res = await fetch(url);
-    if(!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
-    const now = new Date().toISOString();
-    const out = (data.results||[]).slice(0,15).map((job,i)=>{
-      const loc = job.locations?.[0]?.name || "";
-      const locParts = loc.split(",").map(s=>s.trim());
-      const cleanedContent = (job.contents||"").replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();
-      return {
-        id: "lj-muse-" + (job.id || Date.now()+"-"+i),
-        name: job.company?.name || "Unknown Company",
-        jobTitle: job.name || "",
-        probableRole: job.name || "",
-        region: locParts[locParts.length-1] || (countryNames?.[0]||""),
-        city: locParts[0] || "",
-        sector: job.categories?.[0]?.name || "",
-        status: module === "exec" ? "WARM" : "WATCH",
-        type: module === "board" ? "board" : "exec",
-        companyDescription: cleanedContent.slice(0, 260),
-        description: cleanedContent.slice(0, 260),
-        sentiment: 60,
-        tags: (job.categories||[]).map(c=>c.name).slice(0,3),
-        fitReasons: [
-          "Live posting on The Muse — you can apply directly without a warm introduction.",
-          "Verified active vacancy, not an AI-inferred signal, so timing is known."
-        ],
-        hiringSignal: "Active public job posting",
-        whyNow: job.publication_date ? ("Posted " + new Date(job.publication_date).toLocaleDateString() + " — application window is open.") : "Currently live on The Muse.",
-        sourceUrl: job.refs?.landing_page || "",
-        applyUrl: job.refs?.landing_page || "",
-        sourceName: "The Muse",
-        jobBoardSource: "The Muse",
-        dataSource: "live_posting",
-        postedDate: job.publication_date || null,
-        scannedAt: now,
-        moduleTag: module === "board" ? "Board" : "Exec Role"
-      };
-    });
-    onLog && onLog("✓ The Muse returned " + out.length + " live postings");
-    return out;
-  } catch(e) {
-    onLog && onLog("✗ The Muse: " + (e.message||"fetch failed"));
-    return [];
-  }
-};
-
-const fetchAdzunaJobs = async ({ countryCodes, execFunction, minSalary, module, onLog }) => {
-  const appId = storage.get("oos-adzuna-id") || "";
-  const appKey = storage.get("oos-adzuna-key") || "";
-  if(!appId || !appKey) {
-    onLog && onLog("ℹ Adzuna credentials not set — skipping (configure in Settings to enable).");
-    return [];
-  }
-  try {
-    const targets = (countryCodes||[])
-      .map(c => ADZUNA_COUNTRY_MAP[(c||"").toUpperCase()])
-      .filter(Boolean)
-      .slice(0,3);
-    if(targets.length === 0) {
-      onLog && onLog("ℹ Adzuna: none of the selected countries are supported — skipping.");
-      return [];
-    }
-    onLog && onLog("📡 Querying Adzuna across " + targets.join(", ").toUpperCase() + "…");
-    const levelTerms = module === "board"
-      ? "non-executive director OR board member OR NED OR chair"
-      : "director OR VP OR head of OR chief OR president";
-    const what = [execFunction, levelTerms].filter(Boolean).join(" ");
-    const perCountry = await Promise.all(targets.map(async (cc) => {
-      const p = new URLSearchParams({
-        app_id: appId, app_key: appKey,
-        results_per_page: "10", what,
-        "content-type": "application/json"
-      });
-      if(minSalary && Number(minSalary) > 0) p.append("salary_min", String(minSalary));
-      const url = "https://api.adzuna.com/v1/api/jobs/" + cc + "/search/1?" + p.toString();
-      const res = await fetch(url);
-      if(!res.ok) throw new Error(cc + " HTTP " + res.status);
-      return { cc, data: await res.json() };
-    }));
-    const now = new Date().toISOString();
-    const out = [];
-    perCountry.forEach(({cc, data}) => {
-      (data.results||[]).forEach(job => {
-        const salMin = job.salary_min ? Math.round(job.salary_min) : 0;
-        const salMax = job.salary_max ? Math.round(job.salary_max) : salMin;
-        const salRange = salMin ? ("$" + Math.round(salMin/1000) + "K–$" + Math.round(salMax/1000) + "K") : null;
-        out.push({
-          id: "lj-adz-" + (job.id || Date.now()+"-"+out.length),
-          name: job.company?.display_name || "Unknown Company",
-          jobTitle: job.title || "",
-          probableRole: job.title || "",
-          region: cc.toUpperCase(),
-          city: (job.location?.display_name||"").split(",")[0]?.trim() || "",
-          sector: job.category?.label || "",
-          status: module === "exec" ? "WARM" : "WATCH",
-          type: module === "board" ? "board" : "exec",
-          companyDescription: (job.description||"").slice(0, 260),
-          description: (job.description||"").slice(0, 260),
-          sentiment: 65,
-          tags: [job.category?.tag].filter(Boolean),
-          salary: salRange,
-          estimatedPackage: salRange,
-          estimatedFee: salRange,
-          annualUSD: salMin || 0,
-          packageBreakdown: salMin ? ("Base " + salRange + " (source: Adzuna listing)") : null,
-          fitReasons: [
-            "Verified live posting on Adzuna with published salary data — no estimation needed.",
-            "Apply directly via the source link; no warm introduction required to get on the radar."
-          ],
-          hiringSignal: "Active public job posting with disclosed compensation",
-          whyNow: job.created ? ("Posted " + new Date(job.created).toLocaleDateString() + " — application window is open.") : "Currently live on Adzuna.",
-          sourceUrl: job.redirect_url || "",
-          applyUrl: job.redirect_url || "",
-          sourceName: "Adzuna",
-          jobBoardSource: "Adzuna",
-          dataSource: "live_posting",
-          postedDate: job.created || null,
-          scannedAt: now,
-          moduleTag: module === "board" ? "Board" : "Exec Role"
-        });
-      });
-    });
-    onLog && onLog("✓ Adzuna returned " + out.length + " live postings");
-    return out;
-  } catch(e) {
-    onLog && onLog("✗ Adzuna: " + (e.message||"fetch failed"));
-    return [];
-  }
-};
-
-// Orchestrator: fan out to all enabled sources in parallel.
-const fetchLiveJobs = async ({ module, countryCodes, execFunction, minSalary, onLog }) => {
-  const countryNames = (countryCodes||[]).map(code => {
-    const found = (typeof ALL_COUNTRIES_FLAT !== "undefined")
-      ? ALL_COUNTRIES_FLAT.find(x => x.code === code) : null;
-    return found ? found.name : code;
-  });
-  const [muse, adzuna] = await Promise.all([
-    fetchMuseJobs({ countryNames, execFunction, module, onLog }),
-    fetchAdzunaJobs({ countryCodes, execFunction, minSalary, module, onLog })
-  ]);
-  return [...muse, ...adzuna];
-};
-
-// Merge AI-generated results with live postings. When an AI signal matches a
-// live posting by company name, we upgrade the AI card to "verified" and
-// enrich it with the real apply link, salary, and posted date. Otherwise the
-// live posting is appended as its own card.
-const mergeLiveAndAiResults = (aiResults, liveResults) => {
-  const normName = s => (s||"").toLowerCase().replace(/[^a-z0-9]+/g," ").trim();
-  const out = (aiResults||[]).map(r => ({...r, dataSource: r.dataSource || "ai_signal"}));
-  const usedLive = new Set();
-  out.forEach(ai => {
-    const aiKey = normName(ai.name);
-    if(!aiKey) return;
-    const match = liveResults.find((lr,idx) => !usedLive.has(idx) && normName(lr.name) === aiKey);
-    if(match) {
-      usedLive.add(liveResults.indexOf(match));
-      ai.applyUrl = match.applyUrl || ai.applyUrl;
-      ai.postedDate = match.postedDate || ai.postedDate;
-      ai.jobBoardSource = match.jobBoardSource;
-      ai.dataSource = "verified";
-      if(!ai.sourceUrl) ai.sourceUrl = match.sourceUrl;
-      if(match.salary && !ai.salary) ai.salary = match.salary;
-    }
-  });
-  liveResults.forEach((lr,idx) => { if(!usedLive.has(idx)) out.push(lr); });
-  return out;
-};
-
 // ─── SHARED: STREAMING CHATBOT ────────────────────────────────────────────────
 const StreamingChatbot = ({apiKey, provider, systemPrompt, systemPromptBuilder, title, subtitle, icon, contextPills=[], onClose, t, isMobile, openingBrief, persistedMessages, onMessagesChange}) => {
   const [msgs, setMsgs] = useState(persistedMessages&&persistedMessages.length>0 ? persistedMessages : [{role:"assistant",content:openingBrief||"Hi! I'm your AI Advisor. Ask me anything about your opportunities, pipeline, strategy, or how to use the app.",id:"w1"}]);
@@ -1551,9 +1352,6 @@ const OpportunityCard = ({item,t,onSave,isSaved,onRemove,onStatusChange,onNoteCh
             <span onClick={savedMode&&onNavigateToSource?e=>{e.stopPropagation();onNavigateToSource(item);}:undefined} style={{fontWeight:700,color:savedMode&&onNavigateToSource?moduleC:t.text,fontSize:mob?13:14,cursor:savedMode&&onNavigateToSource?"pointer":"default",textDecoration:savedMode&&onNavigateToSource?"underline":"none",textDecorationColor:moduleC+"60"}}>{item.name}</span>
             {item.status&&<span style={{fontSize:12,fontWeight:700,letterSpacing:"0.08em",padding:"2px 7px",borderRadius:4,background:statusColor+"20",color:statusColor}}>{item.status}</span>}
             {item.moduleTag&&<span style={{fontSize:12,fontWeight:700,letterSpacing:"0.08em",padding:"2px 7px",borderRadius:4,background:moduleC+"15",color:moduleC}}>{item.moduleTag}</span>}
-            {item.dataSource==="live_posting"&&<span title={"Live posting on "+(item.jobBoardSource||"job board")} style={{fontSize:11,fontWeight:800,letterSpacing:"0.08em",padding:"2px 7px",borderRadius:4,background:"#10b98120",color:"#10b981",border:"1px solid #10b98140",display:"inline-flex",alignItems:"center",gap:3}}>● LIVE{item.jobBoardSource?" · "+item.jobBoardSource:""}</span>}
-            {item.dataSource==="verified"&&<span title={"AI signal confirmed by live posting on "+(item.jobBoardSource||"job board")} style={{fontSize:11,fontWeight:800,letterSpacing:"0.08em",padding:"2px 7px",borderRadius:4,background:"#6366f120",color:"#818cf8",border:"1px solid #6366f140",display:"inline-flex",alignItems:"center",gap:3}}>✓ VERIFIED</span>}
-            {item.dataSource==="ai_signal"&&<span title="AI-inferred hiring signal — verify before outreach" style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",padding:"2px 7px",borderRadius:4,background:t.border,color:t.textDim}}>AI SIGNAL</span>}
             {profile&&<ScoreBadge item={item} profile={profile} t={t}/>}
           </div>
           <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4,fontSize:mob?10:11,color:t.textMuted,flexWrap:"wrap"}}>
@@ -1592,7 +1390,7 @@ const OpportunityCard = ({item,t,onSave,isSaved,onRemove,onStatusChange,onNoteCh
         {/* Status Change */}
         {onStatusChange&&<div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:12,marginBottom:10}}>
           {["PURSUE","WATCH","PASS","ACTIVE","RESEARCHING","DECLINED","BUILD","RESEARCH","SKIP"].filter((s,i,arr)=>{
-            const relevant=item.type==="board"||item.type==="consulting"?["PURSUE","WATCH","PASS","ACTIVE","RESEARCHING","DECLINED"]:["PURSUE","WATCH","PASS","BUILD","RESEARCH","SKIP"];
+            const relevant=item.type==="board"?["PURSUE","WATCH","PASS","ACTIVE","RESEARCHING","DECLINED"]:["PURSUE","WATCH","PASS","BUILD","RESEARCH","SKIP"];
             return relevant.includes(s);
           }).slice(0,6).map(s=>(
             <button key={s} onClick={()=>onStatusChange(item,s)} style={{...btn0,fontSize:15,fontWeight:700,padding:"4px 10px",borderRadius:4,border:"1px solid "+(item.status===s?(STATUS_COLORS[s]||"#888")+"60":t.border),background:item.status===s?(STATUS_COLORS[s]||"#888")+"18":"transparent",color:item.status===s?STATUS_COLORS[s]||"#888":t.textMuted}}>{s}</button>
@@ -1616,12 +1414,9 @@ const OpportunityCard = ({item,t,onSave,isSaved,onRemove,onStatusChange,onNoteCh
           </div>
         </div>}
 
-        {/* Source + Apply (for live postings) */}
+        {/* Source link */}
         <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",marginBottom:10}}>
-          {item.applyUrl&&(item.dataSource==="live_posting"||item.dataSource==="verified")&&<a href={item.applyUrl} target="_blank" rel="noopener noreferrer" style={{display:"inline-flex",alignItems:"center",gap:5,fontSize:14,color:"#fff",textDecoration:"none",padding:"7px 13px",background:"linear-gradient(135deg,#10b981,#059669)",borderRadius:6,fontWeight:700,boxShadow:"0 1px 3px rgba(16,185,129,0.3)"}}>
-            <Ic.ExternalLink size={11}/> Apply on {item.jobBoardSource||"Source"}
-          </a>}
-          {item.sourceUrl&&!(item.applyUrl&&item.applyUrl===item.sourceUrl)&&<a href={item.sourceUrl} target="_blank" rel="noopener noreferrer" style={{display:"inline-flex",alignItems:"center",gap:5,fontSize:15,color:moduleC,textDecoration:"none",padding:"5px 10px",background:moduleC+"15",borderRadius:6,fontWeight:600}}>
+          {item.sourceUrl&&<a href={item.sourceUrl} target="_blank" rel="noopener noreferrer" style={{display:"inline-flex",alignItems:"center",gap:5,fontSize:15,color:moduleC,textDecoration:"none",padding:"5px 10px",background:moduleC+"15",borderRadius:6,fontWeight:600}}>
             <Ic.ExternalLink size={10}/>{item.sourceName||"Source"}
           </a>}
           {item.postedDate&&<span style={{fontSize:12,color:t.textMuted,fontStyle:"italic"}}>Posted {new Date(item.postedDate).toLocaleDateString()}</span>}
@@ -1750,13 +1545,12 @@ const ScanLog = ({log,onClear,t}) => (
 
 // ─── MODULE: BOARD SCOUT ──────────────────────────────────────────────────────
 const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onOpenChat,onOpenTax,onOpenNetwork,onOpenDocs,onSchedule,onLogActivity,activityLog,
-  boardResults,setBoardResults,consultResults,setConsultResults,
+  boardResults,setBoardResults,
   bsLoading,setBsLoading,bsScanLog,setBsScanLog,bsLastScanned,setBsLastScanned}) => {
-  const [tab,setTab]=useState(()=>{ const t=storage.get("bs-tab"); return t||"board"; });
+  const [tab,setTab]=useState(()=>{ const t=storage.get("bs-tab"); return (t==="board"||t==="saved")?t:"board"; });
   const [countries,setCountries]=useState(()=>storage.get("bs-countries")||(profile.regions||[]).map(n=>ALL_COUNTRIES_FLAT.find(c=>c.name===n)?.code).filter(Boolean)||[]);
   const [sectors,setSectors]=useState(()=>storage.get("bs-sectors")||profile.defaultSectors||[]);
   const [allSectors,setAllSectors]=useState(()=>storage.get("bs-allsectors")!==false);
-  const [liveJobs,setLiveJobs]=useState(()=>storage.get("bs-live-jobs")!==false);
   const [statusFilter,setStatusFilter]=useState("ALL");
   const [configOpen,setConfigOpen]=useState(!isMobile);
   const loading=bsLoading; const setLoading=setBsLoading;
@@ -1769,7 +1563,6 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
   useEffect(()=>{ storage.set("bs-tab",tab); },[tab]);
   useEffect(()=>{ storage.set("bs-sectors",sectors); },[sectors]);
   useEffect(()=>{ storage.set("bs-allsectors",allSectors); },[allSectors]);
-  useEffect(()=>{ storage.set("bs-live-jobs",liveJobs); },[liveJobs]);
 
   const selectedCountryNames=countries.map(c=>getCountryByCode(c).name).filter(Boolean);
   const selectedSectors=allSectors?ALL_SECTORS_FLAT:sectors;
@@ -1783,60 +1576,40 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
   const runScan=useCallback(async()=>{
     if(!apiKey){setScanLog(["No API key set — configure in Settings"]);return;}
     bsAbortRef.current=new AbortController();
-    setLoading(true);setBoardResults([]);setConsultResults([]);setScanLog(["Starting board & consulting scan..."]);
+    setLoading(true);setBoardResults([]);setScanLog(["Starting board scan..."]);
     const cStr=selectedCountryNames.join(", "), sStr=selectedSectors.join(", ");
     const useSearch=provider==="claude"?[{type:"web_search_20250305",name:"web_search",max_uses:5}]:[];
     const sys="You are a JSON API endpoint. Search the web for real company data and return ONLY raw JSON arrays. No explanations or markdown. Return at least 1 result.";
 
     const boardPrompt=`${profileCtx}\n\nSearch for board seat opportunities in ${cStr} in sectors: ${sStr}. Find companies actively seeking non-executive directors or board advisors whose background matches this candidate: ${expertiseSummary}. Key expertise to match: ${keySkills}.\n\nReturn ONLY a JSON array:\n[{"name":"Company","region":"Country","city":"City","sector":"Sector","status":"PURSUE","type":"board","companyDescription":"2-3 sentences","sentiment":75,"tags":["tag1"],"fitReasons":["specific reason this candidate fits","reason2","reason3"],"estimatedFee":"$2K-$5K/month retainer","engagementType":"Independent Non-Executive Director","contactInfo":"contact@company.com","sourceUrl":"https://url","sourceName":"Source","sourceTitle":"Title"}]\nStatus: PURSUE, WATCH, PASS. Make fitReasons specific to this candidate's actual background — write them in second person addressed to the candidate, e.g. "Your experience in X makes you well positioned..." not "The candidate has experience in X". OUTPUT ONLY JSON.`;
 
-    const consultPrompt=`${profileCtx}\n\nSearch for consulting and advisory mandates in ${cStr} in sectors: ${sStr}. Find organisations that need external expertise matching this candidate's background: ${expertiseSummary}. Key skills to match: ${keySkills}. Look for organisations facing challenges or transformations where this specific expertise would be valuable.\n\nReturn ONLY a JSON array:\n[{"name":"Company","region":"Country","city":"City","sector":"Sector","status":"ACTIVE","type":"consulting","companyDescription":"2-3 sentences","sentiment":72,"tags":["tag1"],"fitReasons":["specific reason this candidate fits","reason2"],"needReasons":["specific challenge this organisation faces that matches the candidate"],"estimatedFee":"$3K-$5K/day","engagementType":"6-month advisory","contactInfo":"contact","sourceUrl":"https://url","sourceName":"Source","sourceTitle":"Title"}]\nStatus: ACTIVE, RESEARCHING, DECLINED. Make fitReasons specific to this candidate's actual expertise — write them in second person addressed to the candidate, e.g. "Your background in X positions you well to help with..." not "The candidate has experience in X". Make needReasons describe the organisation's challenge in third person. OUTPUT ONLY JSON.`;
-
-    const bCall=callLLM(provider,apiKey,[{role:"user",content:boardPrompt}],useSearch,sys,"BOARD",(m)=>setScanLog(p=>[...p,m])).then(extractJSON);
-    const cCall=callLLM(provider,apiKey,[{role:"user",content:consultPrompt}],useSearch,sys,"CONSULTING",(m)=>setScanLog(p=>[...p,m])).then(extractJSON);
-    const liveCall = liveJobs
-      ? fetchLiveJobs({ module:"board", countryCodes: countries, execFunction:"", minSalary:0, onLog:(m)=>setScanLog(p=>[...p,m]) })
-      : Promise.resolve([]);
     try {
-    const results=await Promise.allSettled([bCall,cCall,liveCall]);
-    const now=new Date().toISOString();
-    const liveResults = results[2].status==="fulfilled" ? results[2].value : [];
-    if(results[0].status==="fulfilled"){
-      const aiBr=results[0].value.map((v,i)=>({...v,id:"b-"+Date.now()+"-"+i,moduleTag:"Board",scannedAt:now,dataSource:v.dataSource||"ai_signal"}));
-      const br = mergeLiveAndAiResults(aiBr, liveResults);
+      const blocks = await callLLM(provider,apiKey,[{role:"user",content:boardPrompt}],useSearch,sys,"BOARD",(m)=>setScanLog(p=>[...p,m]));
+      const aiResults = extractJSON(blocks);
+      const now=new Date().toISOString();
+      const br=aiResults.map((v,i)=>({...v,id:"b-"+Date.now()+"-"+i,moduleTag:"Board",scannedAt:now}));
       setBoardResults(br);storage.set("bs-results",br);
-      const liveCount = br.filter(x=>x.dataSource==="live_posting").length;
-      const verifiedCount = br.filter(x=>x.dataSource==="verified").length;
-      setScanLog(p=>[...p,"✓ "+br.length+" board opportunities ("+aiBr.length+" AI, "+liveCount+" live, "+verifiedCount+" verified)"]);
-    }
-    else {
-      setScanLog(p=>[...p,"✗ Board: "+results[0].reason?.message]);
-      if(liveResults.length>0){ setBoardResults(liveResults);storage.set("bs-results",liveResults);setScanLog(p=>[...p,"✓ Showing "+liveResults.length+" live postings only"]); }
-    }
-    if(results[1].status==="fulfilled"){const cr=results[1].value.map((v,i)=>({...v,id:"c-"+Date.now()+"-"+i,moduleTag:"Consulting",scannedAt:now,dataSource:"ai_signal"}));setConsultResults(cr);storage.set("bs-consult-results",cr);setScanLog(p=>[...p,"✓ "+cr.length+" consulting opportunities"]);}
-    else setScanLog(p=>[...p,"✗ Consulting: "+results[1].reason?.message]);
-    storage.set("bs-last-scanned",now);setBsLastScanned(now);
-    setScanLog(p=>[...p,"Scan complete."]);
-  } catch(err){ if(err.name!=="AbortError") setScanLog(p=>[...p,"✗ Error: "+err.message]); }
-  finally { setLoading(false); }
-  },[apiKey,provider,selectedCountryNames,selectedSectors,profileCtx,expertiseSummary,keySkills,liveJobs,countries]);
+      setScanLog(p=>[...p,"✓ "+br.length+" board opportunities"]);
+      storage.set("bs-last-scanned",now);setBsLastScanned(now);
+      setScanLog(p=>[...p,"Scan complete."]);
+    } catch(err){ if(err.name!=="AbortError") setScanLog(p=>[...p,"✗ Error: "+err.message]); }
+    finally { setLoading(false); }
+  },[apiKey,provider,selectedCountryNames,selectedSectors,profileCtx,expertiseSummary,keySkills]);
 
   const saveOpp=(item)=>{
     if(saved.some(s=>s.name===item.name&&s.region===item.region)) return;
     setSaved(p=>[...p,{...item,savedAt:new Date().toISOString(),notes:"",source:"board"}]);
     setBoardResults(p=>{const r=p.filter(s=>s.id!==item.id);storage.set("bs-results",r);return r;});
-    setConsultResults(p=>{const r=p.filter(s=>s.id!==item.id);storage.set("bs-consult-results",r);return r;});
   };
   const removeOpp=(id)=>setSaved(p=>p.filter(s=>s.id!==id));
   const removeResult=(id)=>{
     setBoardResults(p=>{const r=p.filter(s=>s.id!==id);storage.set("bs-results",r);return r;});
-    setConsultResults(p=>{const r=p.filter(s=>s.id!==id);storage.set("bs-consult-results",r);return r;});
   };
   const updateNote=(id,notes)=>setSaved(p=>p.map(s=>s.id===id?{...s,notes}:s));
-  const changeStatus=(item,status)=>{ if(tab==="saved") setSaved(p=>p.map(s=>s.id===item.id?{...s,status}:s)); else if(tab==="board") setBoardResults(p=>p.map(v=>v.id===item.id?{...v,status}:v)); else setConsultResults(p=>p.map(v=>v.id===item.id?{...v,status}:v)); };
+  const changeStatus=(item,status)=>{ if(tab==="saved") setSaved(p=>p.map(s=>s.id===item.id?{...s,status}:s)); else setBoardResults(p=>p.map(v=>v.id===item.id?{...v,status}:v)); };
 
   const bsSaved=saved.filter(s=>s.source==="board");
-  const currentItems=tab==="board"?boardResults.filter(i=>statusFilter==="ALL"||i.status===statusFilter):tab==="consulting"?consultResults.filter(i=>statusFilter==="ALL"||i.status===statusFilter):bsSaved.filter(i=>statusFilter==="ALL"||i.status===statusFilter);
+  const currentItems=tab==="board"?boardResults.filter(i=>statusFilter==="ALL"||i.status===statusFilter):bsSaved.filter(i=>statusFilter==="ALL"||i.status===statusFilter);
 
   return (
     <div style={{display:"flex",flexDirection:isMobile?"column":"row",gap:8,flex:1,overflow:"hidden"}}>
@@ -1851,14 +1624,7 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
           <div style={{marginTop:8}}>
           <CategorySectorPicker selected={sectors} onChange={setSectors} max={5} color={moduleColor} storageKey="bs" t={t} allMode={allSectors} onToggleAll={()=>{setAllSectors(!allSectors);setSectors([]);}}/>
           </div>
-          <label style={{display:"flex",alignItems:"center",gap:8,marginTop:10,marginBottom:10,padding:"8px 10px",background:t.input,border:"1px solid "+t.border,borderRadius:7,cursor:"pointer"}}>
-            <input type="checkbox" checked={liveJobs} onChange={e=>setLiveJobs(e.target.checked)} style={{accentColor:moduleColor,width:14,height:14}}/>
-            <div style={{flex:1,minWidth:0}}>
-              <div style={{fontSize:13,fontWeight:700,color:t.text}}>Include live postings</div>
-              <div style={{fontSize:11,color:t.textMuted,lineHeight:1.4}}>Blend real job-board listings with AI signals</div>
-            </div>
-          </label>
-          <button onClick={loading?cancelScan:runScan} disabled={!loading&&(!apiKey||countries.length===0)} style={{...btn0,width:"100%",padding:14,borderRadius:8,fontSize:15,fontWeight:700,color:"#fff",background:loading?"#ef4444":(!apiKey||countries.length===0)?t.textDim:"linear-gradient(135deg,"+moduleColor+",#059669)",display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"background 0.2s"}}>
+          <button onClick={loading?cancelScan:runScan} disabled={!loading&&(!apiKey||countries.length===0)} style={{...btn0,width:"100%",padding:14,borderRadius:8,fontSize:15,fontWeight:700,color:"#fff",background:loading?"#ef4444":(!apiKey||countries.length===0)?t.textDim:"linear-gradient(135deg,"+moduleColor+",#059669)",display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"background 0.2s",marginTop:10}}>
             {loading?<><Ic.Loader2 size={15} style={{animation:"spin 0.8s linear infinite"}}/> Cancel</>:<><Ic.Search size={15}/> {bsLastScanned?"Rescan":"Run Scan"}</>}
           </button>
           {!apiKey&&<div style={{marginTop:8,fontSize:15,color:"#f59e0b",textAlign:"center"}}>⚠ Configure API key in Settings</div>}
@@ -1870,21 +1636,21 @@ const BoardScoutModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
       <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",overflow:"hidden",maxHeight:"calc(100vh - 58px)",minHeight:0}}>
         <ProfileNudge profile={profile} t={t}/>
         <div style={{flexShrink:0,display:"flex",marginBottom:8,background:t.surface,borderRadius:8,padding:3,border:"1px solid "+t.border}}>
-          {[{key:"board",label:"Board",count:boardResults.length},{key:"consulting",label:"Consulting",count:consultResults.length},{key:"saved",label:"Saved",count:bsSaved.length}].map(({key,label,count})=>(
+          {[{key:"board",label:"Board",count:boardResults.length},{key:"saved",label:"Saved",count:bsSaved.length}].map(({key,label,count})=>(
             <button key={key} onClick={()=>{setTab(key);setStatusFilter("ALL");}} style={{...btn0,flex:1,padding:isMobile?"12px 6px":"9px 8px",borderRadius:6,fontSize:15,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:5,background:tab===key?moduleColor+"15":"transparent",color:tab===key?moduleColor:t.textMuted}}>
               {label}{count>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:8,background:tab===key?moduleColor+"25":t.border,color:tab===key?moduleColor:t.textDim}}>{count}</span>}
             </button>
           ))}
         </div>
         <div style={{flexShrink:0,display:"flex",gap:5,marginBottom:8,flexWrap:"wrap"}}>
-          {["ALL","PURSUE","WATCH","PASS","ACTIVE","RESEARCHING"].map(s=>(
+          {["ALL","PURSUE","WATCH","PASS"].map(s=>(
             <button key={s} onClick={()=>setStatusFilter(s)} style={{...btn0,fontSize:15,fontWeight:700,padding:"4px 10px",borderRadius:4,border:"1px solid "+(statusFilter===s?(STATUS_COLORS[s]||moduleColor)+"60":t.border),background:statusFilter===s?(STATUS_COLORS[s]||moduleColor)+"15":"transparent",color:statusFilter===s?STATUS_COLORS[s]||moduleColor:t.textMuted}}>{s}</button>
           ))}
         </div>
         <div style={{flex:1,overflowY:"auto",minHeight:0}}>
           {currentItems.length===0&&!loading&&<div style={{textAlign:"center",padding:48,color:t.textDim}}>
             <div style={{fontSize:36,marginBottom:10}}>🔍</div>
-            <div style={{fontSize:15,fontWeight:500}}>{tab==="saved"?"No saved board opportunities yet.":"Run a scan to discover board & consulting opportunities."}</div>
+            <div style={{fontSize:15,fontWeight:500}}>{tab==="saved"?"No saved board opportunities yet.":"Run a scan to discover board opportunities."}</div>
           </div>}
           {currentItems.map(item=><OpportunityCard key={item.id} item={item} t={t} onSave={saveOpp} isSaved={saved.some(s=>s.name===item.name&&s.region===item.region)} onRemove={removeOpp} onRemoveResult={removeResult} onStatusChange={changeStatus} onNoteChange={updateNote} savedMode={tab==="saved"} moduleColor={moduleColor} onResearch={onOpenChat} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={onOpenTax} onOpenNetwork={onOpenNetwork} onOpenDocs={onOpenDocs} onSchedule={onSchedule} onLogActivity={onLogActivity} activityLog={activityLog}/>)}
         </div>
@@ -2037,7 +1803,6 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
   const [execFunction,setExecFunction]=useState(()=>storage.get("es-function")||"");
   const [minPackage,setMinPackage]=useState(()=>storage.get("es-min-package")||150000);
   const [scope,setScope]=useState(()=>storage.get("es-scope")||"regional");
-  const [liveJobs,setLiveJobs]=useState(()=>storage.get("es-live-jobs")!==false);
   const [statusFilter,setStatusFilter]=useState("ALL");
   const [configOpen,setConfigOpen]=useState(!isMobile);
   const loading=esLoading; const setLoading=setEsLoading;
@@ -2051,7 +1816,6 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
   useEffect(()=>{ storage.set("es-function",execFunction); },[execFunction]);
   useEffect(()=>{ storage.set("es-min-package",minPackage); },[minPackage]);
   useEffect(()=>{ storage.set("es-scope",scope); },[scope]);
-  useEffect(()=>{ storage.set("es-live-jobs",liveJobs); },[liveJobs]);
 
   const selectedCountryNames=countries.map(c=>getCountryByCode(c).name).filter(Boolean);
   const selectedSectors=allSectors?ALL_SECTORS_FLAT:sectors;
@@ -2069,33 +1833,19 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     const funcStr=execFunction?`Function focus: ${execFunction}.`:"";
     const prompt=`${profileCtx}\n\nYou are an executive search consultant. Identify companies likely to need a ${scopeLabel} director-level or above hire in the next 6-12 months. ${funcStr}\n\nSearch for companies in ${cStr} across sectors: ${sStr||"all sectors"} that show HIRING SIGNALS such as:\n- Recent expansion into new geographies or markets\n- Leadership departures, restructuring or transformation programmes\n- Funded scale-ups that have outgrown current leadership\n- Companies entering new sectors or undergoing digital transformation\n- Post-M&A integration needs\n- Rapid growth requiring senior operational leadership\n\nMINIMUM TOTAL PACKAGE: $${minPackage.toLocaleString()}/year. Only surface roles that would realistically command at least this compensation.\n\nTARGET PROFILE MATCH: The candidate has ${profile.title||"senior director"} background. Match on DEPTH OF RESPONSIBILITY not just title — look for roles requiring multi-country remit, P&L ownership, large team leadership, or strategic transformation scope.\n\nFor each opportunity return realistic total package estimates using these benchmarks: Country Director $120K-$200K, Regional Director $160K-$280K, VP/SVP $200K-$350K, C-suite $250K-$500K+. Adjust for market (US +30%, Nordics baseline, Africa -40%, Middle East +20%).\n\nReturn ONLY a JSON array:\n[{"name":"Company name","probableRole":"Specific role title e.g. Regional Supply Chain Director","hiringSignal":"Why this company likely needs this hire right now — specific signal","region":"Country/Region","city":"City","sector":"Sector","estimatedPackage":"$180,000–$220,000 total package","annualUSD":200000,"packageBreakdown":"Base ~$160K + 20% bonus","daysPerYear":220,"effortRating":"HIGH","status":"HOT","description":"What this company does and why this role exists","fitReasons":["Specific reason this candidate fits — written in second person as You...","second fit reason"],"whyNow":"The specific hiring signal — what changed recently","sourceUrl":"https://url","sourceName":"Source name","sentiment":75,"tags":["transformation","supply-chain"]}]\nStatus: HOT (strong signal), WARM (emerging signal), COLD (speculative). Write fitReasons in second person. Be specific and realistic. OUTPUT ONLY JSON.`;
 
-    const aiCall = callLLM(provider,apiKey,[{role:"user",content:prompt}],useSearch,sys,"EXEC",(m)=>setScanLog(p=>[...p,m])).then(extractJSON);
-    const liveCall = liveJobs
-      ? fetchLiveJobs({ module:"exec", countryCodes: countries, execFunction, minSalary: minPackage, onLog:(m)=>setScanLog(p=>[...p,m]) })
-      : Promise.resolve([]);
     try {
-      const [aiRes, liveRes] = await Promise.allSettled([aiCall, liveCall]);
+      const blocks = await callLLM(provider,apiKey,[{role:"user",content:prompt}],useSearch,sys,"EXEC",(m)=>setScanLog(p=>[...p,m]));
+      const aiResults = extractJSON(blocks);
       const now = new Date().toISOString();
-      const liveResults = liveRes.status==="fulfilled" ? liveRes.value : [];
-      let merged = [];
-      if(aiRes.status==="fulfilled") {
-        const aiHr = aiRes.value.map((v,i)=>({...v,id:"es-"+Date.now()+"-"+i,moduleTag:v.probableRole||"Exec Role",dataSource:v.dataSource||"ai_signal",scannedAt:now}));
-        merged = mergeLiveAndAiResults(aiHr, liveResults);
-        const liveCount = merged.filter(x=>x.dataSource==="live_posting").length;
-        const verifiedCount = merged.filter(x=>x.dataSource==="verified").length;
-        setScanLog(p=>[...p,"✓ "+merged.length+" opportunities ("+aiHr.length+" AI, "+liveCount+" live, "+verifiedCount+" verified)"]);
-      } else {
-        merged = liveResults;
-        setScanLog(p=>[...p,"✗ AI scan failed: "+(aiRes.reason?.message||"unknown")]);
-        if(liveResults.length>0) setScanLog(p=>[...p,"✓ Showing "+liveResults.length+" live postings only"]);
-      }
+      const merged = aiResults.map((v,i)=>({...v,id:"es-"+Date.now()+"-"+i,moduleTag:v.probableRole||"Exec Role",scannedAt:now}));
       setEsResults(merged);
       storage.set("es-results",merged);
       storage.set("es-last-scanned",now);
       setEsLastScanned(now);
+      setScanLog(p=>[...p,"✓ "+merged.length+" opportunities"]);
     } catch(e){ setScanLog(p=>[...p,"✗ "+e.message]); }
     finally { setScanLog(p=>[...p,"Scan complete."]); setLoading(false); }
-  },[apiKey,provider,selectedCountryNames,selectedSectors,execFunction,minPackage,scope,profileCtx,liveJobs,countries]);
+  },[apiKey,provider,selectedCountryNames,selectedSectors,execFunction,minPackage,scope,profileCtx]);
 
   const saveOpp=(item)=>{
     if(saved.some(s=>s.name===item.name&&s.region===item.region)) return;
@@ -2143,14 +1893,7 @@ const ExecSearchModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
             <div style={{marginTop:4,fontSize:12,color:t.textMuted}}>Base + bonus + equity combined</div>
           </div>
           <div style={{marginTop:8}}><CategorySectorPicker selected={sectors} onChange={setSectors} max={5} color={moduleColor} t={t} allMode={allSectors} onToggleAll={()=>{setAllSectors(!allSectors);setSectors([])}}/></div>
-          <label style={{display:"flex",alignItems:"center",gap:8,marginTop:10,marginBottom:10,padding:"8px 10px",background:t.input,border:"1px solid "+t.border,borderRadius:7,cursor:"pointer"}}>
-            <input type="checkbox" checked={liveJobs} onChange={e=>setLiveJobs(e.target.checked)} style={{accentColor:moduleColor,width:14,height:14}}/>
-            <div style={{flex:1,minWidth:0}}>
-              <div style={{fontSize:13,fontWeight:700,color:t.text}}>Include live postings</div>
-              <div style={{fontSize:11,color:t.textMuted,lineHeight:1.4}}>Blend real job-board listings with AI hiring signals</div>
-            </div>
-          </label>
-          <button onClick={loading?()=>{setLoading(false);setScanLog(p=>[...p,"⛔ Cancelled."]);}:runScan} disabled={!loading&&(!apiKey||countries.length===0)} style={{...btn0,width:"100%",padding:14,borderRadius:8,fontSize:15,fontWeight:700,color:"#fff",background:loading?"#ef4444":(!apiKey||countries.length===0)?t.textDim:"linear-gradient(135deg,"+moduleColor+",#9333ea)",display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"background 0.2s"}}>
+          <button onClick={loading?()=>{setLoading(false);setScanLog(p=>[...p,"⛔ Cancelled."]);}:runScan} disabled={!loading&&(!apiKey||countries.length===0)} style={{...btn0,width:"100%",padding:14,borderRadius:8,fontSize:15,fontWeight:700,color:"#fff",background:loading?"#ef4444":(!apiKey||countries.length===0)?t.textDim:"linear-gradient(135deg,"+moduleColor+",#9333ea)",display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"background 0.2s",marginTop:10}}>
             {loading?<><Ic.Loader2 size={15} style={{animation:"spin 0.8s linear infinite"}}/> Cancel</>:<><Ic.Search size={15}/> {esLastScanned?"Rescan":"Find Roles"}</>}
           </button>
         </div>}
@@ -2218,7 +1961,7 @@ const SideHustleModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,onO
     const useSearch=provider==="claude"?[{type:"web_search_20250305",name:"web_search",max_uses:5}]:[];
     const sys="You are a JSON API endpoint. Return ONLY raw JSON arrays. No markdown.";
 
-    const prompt=`${profileCtx}\n\nFind paid side hustle opportunities that match this candidate's specific background. Look for: fractional roles, advisory seats, keynote speaking, paid workshops, short project contracts, expert witness or review work, board observer roles — anything where this person's expertise (${professionLabel}) can be monetised on a part-time or project basis in ${cStr}, sectors: ${sStr}.\n\nMINIMUM ANNUAL VALUE: ${minAnnualStr} USD. Only surface opportunities that could realistically generate at least this amount annually based on market rates, engagement frequency, and the candidate's seniority. Use these fee anchors: Board NED (listed) $40K-$120K/year retainer; Board NED (private) $15K-$50K/year; Fractional Director $1,500-$6,000/day × realistic days; Advisory retainer $2K-$8K/month; Keynote $3K-$15K/event; Consulting project fees based on scope. Adjust upward for senior profiles in high-value markets.\n\nFor each opportunity, estimate the realistic annual USD value and include it as annualUSD. Also estimate daysPerYear commitment and calculate usdPerDay. Rate effort as LOW (under 20 days/year), MEDIUM (20-60 days), or HIGH (over 60 days).\n\nReturn ONLY a JSON array:\n[{"name":"Opportunity/Company","region":"Country","city":"City","sector":"Sector","status":"HOT","type":"fractional","description":"what the role is and why it fits this candidate specifically","estimatedFee":"market rate description","annualUSD":120000,"daysPerYear":24,"usdPerDay":5000,"effortRating":"LOW","feeBasis":"3 board meetings/year + $90K retainer","timeCommitment":"2 days/month","sentiment":80,"tags":["tag1"],"fitReasons":["specific reason this candidate fits based on their background","skill match"],"engagementType":"${exampleRole}","sourceUrl":"https://url","sourceName":"Source","whyNow":"why timing is right for this specific person"}\nStatus: HOT, WARM, COLD. Types: fractional, advisory, speaking, workshop, contract, board-observer, expert-witness. Make all results specific to this candidate's actual profession and expertise. Write fitReasons in second person. Be realistic with fee estimates — do not inflate. OUTPUT ONLY JSON.`;
+    const prompt=`${profileCtx}\n\nFind paid side hustle opportunities that match this candidate's specific background. Look for: fractional roles, advisory seats, consulting and advisory mandates, keynote speaking, paid workshops, short project contracts, expert witness or review work, board observer roles — anything where this person's expertise (${professionLabel}) can be monetised on a part-time or project basis in ${cStr}, sectors: ${sStr}.\n\nMINIMUM ANNUAL VALUE: ${minAnnualStr} USD. Only surface opportunities that could realistically generate at least this amount annually based on market rates, engagement frequency, and the candidate's seniority. Use these fee anchors: Board NED (listed) $40K-$120K/year retainer; Board NED (private) $15K-$50K/year; Fractional Director $1,500-$6,000/day × realistic days; Advisory retainer $2K-$8K/month; Keynote $3K-$15K/event; Consulting mandates $3K-$5K/day × engagement length. Adjust upward for senior profiles in high-value markets.\n\nFor each opportunity, estimate the realistic annual USD value and include it as annualUSD. Also estimate daysPerYear commitment and calculate usdPerDay. Rate effort as LOW (under 20 days/year), MEDIUM (20-60 days), or HIGH (over 60 days). For consulting/advisory mandates, derive annualUSD from day rate × realistic project days.\n\nReturn ONLY a JSON array:\n[{"name":"Opportunity/Company","region":"Country","city":"City","sector":"Sector","status":"HOT","type":"fractional","description":"what the role is and why it fits this candidate specifically","estimatedFee":"market rate description","annualUSD":120000,"daysPerYear":24,"usdPerDay":5000,"effortRating":"LOW","feeBasis":"3 board meetings/year + $90K retainer","timeCommitment":"2 days/month","sentiment":80,"tags":["tag1"],"fitReasons":["specific reason this candidate fits based on their background","skill match"],"needReasons":["specific challenge this organisation faces — only for consulting/advisory types"],"engagementType":"${exampleRole}","sourceUrl":"https://url","sourceName":"Source","whyNow":"why timing is right for this specific person"}\nStatus: HOT, WARM, COLD. Types: fractional, advisory, consulting, speaking, workshop, contract, board-observer, expert-witness. Make all results specific to this candidate's actual profession and expertise. Write fitReasons in second person ("Your background in X..."). For consulting/advisory types, ALSO include needReasons describing the organisation's challenge in third person. For other types, omit needReasons. Be realistic with fee estimates — do not inflate. OUTPUT ONLY JSON.`;
 
     try {
       const blocks=await callLLM(provider,apiKey,[{role:"user",content:prompt}],useSearch,sys,"HUSTLES",(m)=>setScanLog(p=>[...p,m]));
@@ -2439,14 +2182,16 @@ const DealMonitorModule = ({t,apiKey,provider,profile,isMobile,saved,setSaved,on
 };
 
 // ─── MODULE: COMMAND CENTER ────────────────────────────────────────────────────
-const CommandCenter = ({t,profile,saved,isMobile,setActiveModule,apiKey,provider,profileComplete,gatedModules,activityLog,contacts,saveToVault}) => {
+const CommandCenter = ({t,profile,saved,isMobile,setActiveModule,apiKey,provider,profileComplete,gatedModules,activityLog,contacts,saveToVault,hiddenModules}) => {
   const now=new Date();
   const hr=now.getHours();
   const greeting=hr<12?"Good morning":hr<17?"Good afternoon":"Good evening";
   const name=profile.name?profile.name.split(" ")[0]:"";
-  const total=saved.length;
-  const bySource={board:saved.filter(s=>s.source==="board").length,venture:saved.filter(s=>s.source==="venture").length,hustle:saved.filter(s=>s.source==="hustle").length,deal:saved.filter(s=>s.source==="deal").length};
-  const topPursue=saved.filter(s=>s.status==="PURSUE"||s.status==="BUILD"||s.status==="HOT").slice(0,3);
+  const hidden=hiddenModules||[];
+  const visibleSaved=saved.filter(s=>!hidden.includes(s.source));
+  const total=visibleSaved.length;
+  const bySource={board:visibleSaved.filter(s=>s.source==="board").length,venture:visibleSaved.filter(s=>s.source==="venture").length,hustle:visibleSaved.filter(s=>s.source==="hustle").length,deal:visibleSaved.filter(s=>s.source==="deal").length,exec:visibleSaved.filter(s=>s.source==="exec").length};
+  const topPursue=visibleSaved.filter(s=>s.status==="PURSUE"||s.status==="BUILD"||s.status==="HOT").slice(0,3);
   const [morningBrief,setMorningBrief]=useState(null);
   const [briefLoading,setBriefLoading]=useState(false);
   const [weeklyDigest,setWeeklyDigest]=useState(null);
@@ -2580,12 +2325,12 @@ Use "you have", "your pipeline", "you should" — never "Young has" or "the user
   };
 
   const modules=[
-    {key:"board",label:"Board Scout",desc:"Board seats & consulting mandates",color:"#6ee7b7",icon:"🏛"},
-    {key:"hustle",label:"Side Hustle Lab",desc:"Fractional roles & paid advisory",color:"#fb923c",icon:"⚡"},
+    {key:"board",label:"Board Scout",desc:"Board seats & NED roles",color:"#6ee7b7",icon:"🏛"},
+    {key:"hustle",label:"Side Hustle Lab",desc:"Fractional, advisory & consulting mandates",color:"#fb923c",icon:"⚡"},
     {key:"exec",label:"Executive Search",desc:"Director & C-suite opportunities",color:"#c084fc",icon:"👔"},
     {key:"venture",label:"Venture Scout",desc:"Startup deals & business ideas",color:"#818cf8",icon:"🚀"},
     {key:"deal",label:"Investment Thesis",desc:"Your thesis-driven deal flow",color:"#f6c90e",icon:"🎯"},
-  ];
+  ].filter(m=>!hidden.includes(m.key));
 
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%",minHeight:0}}>
@@ -2633,12 +2378,16 @@ Use "you have", "your pipeline", "you should" — never "Young has" or "the user
 
       {/* Pipeline summary */}
       <div style={{display:"grid",gridTemplateColumns:isMobile?"repeat(2,1fr)":"repeat(4,1fr)",gap:8,marginBottom:16,position:"sticky",top:0,zIndex:3,background:t.bg,paddingTop:4,paddingBottom:4}}>
-        {[
-          {label:"Total Saved",value:total,color:t.accent},
-          {label:"Board & Advisory",value:bySource.board+bySource.hustle,color:"#6ee7b7"},
-          {label:"Ventures & Deals",value:bySource.venture+bySource.deal,color:"#818cf8"},
-          {label:"Top Prospects",value:topPursue.length,color:"#f6c90e"},
-        ].map((stat,i)=>(
+        {(() => {
+          const advisoryShown=!hidden.includes("board")||!hidden.includes("hustle");
+          const advisoryLabel=hidden.includes("board")?"Advisory":hidden.includes("hustle")?"Board":"Board & Advisory";
+          return [
+            {label:"Total Saved",value:total,color:t.accent},
+            advisoryShown?{label:advisoryLabel,value:(bySource.board||0)+(bySource.hustle||0),color:"#6ee7b7"}:null,
+            {label:"Ventures & Deals",value:bySource.venture+bySource.deal,color:"#818cf8"},
+            {label:"Top Prospects",value:topPursue.length,color:"#f6c90e"},
+          ].filter(Boolean);
+        })().map((stat,i)=>(
           <div key={i} style={{background:t.card,border:"1px solid "+stat.color+"25",borderRadius:8,padding:"10px 12px"}}>
             <div style={{fontSize:isMobile?20:22,fontWeight:800,color:stat.color,fontFamily:"'DM Mono',monospace"}}>{stat.value}</div>
             <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.06em",color:t.textDim,marginTop:3}}>{stat.label.toUpperCase()}</div>
@@ -2810,9 +2559,12 @@ const sourceLabel = (src) => {
   return map[src] || (src ? src.charAt(0).toUpperCase()+src.slice(1) : "Unknown");
 };
 
-const PipelineModule = ({t,saved,setSaved,isMobile,onOpenChat,profile,apiKey,provider,onOpenTax,onOpenNetwork,onOpenDocs,onNavigateToSource,onSchedule,onLogActivity,activityLog}) => {
+const PipelineModule = ({t,saved:savedAll,setSaved,isMobile,onOpenChat,profile,apiKey,provider,onOpenTax,onOpenNetwork,onOpenDocs,onNavigateToSource,onSchedule,onLogActivity,activityLog,hiddenModules}) => {
+  const hidden=hiddenModules||[];
+  const saved=React.useMemo(()=>(savedAll||[]).filter(s=>!hidden.includes(s.source)),[savedAll,hidden]);
   const [view,setView]=useState(()=>storage.get("pipeline-view")||"kanban");
   const [sourceFilter,setSourceFilter]=useState("ALL");
+  useEffect(()=>{ if(sourceFilter!=="ALL"&&hidden.includes(sourceFilter)) setSourceFilter("ALL"); },[hidden,sourceFilter]);
   const [listStatusFilter,setListStatusFilter]=useState("ALL");
   const [valueSortBy,setValueSortBy]=useState("annualUSD");
   const [valueAnalysing,setValueAnalysing]=useState(false);
@@ -2928,7 +2680,7 @@ Be conservative and realistic. OUTPUT ONLY JSON.`;
 
       {/* Frozen source filter */}
       <div style={{flexShrink:0,display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>
-        {["ALL","board","venture","hustle","exec","deal"].map(s=>(
+        {["ALL","board","venture","hustle","exec","deal"].filter(s=>s==="ALL"||!hidden.includes(s)).map(s=>(
           <button key={s} onClick={()=>setSourceFilter(s)} style={{...btn0,fontSize:15,fontWeight:700,padding:"4px 10px",borderRadius:4,border:"1px solid "+(sourceFilter===s?(moduleColors[s]||t.accent)+"60":t.border),background:sourceFilter===s?(moduleColors[s]||t.accent)+"15":"transparent",color:sourceFilter===s?moduleColors[s]||t.accent:t.textMuted}}>{s==="ALL"?"All":sourceLabel(s)}</button>
         ))}
       </div>
@@ -3584,8 +3336,15 @@ const DocumentGenerator = ({item,profile,apiKey,provider,t,onClose,onSaveToVault
   const [copied,setCopied]=useState(false);
   const [savedToVault,setSavedToVault]=useState(false);
   const [showAll,setShowAll]=useState(false);
+  // ── Outreach-email specific state ──
+  const looksLikeEmail = (s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((s||"").trim());
+  const [emailTo,setEmailTo]=useState(()=>looksLikeEmail(item.contactInfo)?item.contactInfo.trim():"");
+  const [emailCc,setEmailCc]=useState("");
+  const [emailSubject,setEmailSubject]=useState("");
+  const [emailBody,setEmailBody]=useState("");
 
   const DOC_TYPES=[
+    {key:"outreach_email",label:"Outreach Email",icon:"✉",desc:"Personalised email to a contact at this company"},
     {key:"board_application",label:"Board Application",icon:"🏛",desc:"Cover letter for a board seat"},
     {key:"capability",label:"Capability Statement",icon:"📋",desc:"Consulting one-pager"},
     {key:"due_diligence",label:"Due Diligence Memo",icon:"🔍",desc:"Investment analysis memo"},
@@ -3603,12 +3362,12 @@ const DocumentGenerator = ({item,profile,apiKey,provider,t,onClose,onSaveToVault
 
     // Board source
     if(src==="board"){
-      if(type==="board"||type==="board scout"||type==="") 
-        return ["board_application","executive_bio","outreach_sequence"];
+      if(type==="board"||type==="board scout"||type==="")
+        return ["outreach_email","board_application","executive_bio","outreach_sequence"];
       if(type==="consulting"||type==="advisory"||type==="consulting mandate")
-        return ["capability","fee_negotiation","outreach_sequence","executive_bio"];
+        return ["outreach_email","capability","fee_negotiation","outreach_sequence","executive_bio"];
       // default for board source
-      return ["board_application","executive_bio","outreach_sequence"];
+      return ["outreach_email","board_application","executive_bio","outreach_sequence"];
     }
 
     // Venture source
@@ -3616,23 +3375,27 @@ const DocumentGenerator = ({item,profile,apiKey,provider,t,onClose,onSaveToVault
       if(type==="idea"||type==="build"||type==="research"||type==="skip")
         return ["investment_thesis","capability"];
       // ventures, deals, anything else from venture scout
-      return ["due_diligence","investment_thesis","outreach_sequence"];
+      return ["outreach_email","due_diligence","investment_thesis","outreach_sequence"];
     }
 
     // Hustle source
     if(src==="hustle")
-      return ["capability","fee_negotiation","outreach_sequence","executive_bio"];
+      return ["outreach_email","capability","fee_negotiation","outreach_sequence","executive_bio"];
+
+    // Exec source
+    if(src==="exec")
+      return ["outreach_email","executive_bio","outreach_sequence","fee_negotiation"];
 
     // Deal / Investment Thesis source
     if(src==="deal")
-      return ["due_diligence","investment_thesis","outreach_sequence"];
+      return ["outreach_email","due_diligence","investment_thesis","outreach_sequence"];
 
     // Fallback: try to infer from type alone (e.g. items opened from Pipeline)
-    if(type==="board") return ["board_application","executive_bio","outreach_sequence"];
-    if(type==="consulting"||type==="advisory") return ["capability","fee_negotiation","outreach_sequence","executive_bio"];
+    if(type==="board") return ["outreach_email","board_application","executive_bio","outreach_sequence"];
+    if(type==="consulting"||type==="advisory") return ["outreach_email","capability","fee_negotiation","outreach_sequence","executive_bio"];
     if(type==="fractional"||type==="speaking"||type==="workshop"||type==="contract"||type==="board-observer"||type==="expert-witness")
-      return ["capability","fee_negotiation","outreach_sequence","executive_bio"];
-    if(type==="venture"||type==="idea"||type==="build") return ["due_diligence","investment_thesis","outreach_sequence"];
+      return ["outreach_email","capability","fee_negotiation","outreach_sequence","executive_bio"];
+    if(type==="venture"||type==="idea"||type==="build") return ["outreach_email","due_diligence","investment_thesis","outreach_sequence"];
 
     // True fallback — show all
     return DOC_TYPES.map(d=>d.key);
@@ -3657,7 +3420,33 @@ DESCRIPTION: ${item.companyDescription||item.description||""}
 FEE: ${item.estimatedFee||item.entryCost||item.equity||"Not specified"}
 FIT: ${(item.fitReasons||[]).join("; ")||"Not specified"}`;
 
+    const needCtx = (item.needReasons||[]).length>0 ? `RELEVANCE SIGNALS (hypothetical — do NOT state these as confirmed facts about the company):\n${(item.needReasons||[]).map(r=>"- "+r).join("\n")}` : "";
     const prompts={
+      outreach_email:`${profCtx}
+
+${oppCtx}
+${needCtx}
+
+Write a professional outreach email FROM ME to a senior contact at ${item.name||"the target organisation"}. I am the sender introducing myself and proposing a conversation. The goal is to make them want to take a 20-minute call.
+
+Tone: senior peer to senior peer. Confident, specific, warm. No flattery, no buzzwords, no padding. Plain prose, not a sales pitch.
+
+Output format — plain text only, ABSOLUTELY no markdown, no asterisks, no hashtags, no bold, no bullet points unless they're written as full sentences:
+
+Line 1: Subject: [a specific subject line referencing what I bring or what they need — under 70 characters]
+Line 2: [blank]
+Line 3+: The email body, structured as:
+- A salutation ("Dear team at ${item.name||"[Company]"}," or "Hello,")
+- One short opening paragraph that names a specific reason I'm reaching out — anchor it on my genuine interest in the company, sector, or their publicly known work. Do NOT assume the company is running any specific project, implementing any technology, or facing any challenge just because I have experience with it
+- One paragraph introducing myself: my current role, my most relevant 1-2 career highlights for THIS opportunity, and the angle of value I'd bring
+- One paragraph proposing a specific next step (a 20-minute call to explore whether there's a fit) and offering 2-3 concrete time options the following week
+- A professional sign-off with my name (${profile.name||""}) and title (${profile.title||""})
+
+Total length: 180-260 words for the body. Every sentence must earn its place. Reference ${item.name||"the company"} by name at least once.
+
+CRITICAL: My career experience (specific tools, systems, initiatives) is MY credential — it is what I bring to any engagement. Do NOT project it onto the company. Do NOT assume or imply they are implementing SAP, any ERP, any specific technology, or running any initiative simply because I have done so. Frame everything as the value I bring, not as a mirror of their assumed situation. If relevance signals are listed above, use them only as background context to understand why this opportunity is interesting — never state them as facts about the company.
+
+CRITICAL: Output the literal word "Subject:" followed by the subject on the first line. Then a blank line. Then the body. No other formatting. No preamble explaining what the email is.`,
       board_application:`${profCtx}
 
 ${oppCtx}
@@ -3813,9 +3602,40 @@ Max 400 words. Analytical, honest about risks.`
 
     try {
       const blocks=await callLLM(provider,apiKey,[{role:"user",content:prompts[effectiveDocType]}],[],"You are a professional ghostwriter specialising in executive communications. Write sharp, specific documents that sound genuinely human. No generic phrases. CRITICAL FORMATTING RULES: Never use markdown. No ## headers, no ** bold, no * italic, no --- dividers, no bullet points with *. Use PLAIN TEXT ONLY. For section headers write them in ALL CAPS on their own line. For emphasis, use plain words. For lists use a dash followed by a space. Write as a professional human document, not a markdown file.","DOC",null);
-      setResult(stripCiteTags(blocks.map(b=>b.text).join("").trim()));
+      let raw = stripCiteTags(blocks.map(b=>b.text).join("").trim());
+      // Defensive: scrub any stray markdown the model may have emitted
+      raw = raw.replace(/\*\*/g,"").replace(/(^|\n)#{1,6}\s*/g,"$1").replace(/(^|\s)\*(?=\S)/g,"$1");
+      setResult(raw);
+      if(effectiveDocType==="outreach_email"){
+        // Parse "Subject: ..." from the first non-blank line, body is the rest
+        const lines = raw.split(/\r?\n/);
+        let subjLine = "";
+        let bodyStart = 0;
+        for(let i=0;i<lines.length;i++){
+          const l=lines[i].trim();
+          if(!l) continue;
+          const m=l.match(/^subject\s*:\s*(.+)$/i);
+          if(m){ subjLine=m[1].trim(); bodyStart=i+1; }
+          break;
+        }
+        const body = lines.slice(bodyStart).join("\n").replace(/^\s*\n+/,"").trim();
+        setEmailSubject(subjLine||("Outreach — "+(item.name||"")));
+        setEmailBody(body||raw);
+      }
     } catch(e){setResult("Generation failed: "+e.message);}
     setLoading(false);
+  };
+
+  // Build mailto: link from current email-state
+  const sendEmail = () => {
+    const to = (emailTo||"").trim();
+    if(!looksLikeEmail(to)) return;
+    const params = [];
+    if(emailSubject) params.push("subject="+encodeURIComponent(emailSubject));
+    if(emailCc && looksLikeEmail(emailCc.trim())) params.push("cc="+encodeURIComponent(emailCc.trim()));
+    if(emailBody) params.push("body="+encodeURIComponent(emailBody));
+    const href = "mailto:"+encodeURIComponent(to)+(params.length?"?"+params.join("&"):"");
+    window.location.href = href;
   };
 
   const copy=()=>{
@@ -3874,7 +3694,7 @@ ${htmlLines}
           <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
             <div style={{width:36,height:36,borderRadius:10,background:t.goldDim,border:"1px solid "+t.gold+"40",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>📄</div>
             <div style={{flex:1,minWidth:0}}><div style={{fontSize:18,fontWeight:700,color:t.text,letterSpacing:"-0.01em"}}>Document Generator</div><div style={{fontSize:15,color:t.textMuted}}>{item.name} · {item.region}</div></div>
-            {result&&!loading&&<button onClick={handlePrint} style={{...btn0,display:"flex",alignItems:"center",gap:5,padding:"7px 12px",borderRadius:7,fontSize:15,fontWeight:700,background:t.indigoDim,border:"1px solid "+t.indigo+"40",color:t.indigo,flexShrink:0}}>
+            {result&&!loading&&effectiveDocType!=="outreach_email"&&<button onClick={handlePrint} style={{...btn0,display:"flex",alignItems:"center",gap:5,padding:"7px 12px",borderRadius:7,fontSize:15,fontWeight:700,background:t.indigoDim,border:"1px solid "+t.indigo+"40",color:t.indigo,flexShrink:0}}>
               🖨 Print
             </button>}
             <button onClick={onClose} style={{...btn0,width:30,height:30,borderRadius:7,background:t.input,border:"1px solid "+t.border,color:t.textMuted,fontSize:18,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>×</button>
@@ -3908,7 +3728,58 @@ ${htmlLines}
             {loading?<><Ic.Loader2 size={15} color={t.textMuted}/> Generating {activeDoc.label}…</>:<><Ic.Edit size={14}/> Generate {activeDoc.label}</>}
           </button>
 
-          {result&&<>
+          {result&&effectiveDocType==="outreach_email"&&<>
+            {/* Email composer — editable To/Cc/Subject/Body with Send */}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <span style={{fontSize:12,fontWeight:700,letterSpacing:"0.06em",color:t.gold}}>OUTREACH EMAIL</span>
+              <div style={{display:"flex",gap:6}}>
+                <button onClick={()=>{const txt="Subject: "+emailSubject+"\n\n"+emailBody;navigator.clipboard.writeText(txt).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2000);}).catch(()=>{});}} style={{...btn0,fontSize:15,fontWeight:600,padding:"4px 10px",borderRadius:5,background:copied?t.accentDim:"transparent",border:"1px solid "+(copied?t.accent+"40":t.border),color:copied?t.accent:t.textMuted,display:"flex",alignItems:"center",gap:4}}>
+                  <Ic.Copy size={10}/>{copied?"Copied!":"Copy"}
+                </button>
+                <button onClick={generate} style={{...btn0,fontSize:15,fontWeight:600,padding:"4px 10px",borderRadius:5,background:"transparent",border:"1px solid "+t.border,color:t.textMuted,display:"flex",alignItems:"center",gap:4}}>
+                  <Ic.Loader2 size={10}/> Regen
+                </button>
+                {onSaveToVault&&<button onClick={()=>{
+                  onSaveToVault({
+                    title: activeDoc.label+" — "+(item.name||""),
+                    docTypeLabel: activeDoc.label,
+                    content: "Subject: "+emailSubject+"\n\nTo: "+emailTo+(emailCc?"\nCc: "+emailCc:"")+"\n\n"+emailBody,
+                    sourceOpportunity: item.name||"",
+                    sourceItem: item,
+                  });
+                  setSavedToVault(true);
+                  setTimeout(()=>setSavedToVault(false), 2500);
+                }} style={{...btn0,fontSize:15,fontWeight:600,padding:"4px 10px",borderRadius:5,background:savedToVault?"#38bdf820":"transparent",border:"1px solid "+(savedToVault?"#38bdf850":t.border),color:savedToVault?"#38bdf8":t.textMuted,display:"flex",alignItems:"center",gap:4}}>
+                  <Ic.Archive size={10}/>{savedToVault?"Saved!":"Save to Vault"}
+                </button>}
+              </div>
+            </div>
+            <div style={{background:t.input,border:"1px solid "+t.border,borderRadius:8,padding:"14px 16px",display:"flex",flexDirection:"column",gap:9}}>
+              <div>
+                <label style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,display:"block",marginBottom:3}}>TO</label>
+                <input type="email" value={emailTo} onChange={e=>setEmailTo(e.target.value)} placeholder="recipient@company.com" style={{width:"100%",padding:"8px 10px",background:t.surface,border:"1px solid "+(emailTo&&!looksLikeEmail(emailTo)?t.coral+"60":t.border),borderRadius:7,color:t.text,fontSize:14,fontFamily:"'DM Mono',monospace",boxSizing:"border-box"}}/>
+                {emailTo&&!looksLikeEmail(emailTo)&&<div style={{fontSize:12,color:t.coral,marginTop:3}}>Not a valid email address.</div>}
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,display:"block",marginBottom:3}}>CC <span style={{fontWeight:500,color:t.textDim,letterSpacing:0,textTransform:"none"}}>(optional)</span></label>
+                <input type="email" value={emailCc} onChange={e=>setEmailCc(e.target.value)} placeholder="cc@company.com" style={{width:"100%",padding:"8px 10px",background:t.surface,border:"1px solid "+(emailCc&&!looksLikeEmail(emailCc)?t.coral+"60":t.border),borderRadius:7,color:t.text,fontSize:14,fontFamily:"'DM Mono',monospace",boxSizing:"border-box"}}/>
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,display:"block",marginBottom:3}}>SUBJECT</label>
+                <input type="text" value={emailSubject} onChange={e=>setEmailSubject(e.target.value)} style={{width:"100%",padding:"8px 10px",background:t.surface,border:"1px solid "+t.border,borderRadius:7,color:t.text,fontSize:14,boxSizing:"border-box"}}/>
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:700,letterSpacing:"0.07em",color:t.textDim,display:"block",marginBottom:3}}>MESSAGE</label>
+                <textarea value={emailBody} onChange={e=>setEmailBody(e.target.value)} rows={14} style={{width:"100%",padding:"10px 12px",background:t.surface,border:"1px solid "+t.border,borderRadius:7,color:t.text,fontSize:14,fontFamily:"inherit",lineHeight:1.65,resize:"vertical",boxSizing:"border-box",whiteSpace:"pre-wrap"}}/>
+              </div>
+              <button onClick={sendEmail} disabled={!looksLikeEmail(emailTo)} style={{...btn0,width:"100%",padding:"11px",borderRadius:8,fontSize:15,fontWeight:700,color:"#fff",background:looksLikeEmail(emailTo)?"linear-gradient(135deg,#10b981,#059669)":t.input,border:"1px solid "+(looksLikeEmail(emailTo)?"transparent":t.border),display:"flex",alignItems:"center",justifyContent:"center",gap:6,opacity:looksLikeEmail(emailTo)?1:0.6,cursor:looksLikeEmail(emailTo)?"pointer":"not-allowed"}}>
+                <Ic.ExternalLink size={13}/> Send via your email client
+              </button>
+              <div style={{fontSize:12,color:t.textMuted,lineHeight:1.5}}>Opens your default mail app (Gmail, Apple Mail, Outlook…) with the recipient, subject, and message pre-filled. You confirm and send from there.</div>
+            </div>
+          </>}
+
+          {result&&effectiveDocType!=="outreach_email"&&<>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
               <span style={{fontSize:12,fontWeight:700,letterSpacing:"0.06em",color:t.gold}}>{activeDoc.label.toUpperCase()}</span>
               <div style={{display:"flex",gap:6}}>
@@ -3944,7 +3815,9 @@ ${htmlLines}
 };
 
 // ─── MODULE: CONTROL TOWER ────────────────────────────────────────────────────
-const ControlTowerModule = ({t, isMobile, saved, activityLog, contacts, calendarEvents, setActiveModule}) => {
+const ControlTowerModule = ({t, isMobile, saved:savedAll, activityLog, contacts, calendarEvents, setActiveModule, hiddenModules}) => {
+  const hidden=hiddenModules||[];
+  const saved=React.useMemo(()=>(savedAll||[]).filter(s=>!hidden.includes(s.source)),[savedAll,hidden]);
   const TC = {board:"#6ee7b7", exec:"#c084fc", hustle:"#fb923c", venture:"#818cf8", deal:"#f6c90e"};
   const [selectedOpp, setSelectedOpp] = useState(null);
 
@@ -4034,7 +3907,7 @@ const ControlTowerModule = ({t, isMobile, saved, activityLog, contacts, calendar
       <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
         <span style={{fontSize:13,color:t.textMuted}}>{saved.length} opportunities</span>
         <span style={{color:t.textDim}}>·</span>
-        {Object.entries({board:"#6ee7b7",exec:"#c084fc",hustle:"#fb923c",venture:"#818cf8",deal:"#f6c90e"}).map(([src,col])=>{
+        {Object.entries({board:"#6ee7b7",exec:"#c084fc",hustle:"#fb923c",venture:"#818cf8",deal:"#f6c90e"}).filter(([src])=>!hidden.includes(src)).map(([src,col])=>{
           const cnt = saved.filter(s=>s.source===src).length;
           if(!cnt) return null;
           return <span key={src} style={{fontSize:11,fontWeight:700,padding:"2px 9px",borderRadius:20,border:"1px solid "+col+"40",color:col,background:col+"12"}}>{cnt} {src}</span>;
@@ -4674,60 +4547,7 @@ const CountryDropdown = ({value, onChange, t}) => {
 };
 
 // ─── MODULE: SETTINGS ─────────────────────────────────────────────────────────
-// Live Job Boards config — Adzuna credentials are optional; The Muse works
-// without any key. When Adzuna keys are present, scans in Board Scout and
-// Executive Search will also query Adzuna in parallel with AI scans and The Muse.
-const LiveJobBoardSettings = ({t,inputS,isMobile}) => {
-  const [adzId,setAdzId]=useState(()=>storage.get("oos-adzuna-id")||"");
-  const [adzKey,setAdzKey]=useState(()=>storage.get("oos-adzuna-key")||"");
-  const [show,setShow]=useState(false);
-  const [savedFlash,setSavedFlash]=useState(false);
-  const save=()=>{
-    storage.set("oos-adzuna-id",adzId.trim());
-    storage.set("oos-adzuna-key",adzKey.trim());
-    setSavedFlash(true); setTimeout(()=>setSavedFlash(false),1500);
-  };
-  const clear=()=>{
-    setAdzId(""); setAdzKey("");
-    storage.del("oos-adzuna-id"); storage.del("oos-adzuna-key");
-  };
-  const configured = !!(adzId && adzKey);
-  return (
-    <div style={{background:t.card,border:"1px solid "+t.border,boxShadow:t.cardShadow,borderRadius:10,padding:"12px 14px",marginBottom:10}}>
-      <div style={{fontSize:15,fontWeight:700,color:t.text,marginBottom:3,display:"flex",alignItems:"center",gap:6}}>
-        <Ic.Briefcase size={13} color="#10b981"/>Live Job Boards
-        <span style={{fontSize:11,fontWeight:700,padding:"2px 6px",borderRadius:4,background:"#10b98120",color:"#10b981",marginLeft:"auto"}}>OPTIONAL</span>
-      </div>
-      <div style={{fontSize:14,color:t.textMuted,marginBottom:10,lineHeight:1.55}}>
-        When enabled in Board Scout or Executive Search, scans will blend real job postings with AI-inferred hiring signals. <strong style={{color:t.text}}>The Muse</strong> works without any credentials. <strong style={{color:t.text}}>Adzuna</strong> adds broader global coverage with published salary data — create a free developer account at <a href="https://developer.adzuna.com" target="_blank" rel="noopener noreferrer" style={{color:"#10b981",fontWeight:600}}>developer.adzuna.com</a> to get an app_id and app_key.
-      </div>
-      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:7,marginBottom:8}}>
-        <div>
-          <label style={{fontSize:12,fontWeight:700,letterSpacing:"0.08em",color:t.textDim,display:"block",marginBottom:3}}>ADZUNA APP ID</label>
-          <input type={show?"text":"password"} value={adzId} onChange={e=>setAdzId(e.target.value)} placeholder="e.g. a1b2c3d4" style={{...inputS,fontFamily:"'DM Mono',monospace"}}/>
-        </div>
-        <div>
-          <label style={{fontSize:12,fontWeight:700,letterSpacing:"0.08em",color:t.textDim,display:"block",marginBottom:3}}>ADZUNA APP KEY</label>
-          <input type={show?"text":"password"} value={adzKey} onChange={e=>setAdzKey(e.target.value)} placeholder="32-character key" style={{...inputS,fontFamily:"'DM Mono',monospace"}}/>
-        </div>
-      </div>
-      <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
-        <button onClick={save} disabled={!adzId||!adzKey} style={{...btn0,padding:"7px 14px",borderRadius:7,background:(!adzId||!adzKey)?t.input:"linear-gradient(135deg,#10b981,#059669)",color:"#fff",fontSize:14,fontWeight:700,border:"none",opacity:(!adzId||!adzKey)?0.5:1}}>
-          {savedFlash?"✓ Saved":"Save credentials"}
-        </button>
-        <button onClick={()=>setShow(!show)} style={{...btn0,padding:"7px 12px",borderRadius:7,background:t.input,border:"1px solid "+t.border,color:t.textMuted,fontSize:14,fontWeight:600}}>
-          {show?"Hide":"Show"}
-        </button>
-        {configured&&<button onClick={clear} style={{...btn0,padding:"7px 12px",borderRadius:7,background:t.coralDim,border:"1px solid "+t.coral+"30",color:t.coral,fontSize:14,fontWeight:600}}>Forget</button>}
-        <span style={{fontSize:13,color:configured?"#10b981":t.textDim,marginLeft:"auto"}}>
-          {configured?"✓ Adzuna configured":"The Muse only (no key required)"}
-        </span>
-      </div>
-    </div>
-  );
-};
-
-const SettingsModule = ({t,profile,setProfile,apiKey,setApiKey,provider,setProvider,isMobile,isNewUser}) => {
+const SettingsModule = ({t,profile,setProfile,apiKey,setApiKey,provider,setProvider,isMobile,isNewUser,hiddenModules,setHiddenModules}) => {
   const [showKey,setShowKey]=useState(false);
   const [localProfile,setLocalProfile]=useState(profile);
   const [saved,setSaved]=useState(false);
@@ -4867,8 +4687,42 @@ Return ONLY JSON, no markdown, no backticks.`;
         {apiKey&&<div style={{marginTop:8,fontSize:15,color:t.accent}}>✓ API key configured for {prov.name}</div>}
       </div>
 
-      {/* Live Job Boards — optional, augments Board Scout & Exec Search with real postings */}
-      <LiveJobBoardSettings t={t} inputS={inputS} isMobile={isMobile}/>
+      {/* Module Visibility */}
+      {(() => {
+        const opps=[
+          {key:"board",label:"Board Scout",desc:"Board seats & NED roles",color:"#6ee7b7",icon:"🏛"},
+          {key:"hustle",label:"Side Hustle Lab",desc:"Fractional, advisory & consulting",color:"#fb923c",icon:"⚡"},
+          {key:"exec",label:"Executive Search",desc:"Director & C-suite roles",color:"#c084fc",icon:"👔"},
+        ];
+        const visibleCount=opps.filter(o=>!hiddenModules.includes(o.key)).length;
+        const toggle=(k)=>{
+          const next=hiddenModules.includes(k)?hiddenModules.filter(x=>x!==k):[...hiddenModules,k];
+          setHiddenModules(next);
+        };
+        return (
+          <div style={{background:t.card,border:"1px solid "+t.border,boxShadow:t.cardShadow,borderRadius:10,padding:"12px 14px",marginBottom:10}}>
+            <div style={{fontSize:15,fontWeight:700,color:t.text,marginBottom:3,display:"flex",alignItems:"center",gap:6}}><Ic.Eye size={13} color={t.accent}/>Visible modules</div>
+            <div style={{fontSize:14,color:t.textMuted,marginBottom:10,lineHeight:1.55}}>Choose which opportunity modules to show. Hidden modules disappear from the sidebar, dashboard, pipeline, and chat suggestions. Saved items from a hidden module are filtered out of view but not deleted.</div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {opps.map(o=>{
+                const visible=!hiddenModules.includes(o.key);
+                const isLast=visible&&visibleCount===1;
+                return (
+                  <label key={o.key} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",background:t.input,border:"1px solid "+(visible?o.color+"40":t.border),borderRadius:8,cursor:isLast?"not-allowed":"pointer",opacity:isLast?0.85:1}}>
+                    <input type="checkbox" checked={visible} disabled={isLast} onChange={()=>!isLast&&toggle(o.key)} style={{accentColor:o.color,width:14,height:14}}/>
+                    <span style={{fontSize:18}}>{o.icon}</span>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:14,fontWeight:700,color:t.text}}>{o.label}</div>
+                      <div style={{fontSize:12,color:t.textMuted,lineHeight:1.4}}>{o.desc}</div>
+                    </div>
+                    {isLast&&<span style={{fontSize:11,fontWeight:700,color:t.textDim,letterSpacing:"0.06em"}}>REQUIRED</span>}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* CV Upload */}
       <div style={{background:t.card,border:"1px solid "+t.border,boxShadow:t.cardShadow,borderRadius:10,padding:"12px 14px",marginBottom:10}}>
@@ -6231,7 +6085,7 @@ Return ONLY JSON, no markdown.`;
 
 
 // ─── MODULE: VIBE AGENT ───────────────────────────────────────────────────
-const VibeAgentModule = ({t, apiKey, provider, profile, isMobile, saved, setSaved, onOpenChat, onOpenTax, onOpenNetwork, onOpenDocs, vaMessages, setVaMessages, vaScanLog, setVaScanLog, vaInput, setVaInput, vaLoading, setVaLoading, setActiveModule}) => {
+const VibeAgentModule = ({t, apiKey, provider, profile, isMobile, saved, setSaved, onOpenChat, onOpenTax, onOpenNetwork, onOpenDocs, vaMessages, setVaMessages, vaScanLog, setVaScanLog, vaInput, setVaInput, vaLoading, setVaLoading, setActiveModule, hiddenModules}) => {
   const moduleColor = "#a78bfa";
   // State lifted to TorqueOS parent so it persists across tab navigation
   const messages = vaMessages;
@@ -6316,24 +6170,34 @@ Goal: ${profile.goalLabel||""} ${profile.goalYear?"by "+profile.goalYear:""}`;
     return geo;
   };
 
-  const buildPlanPrompt = (userMsg) => `You are the planning brain for TorqueOS. Your ONLY job is to read the user's request literally and pick the RIGHT module(s).
+  const buildPlanPrompt = (userMsg) => {
+    const hidden=hiddenModules||[];
+    const moduleDefs={
+      board:'- "board" → ONLY for: board seats, NED roles, board director, board advisor, governance roles',
+      hustle:'- "hustle" → ONLY for: side hustle, consulting, advisory, fractional roles, consulting mandates, advisory gigs, day rates, part-time income, $X/month from work, paid gigs, freelance, expert witness',
+      venture:'- "venture" → ONLY for: startup investment, venture deals, co-founder, equity stakes, angel investing, startup ideas',
+      deal:'- "deal" → ONLY for: investment deals, deal flow, private equity, capital deployment, co-investing in companies',
+    };
+    const strictRules={
+      hustle:'- If user says "consulting", "advisory", "consulting mandate", "side hustle", "freelance", "gig", "fractional", "part-time income" → use ONLY "hustle"',
+      board:'- If user says "board seat", "NED", "board director" → use ONLY "board"',
+      venture:'- If user says "startup", "invest in", "angel" → use ONLY "venture"',
+      deal:'- If user says "deal", "co-invest", "deploy capital" → use ONLY "deal"',
+    };
+    const visible=["board","hustle","venture","deal"].filter(k=>!hidden.includes(k));
+    const defs=visible.map(k=>moduleDefs[k]).join("\n");
+    const rules=visible.map(k=>strictRules[k]).join("\n");
+    return `You are the planning brain for TorqueOS. Your ONLY job is to read the user's request literally and pick the RIGHT module(s).
 
 ${profileCtx}
 
 User request: "${userMsg}"
 
 MODULE DEFINITIONS — read carefully:
-- "board" → ONLY for: board seats, NED roles, board director, board advisor, consulting mandates, governance roles
-- "hustle" → ONLY for: side hustle, consulting jobs, fractional roles, advisory gigs, day rates, part-time income, $X/month from work, paid gigs, freelance
-- "venture" → ONLY for: startup investment, venture deals, co-founder, equity stakes, angel investing, startup ideas
-- "deal" → ONLY for: investment deals, deal flow, private equity, capital deployment, co-investing in companies
+${defs}
 
 STRICT MODULE SELECTION RULES:
-- If user says "side hustle", "consulting jobs", "freelance", "gig", "part-time income" → use ONLY "hustle"
-- If user says "board seat", "NED", "board director" → use ONLY "board"
-- If user says "consulting" AND "side hustle" in the same request → use ONLY "hustle" (side hustle takes priority)
-- If user says "startup", "invest in", "angel" → use ONLY "venture"
-- If user says "deal", "co-invest", "deploy capital" → use ONLY "deal"
+${rules}
 - Use 2 modules ONLY if the request genuinely spans two distinct categories
 - NEVER default to 3 modules. Only add a module if the user explicitly asked for it.
 - When in doubt, use 1 module — the most literal match to the user's words
@@ -6354,10 +6218,11 @@ Return ONLY raw JSON, no markdown:
 
 EXAMPLE MAPPINGS:
 - "find consulting jobs as a side hustle for $5K/month" → 1 step: hustle only
-- "find board seats in fintech" → 1 step: board only  
+- "find board seats in fintech" → 1 step: board only
 - "find startup deals and board seats" → 2 steps: venture + board
 - "what opportunities match my profile" → 2 steps: board + hustle (most common profile needs)
 `;
+  };
 
   const buildScanPrompt = (step, userMsg, requestedCount) => {
     // Always use web search for Claude - max uses increased for better results
@@ -6766,33 +6631,37 @@ Be direct, specific, and personal. Reference the candidate's actual profile. Max
     const incomeMatch = m.match(/\$([\d,]+)\s*(?:k|usd|per month|\/month)?/i);
     const constraint = incomeMatch ? incomeMatch[0]+" income target" : "";
 
-    // STRICT priority — hustle takes over "consulting" when "side hustle" or income target present
+    // Consulting/advisory always routes to hustle (post-merge)
     const wantsHustle = m.includes("side hustle")||m.includes("hustle")||m.includes("gig")||
                         m.includes("freelance")||m.includes("fractional")||m.includes("part-time")||
-                        m.includes("per month")||m.includes("/month")||m.includes("monthly income");
-    const wantsBoard = m.includes("board")||m.includes("director")||m.includes("mandate")||
-                       (m.includes("consulting")&&!wantsHustle);
+                        m.includes("per month")||m.includes("/month")||m.includes("monthly income")||
+                        m.includes("consulting")||m.includes("advisory")||m.includes("mandate")||
+                        m.includes("expert witness");
+    const wantsBoard = m.includes("board")||m.includes("ned")||m.includes("non-executive")||
+                       m.includes("governance")||(m.includes("director")&&!wantsHustle);
     const wantsVenture = m.includes("venture")||m.includes("startup")||m.includes("angel")||
                          (m.includes("invest")&&!m.includes("investment thesis")&&!wantsHustle);
     const wantsDeal = m.includes("deal flow")||m.includes("co-invest")||(m.includes("deal")&&!wantsHustle);
-    // "consulting" alone with income target = hustle, not board
-    const wantsConsultingIncome = m.includes("consulting")&&(wantsHustle||!!incomeMatch);
 
-    if (wantsHustle||wantsConsultingIncome)
-      steps.push({module:"hustle", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Side hustle/income intent detected"});
-    if (wantsBoard&&!wantsConsultingIncome)
-      steps.push({module:"board", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Board/consulting mandate intent detected"});
+    const hidden=hiddenModules||[];
+    if (wantsHustle && !hidden.includes("hustle"))
+      steps.push({module:"hustle", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Side hustle/consulting/income intent detected"});
+    if (wantsBoard && !hidden.includes("board"))
+      steps.push({module:"board", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Board/NED intent detected"});
     if (wantsVenture)
       steps.push({module:"venture", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Venture/startup intent detected"});
     if (wantsDeal)
       steps.push({module:"deal", geography:profileGeo, sectors:profileSectors, constraint, rationale:"Deal flow intent detected"});
 
     // General scan fallback — only if nothing matched
-    if (steps.length===0)
-      steps.push(
-        {module:"board", geography:profileGeo, sectors:profileSectors, constraint:"", rationale:"General scan"},
-        {module:"hustle", geography:profileGeo, sectors:profileSectors, constraint:"", rationale:"General scan"}
-      );
+    if (steps.length===0) {
+      const fallback=[
+        !hidden.includes("board")?{module:"board", geography:profileGeo, sectors:profileSectors, constraint:"", rationale:"General scan"}:null,
+        !hidden.includes("hustle")?{module:"hustle", geography:profileGeo, sectors:profileSectors, constraint:"", rationale:"General scan"}:null,
+      ].filter(Boolean);
+      if(fallback.length===0) fallback.push({module:"venture", geography:profileGeo, sectors:profileSectors, constraint:"", rationale:"General scan"});
+      steps.push(...fallback);
+    }
     return {intent: msg.substring(0,100), steps};
   };
 
@@ -6811,13 +6680,17 @@ Be direct, specific, and personal. Reference the candidate's actual profile. Max
   const moduleColors = {board:"#6ee7b7",venture:"#818cf8",hustle:"#fb923c",deal:"#f6c90e"};
   const moduleIcons = {board:"🏛",venture:"🚀",hustle:"💡",deal:"🎯"};
 
-  const starters = [
-    "Find me board seats matching my profile",
-    "What fractional roles fit my background?",
-    "Scan for venture deals in my target regions",
-    "What opportunities should I pursue this month?",
-    "Find consulting mandates in my sectors",
-  ];
+  const starters = (() => {
+    const hidden=hiddenModules||[];
+    const all=[
+      {text:"Find me board seats matching my profile",mod:"board"},
+      {text:"What fractional roles fit my background?",mod:"hustle"},
+      {text:"Scan for venture deals in my target regions",mod:null},
+      {text:"What opportunities should I pursue this month?",mod:null},
+      {text:"Find consulting mandates in my sectors",mod:"hustle"},
+    ];
+    return all.filter(s=>!s.mod||!hidden.includes(s.mod)).map(s=>s.text);
+  })();
 
   // ── RENDER HELPERS ──────────────────────────────────────────────────────────
   const renderThinking = (msg) => (
@@ -7089,11 +6962,79 @@ class ErrorBoundary extends React.Component {
   }
 }
 
+// ─── MIGRATION: Consulting tab merged into Side Hustle Lab (one-time) ────────
+function migrateConsultingToHustlesIfNeeded(){
+  try {
+    if (storage.get("oos-mig-consulting-merged-v1")) return;
+    const STATUS_MAP = {ACTIVE:"HOT", RESEARCHING:"WARM", DECLINED:"COLD"};
+    const remap = (item) => ({
+      ...item,
+      status: STATUS_MAP[item.status] || item.status || "WARM",
+      moduleTag: item.moduleTag || "Consulting",
+      effortRating: item.effortRating || "MEDIUM",
+    });
+    const oldConsult = storage.get("bs-consult-results") || [];
+    if (oldConsult.length > 0) {
+      const existingHustles = storage.get("sh-results") || [];
+      const seen = new Set(existingHustles.map(h => (h.name||"")+"|"+(h.region||"")));
+      const merged = [...existingHustles];
+      for (const c of oldConsult) {
+        const key = (c.name||"")+"|"+(c.region||"");
+        if (!seen.has(key)) { merged.push(remap(c)); seen.add(key); }
+      }
+      storage.set("sh-results", merged);
+    }
+    storage.del("bs-consult-results");
+    const savedItems = storage.get("oos-saved") || [];
+    let mutated = false;
+    const updatedSaved = savedItems.map(s => {
+      if (s.source === "board" && s.type === "consulting") {
+        mutated = true;
+        return {...s, source:"hustle", status: STATUS_MAP[s.status] || s.status, effortRating: s.effortRating || "MEDIUM"};
+      }
+      return s;
+    });
+    if (mutated) storage.set("oos-saved", updatedSaved);
+    storage.set("oos-mig-consulting-merged-v1", true);
+  } catch(e) { /* migration is best-effort */ }
+}
+
+// ─── MIGRATION: Live job boards (Adzuna) removed (one-time) ──────────────────
+function migrateLiveJobsRemovedIfNeeded(){
+  try {
+    if (storage.get("oos-mig-live-jobs-removed-v1")) return;
+    storage.del("oos-adzuna-id");
+    storage.del("oos-adzuna-key");
+    storage.del("bs-live-jobs");
+    storage.del("es-live-jobs");
+    storage.set("oos-mig-live-jobs-removed-v1", true);
+  } catch(e) { /* best-effort */ }
+}
+
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 function TorqueOS({initialProfile, onLogout, startOnSettings}) {
+  migrateConsultingToHustlesIfNeeded();
+  migrateLiveJobsRemovedIfNeeded();
   const [theme,setTheme]=useState(()=>storage.get("oos-theme")||"dark");
   const t=THEMES[theme];
   const [activeModule,setActiveModule]=useState(startOnSettings?"settings":"home");
+  const [hiddenModules,setHiddenModulesRaw]=useState(()=>{
+    const stored=storage.get("oos-hidden-modules");
+    return Array.isArray(stored)?stored.filter(k=>["board","hustle","exec"].includes(k)):[];
+  });
+  const setHiddenModules=React.useCallback((next)=>{
+    const arr=Array.isArray(next)?next:[];
+    // Always keep at least one of the three opportunity modules visible
+    const all=["board","hustle","exec"];
+    const visible=all.filter(k=>!arr.includes(k));
+    const safe=visible.length===0?all.slice(1):arr;
+    setHiddenModulesRaw(safe);
+    storage.set("oos-hidden-modules",safe);
+  },[]);
+  // Bounce off a hidden module if the user lands on one via stale state
+  useEffect(()=>{
+    if(hiddenModules.includes(activeModule)) setActiveModule("home");
+  },[hiddenModules,activeModule]);
   const [provider,setProvider]=useState(()=>storage.get("oos-provider")||"claude");
   const [apiKey,setApiKey]=useState(()=>storage.get("oos-key")||"");
   const [profile,setProfile]=useState(()=>storage.get("oos-profile")||initialProfile||DEFAULT_PROFILE);
@@ -7150,7 +7091,6 @@ function TorqueOS({initialProfile, onLogout, startOnSettings}) {
 
   // ── Lifted scan state — persists across navigation and page reloads ──
   const [boardResults,setBoardResults]=useState(()=>(storage.get("bs-results")||[]).filter(r=>!(storage.get("oos-saved")||[]).some(s=>s.name===r.name&&s.region===r.region)));
-  const [consultResults,setConsultResults]=useState(()=>(storage.get("bs-consult-results")||[]).filter(r=>!(storage.get("oos-saved")||[]).some(s=>s.name===r.name&&s.region===r.region)));
   const [bsLoading,setBsLoading]=useState(false);
   const [bsScanLog,setBsScanLog]=useState([]);
   const [bsLastScanned,setBsLastScanned]=useState(()=>storage.get("bs-last-scanned")||null);
@@ -7468,6 +7408,14 @@ Target sectors: ${(profile.defaultSectors||[]).join(", ")||"Not set"}`;
     onStatus("🧠 Understanding your request…");
 
     // Step 1: Plan via Claude
+    const hidden=hiddenModules||[];
+    const ruleMap={
+      board:'- "board" → board seats, NED, director, governance',
+      hustle:'- "hustle" → side hustle, consulting, advisory, consulting mandates, fractional, day rates, part-time income',
+      venture:'- "venture" → startup investment, co-founder, angel, equity',
+      deal:'- "deal" → deal flow, co-invest, private equity, capital deployment',
+    };
+    const visibleRules=["board","hustle","venture","deal"].filter(k=>!hidden.includes(k)).map(k=>ruleMap[k]).join("\n");
     const planPrompt = `You are a scan planner for TorqueOS. Read the user's request and return a JSON scan plan.
 
 USER PROFILE:
@@ -7476,10 +7424,7 @@ ${profileCtx}
 USER REQUEST: "${userMsg}"
 
 MODULE RULES:
-- "board" → board seats, NED, director, governance, consulting mandates
-- "hustle" → side hustle, consulting gigs, fractional, advisory, day rates, part-time income
-- "venture" → startup investment, co-founder, angel, equity
-- "deal" → deal flow, co-invest, private equity, capital deployment
+${visibleRules}
 
 Return ONLY raw JSON:
 {"intent":"one sentence","steps":[{"module":"board","geography":"[user profile regions]","sectors":["FMCG"],"constraint":"","rationale":"why"}]}
@@ -7491,14 +7436,22 @@ Use 1 module unless user explicitly asks for 2. Default geography: user's profil
       const planBlocks = await callLLM(provider, apiKey, [{role:"user",content:planPrompt}], [], "You are a JSON API. Return ONLY raw JSON, no markdown.", "PLAN", null);
       const raw = planBlocks.map(b=>b.text||"").join("").replace(/```json[\s\S]*?/g,"").replace(/```/g,"").trim();
       plan = JSON.parse(raw);
+      // Drop any steps for hidden modules (defensive)
+      if(plan&&Array.isArray(plan.steps)) plan.steps=plan.steps.filter(s=>!hidden.includes(s.module));
     } catch(e) {
       // Fallback plan
       const geo = profile.location || "Global";
-      const modules = /board|director|NED|governance/i.test(userMsg) ? ["board"] :
-        /exec|executive|job|role|hiring|C-suite|VP|director.*search/i.test(userMsg) ? ["exec"] :
-                      /hustle|consulting|gig|fractional|income/i.test(userMsg) ? ["hustle"] :
-                      /venture|startup|angel|equity/i.test(userMsg) ? ["venture"] :
-                      /deal|invest|capital/i.test(userMsg) ? ["deal"] : ["board","hustle"];
+      const tests=[
+        {re:/hustle|consulting|advisory|gig|fractional|income|mandate/i,mod:"hustle"},
+        {re:/board|NED|non-executive|governance/i,mod:"board"},
+        {re:/exec|executive|job|role|hiring|C-suite|VP|director.*search/i,mod:"exec"},
+        {re:/venture|startup|angel|equity/i,mod:"venture"},
+        {re:/deal|invest|capital/i,mod:"deal"},
+      ];
+      let modules=[];
+      for(const t of tests){ if(t.re.test(userMsg)&&!hidden.includes(t.mod)){ modules=[t.mod]; break; } }
+      if(modules.length===0) modules=["board","hustle"].filter(m=>!hidden.includes(m));
+      if(modules.length===0) modules=["venture"];
       plan = {intent: userMsg, steps: modules.map(m=>({module:m, geography:geo, sectors:(profile.defaultSectors||[]).slice(0,2), constraint:""}))};
     }
 
@@ -7518,7 +7471,7 @@ Geography: ${step.geography}
 Sectors: ${sectorStr}
 Constraint: ${step.constraint||"none"}
 
-Search for real ${step.module==="board"?"board director / NED / consulting mandate":step.module==="hustle"?"consulting gig / fractional / advisory":step.module==="venture"?"startup investment":step.module==="deal"?"investment deal":step.module} opportunities in ${step.geography} in ${sectorStr}.
+Search for real ${step.module==="board"?"board director / NED / governance role":step.module==="hustle"?"consulting mandate / fractional / advisory":step.module==="venture"?"startup investment":step.module==="deal"?"investment deal":step.module} opportunities in ${step.geography} in ${sectorStr}.
 
 Return JSON array of exactly ${requestedCount} items:
 [{"name":"Company Name","region":"Country","city":"City","sector":"Sector","type":"${step.module}","companyDescription":"2-3 sentence description","sentiment":72,"tags":["tag1"],"fitReasons":["Reason referencing candidate background"],"estimatedFee":"$4K-$6K/month","engagementType":"Independent NED","timeCommitment":"1-2 days/month","sourceUrl":"https://url","sourceName":"Source","moduleTag":"${step.module.charAt(0).toUpperCase()+step.module.slice(1)}"}]`;
@@ -7577,10 +7530,10 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
     {key:"vault",label:"Document Vault",icon:"📄",color:"#38bdf8"},
     {key:"contacts",label:"Contacts",icon:"👥",color:"#2dd4bf"},
     {key:"settings",label:"Settings",icon:"⚙",color:t.textMuted},
-  ];
+  ].filter(m=>!hiddenModules.includes(m.key));
 
   // ── Profile completeness gate ──
-  const gatedModules = ["board","venture","hustle","deal","network","vibe"];
+  const gatedModules = ["board","venture","hustle","deal","network","vibe"].filter(m=>!hiddenModules.includes(m));
   const profileGate = {
     apiKey:        {ok: !!apiKey,                                                          label:"API key"},
     title:         {ok: !!(profile.title||"").trim(),                                      label:"Professional title"},
@@ -7644,7 +7597,7 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
               {m.key==="deal"&&dmLoading&&<span style={{width:6,height:6,borderRadius:"50%",background:"#f6c90e",animation:"pulse 1s ease-in-out infinite",flexShrink:0}}/>}
               {m.key==="network"&&niLoading&&<span style={{width:6,height:6,borderRadius:"50%",background:"#818cf8",animation:"pulse 1s ease-in-out infinite",flexShrink:0}}/>}
               {m.key==="vibe"&&vaLoading&&<span style={{width:6,height:6,borderRadius:"50%",background:"#a78bfa",animation:"pulse 1s ease-in-out infinite",flexShrink:0}}/>}
-              {m.key==="board"&&!bsLoading&&boardResults.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#6ee7b7"+"20",color:"#6ee7b7"}}>{boardResults.length+consultResults.length}</span>}
+              {m.key==="board"&&!bsLoading&&boardResults.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#6ee7b7"+"20",color:"#6ee7b7"}}>{boardResults.length}</span>}
               {m.key==="venture"&&!vsLoading&&ventures.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#818cf8"+"20",color:"#818cf8"}}>{ventures.length+ideas.length}</span>}
               {m.key==="hustle"&&!shLoading&&hustles.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#fb923c"+"20",color:"#fb923c"}}>{hustles.length}</span>}
               {m.key==="exec"&&!esLoading&&esResults.length>0&&<span style={{fontSize:15,fontWeight:700,padding:"1px 5px",borderRadius:6,background:"#c084fc20",color:"#c084fc"}}>{esResults.length}</span>}
@@ -7715,9 +7668,9 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
               <div style={{fontSize:15,color:t.textDim}}>
                 {activeModule==="home"&&"Your morning intelligence brief"}
                 {activeModule==="tower"&&"Live view of all your opportunities in motion"}
-                {activeModule==="board"&&"Board seats & consulting mandates"}
+                {activeModule==="board"&&"Board seats & NED roles"}
                 {activeModule==="venture"&&"Startup deals & business ideas"}
-                {activeModule==="hustle"&&"Fractional roles, advisory & paid gigs"}
+                {activeModule==="hustle"&&"Fractional, advisory, consulting & paid gigs"}
                 {activeModule==="exec"&&"Director & C-suite opportunities based on hiring signals"}
                 {activeModule==="deal"&&"Configure your investment thesis and scan for matching deals"}
                 {activeModule==="pipeline"&&saved.length+" opportunities saved across all modules"}
@@ -7742,23 +7695,23 @@ Reference their background (${(profile.highlights||[]).slice(0,1).join("")||prof
           {/* Single-column pages get their own scroll context */}
           {(activeModule==="home"||activeModule==="tower"||activeModule==="settings"||activeModule==="pipeline"||activeModule==="calendar"||activeModule==="vault"||activeModule==="contacts")&&
             <div style={{flex:1,overflowY:"auto",minHeight:0}}>
-              {activeModule==="home"&&<CommandCenter t={t} profile={profile} saved={saved} isMobile={isMobile} setActiveModule={setActiveModule} apiKey={apiKey} provider={provider} profileComplete={profileComplete} gatedModules={gatedModules} activityLog={activityLog} contacts={contacts} saveToVault={saveToVault}/>}
-              {activeModule==="tower"&&<ControlTowerModule t={t} isMobile={isMobile} saved={saved} activityLog={activityLog} contacts={contacts} calendarEvents={calendarEvents} setActiveModule={setActiveModule}/>}
-              {activeModule==="pipeline"&&<PipelineModule t={t} saved={saved} setSaved={setSaved} isMobile={isMobile} onOpenChat={(item)=>openChat(item)} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} onNavigateToSource={(item)=>{const tabMap={board:"saved",venture:"saved",hustle:"saved",deal:"saved",exec:"saved"};const modMap={board:"board",venture:"venture",hustle:"hustle",deal:"deal",exec:"exec"};const prefMap={board:"bs",venture:"vs",hustle:"sh",deal:"dm",exec:"es"};storage.set((prefMap[item.source]||"bs")+"-tab",tabMap[item.source]||"saved");setActiveModule(modMap[item.source]||"board");}}/>}
+              {activeModule==="home"&&<CommandCenter t={t} profile={profile} saved={saved} isMobile={isMobile} setActiveModule={setActiveModule} apiKey={apiKey} provider={provider} profileComplete={profileComplete} gatedModules={gatedModules} activityLog={activityLog} contacts={contacts} saveToVault={saveToVault} hiddenModules={hiddenModules}/>}
+              {activeModule==="tower"&&<ControlTowerModule t={t} isMobile={isMobile} saved={saved} activityLog={activityLog} contacts={contacts} calendarEvents={calendarEvents} setActiveModule={setActiveModule} hiddenModules={hiddenModules}/>}
+              {activeModule==="pipeline"&&<PipelineModule t={t} saved={saved} setSaved={setSaved} isMobile={isMobile} onOpenChat={(item)=>openChat(item)} profile={profile} apiKey={apiKey} provider={provider} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} hiddenModules={hiddenModules} onNavigateToSource={(item)=>{const tabMap={board:"saved",venture:"saved",hustle:"saved",deal:"saved",exec:"saved"};const modMap={board:"board",venture:"venture",hustle:"hustle",deal:"deal",exec:"exec"};const prefMap={board:"bs",venture:"vs",hustle:"sh",deal:"dm",exec:"es"};storage.set((prefMap[item.source]||"bs")+"-tab",tabMap[item.source]||"saved");setActiveModule(modMap[item.source]||"board");}}/>}
               {activeModule==="calendar"&&<CalendarModule t={t} isMobile={isMobile} events={calendarEvents} onSaveEvents={saveCalendarEvents} saved={saved} onScheduleItem={setScheduleModalItem} onNavigate={setActiveModule}/>}
-              {activeModule==="settings"&&<SettingsModule t={t} profile={profile} setProfile={p=>{setProfile(p);storage.set("oos-profile",p);}} apiKey={apiKey} setApiKey={setApiKey} provider={provider} setProvider={setProvider} isMobile={isMobile} isNewUser={startOnSettings}/>}
+              {activeModule==="settings"&&<SettingsModule t={t} profile={profile} setProfile={p=>{setProfile(p);storage.set("oos-profile",p);}} apiKey={apiKey} setApiKey={setApiKey} provider={provider} setProvider={setProvider} isMobile={isMobile} isNewUser={startOnSettings} hiddenModules={hiddenModules} setHiddenModules={setHiddenModules}/>}
               {activeModule==="vault"&&<DocumentVaultModule t={t} isMobile={isMobile} vault={vault} setVault={setVault} onRegenerate={(sourceItem)=>{setDocGenItem(sourceItem);}}/>}
               {activeModule==="contacts"&&<ContactsModule t={t} isMobile={isMobile} contacts={contacts} setContacts={setContacts} activityLog={activityLog} saved={saved} onNavigateToNetwork={(company)=>{setNiFreeSearch(company);setActiveModule("network");}}/>}
             </div>
           }
           {/* Two-column pages manage their own scroll per panel */}
-          {activeModule==="board"&&<BoardScoutModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} boardResults={boardResults} setBoardResults={setBoardResults} consultResults={consultResults} setConsultResults={setConsultResults} bsLoading={bsLoading} setBsLoading={setBsLoading} bsScanLog={bsScanLog} setBsScanLog={setBsScanLog} bsLastScanned={bsLastScanned} setBsLastScanned={setBsLastScanned}/>}
+          {activeModule==="board"&&<BoardScoutModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} boardResults={boardResults} setBoardResults={setBoardResults} bsLoading={bsLoading} setBsLoading={setBsLoading} bsScanLog={bsScanLog} setBsScanLog={setBsScanLog} bsLastScanned={bsLastScanned} setBsLastScanned={setBsLastScanned}/>}
           {activeModule==="venture"&&<VentureScoutModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} ventures={ventures} setVentures={setVentures} ideas={ideas} setIdeas={setIdeas} vsLoading={vsLoading} setVsLoading={setVsLoading} vsScanLog={vsScanLog} setVsScanLog={setVsScanLog} vsLastScanned={vsLastScanned} setVsLastScanned={setVsLastScanned}/>}
           {activeModule==="hustle"&&<SideHustleModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} hustles={hustles} setHustles={setHustles} shLoading={shLoading} setShLoading={setShLoading} shScanLog={shScanLog} setShScanLog={setShScanLog} shLastScanned={shLastScanned} setShLastScanned={setShLastScanned}/>}
           {activeModule==="exec"&&<ExecSearchModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} esResults={esResults} setEsResults={setEsResults} esLoading={esLoading} setEsLoading={setEsLoading} esScanLog={esScanLog} setEsScanLog={setEsScanLog} esLastScanned={esLastScanned} setEsLastScanned={setEsLastScanned}/>}
           {activeModule==="deal"&&<DealMonitorModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} onSchedule={setScheduleModalItem} onLogActivity={setActivityLogItem} activityLog={activityLog} deals={deals} setDeals={setDeals} dmLoading={dmLoading} setDmLoading={setDmLoading} dmScanLog={dmScanLog} setDmScanLog={setDmScanLog} dmLastScanned={dmLastScanned} setDmLastScanned={setDmLastScanned}/>}
           {/* Vibe Agent tab — full page agent */}
-          {activeModule==="vibe"&&<VibeAgentModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} vaMessages={vaMessages} setVaMessages={setVaMessages} vaScanLog={vaScanLog} setVaScanLog={setVaScanLog} vaInput={vaInput} setVaInput={setVaInput} vaLoading={vaLoading} setVaLoading={setVaLoading} setActiveModule={setActiveModule}/>}
+          {activeModule==="vibe"&&<VibeAgentModule t={t} apiKey={apiKey} provider={provider} profile={profile} isMobile={isMobile} saved={saved} setSaved={setSaved} onOpenChat={(item)=>openChat(item)} onOpenTax={setTaxPanelItem} onOpenNetwork={setNetworkPanelItem} onOpenDocs={setDocGenItem} vaMessages={vaMessages} setVaMessages={setVaMessages} vaScanLog={vaScanLog} setVaScanLog={setVaScanLog} vaInput={vaInput} setVaInput={setVaInput} vaLoading={vaLoading} setVaLoading={setVaLoading} setActiveModule={setActiveModule} hiddenModules={hiddenModules}/>}
           {activeModule==="network"&&<NetworkModulePage t={t} profile={profile} apiKey={apiKey} provider={provider} isMobile={isMobile} saved={saved} onOpenChat={openChat} niLoading={niLoading} setNiLoading={setNiLoading} niAnalysis={niAnalysis} setNiAnalysis={setNiAnalysis} niError={niError} setNiError={setNiError} niTarget={niTarget} setNiTarget={setNiTarget} niFreeSearch={niFreeSearch} setNiFreeSearch={setNiFreeSearch} onSaveToVault={saveToVault} onSaveContact={saveContact}/>}
           </div>
         </div>
